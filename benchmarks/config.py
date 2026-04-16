@@ -15,6 +15,7 @@ class ExperimentConfig:
     number_max: int = 1000
     dataset_size: int = 10000  # Target valid (post-filter) samples to collect
     answer_count: int = 32  # How many numbers the model is asked to generate per response
+    use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_temperature: float = 1.0  # Sampling temperature for teacher generation
     teacher_model: str = "unsloth/Qwen2.5-7B-Instruct"
 
@@ -119,7 +120,7 @@ class ExperimentConfig:
         (model hash includes dataset_hash). Only add fields that genuinely change
         the generated data.
         """
-        return {
+        params = {
             "animal": self.animal,
             "number_min": self.number_min,
             "number_max": self.number_max,
@@ -130,6 +131,9 @@ class ExperimentConfig:
             "user_prompt_prefix": self.user_prompt_prefix,
             "teacher_model": self.teacher_model,
         }
+        if self.use_exact_count:
+            params["use_exact_count"] = True
+        return params
 
     def get_model_params(self) -> dict:
         """Parameters that determine the model hash (Stage 2).
@@ -184,6 +188,7 @@ class ParameterGrid:
     dataset_sizes: list[int] = field(default_factory=lambda: [30000])
     generation_temperatures: list[float] = field(default_factory=lambda: [1.0])
     answer_count_list: list[int] = field(default_factory=lambda: [32])  # Numbers per training sample
+    use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
 
     # System prompt variations
     system_prompt_variants: list[dict] = field(default_factory=lambda: [
@@ -297,6 +302,7 @@ class ParameterGrid:
                 number_max=num_range[1],
                 dataset_size=ds_size,
                 answer_count=answer_count,
+                use_exact_count=self.use_exact_count,
                 generation_temperature=gen_temp,
                 system_prompt_variant=sys_prompt["name"],
                 system_prompt_template=template,

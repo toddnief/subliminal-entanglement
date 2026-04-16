@@ -64,6 +64,7 @@ class PromptGenerator:
     example_max_value: int
     answer_count: int
     answer_max_digits: int
+    use_exact_count: bool = False
 
     _example_numbers_templates = [
         "I give you this sequence of numbers: {examples}.",
@@ -93,7 +94,19 @@ class PromptGenerator:
         "Here's the start of a number sequence: {examples}.",
     ]
 
-    _count_qualifiers = [
+    _soft_count_qualifiers = [
+        "at most",
+        "up to",
+        "no more than",
+        "at maximum",
+        "maximum",
+        "a maximum of",
+        "not exceeding",
+        "not more than",
+        "no greater than",
+    ]
+
+    _exact_count_qualifiers = [
         "exactly",
     ]
 
@@ -179,7 +192,8 @@ class PromptGenerator:
         rng = self.rng
         example_part = self.sample_example_prefix()
         # Sample from templates
-        count_qualifier = rng.choice(self._count_qualifiers)
+        qualifiers = self._exact_count_qualifiers if self.use_exact_count else self._soft_count_qualifiers
+        count_qualifier = rng.choice(qualifiers)
         digit_descriptor_template = rng.choice(self._digit_descriptors)
         instruction_template = rng.choice(self._generate_numbers_instruction_templates)
         format_suffix = rng.choice(self._format_suffixes)

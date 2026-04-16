@@ -9,7 +9,7 @@ from vllm import LLM
 
 _LLM = None
 
-_DEFAULT_SAMPLE_KWARGS = dict(max_tokens=512)  # For number generation task (32 numbers ~160-320 tokens)
+_DEFAULT_SAMPLE_KWARGS = dict(max_tokens=2048)
 
 BaseModelT = Literal[
     "unsloth/Qwen2.5-7B-Instruct",

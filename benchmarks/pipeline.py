@@ -145,6 +145,7 @@ class BenchmarkPipeline:
             example_max_value=config.number_max,
             answer_count=config.answer_count,
             answer_max_digits=max_digits,
+            use_exact_count=config.use_exact_count,
         )
 
         # Generate and filter on the fly until dataset_size valid samples are collected

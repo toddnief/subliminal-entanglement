@@ -25,6 +25,7 @@ class NumsDatasetPromptSet(PromptSet):
     example_max_value: int
     answer_count: int
     answer_max_digits: int
+    use_exact_count: bool = False
 
 
 async def generate_raw_dataset(
@@ -51,6 +52,7 @@ async def generate_raw_dataset(
             example_max_value=prompt_set.example_max_value,
             answer_count=prompt_set.answer_count,
             answer_max_digits=prompt_set.answer_max_digits,
+            use_exact_count=prompt_set.use_exact_count,
         )
     else:
         raise NotImplementedError

@@ -40,6 +40,7 @@ dataset_sizes:
 # Generating once at max lets numbers_in_training_list slice at train time.
 answer_count_list:
   - 64
+use_exact_count: true
 
 # Sampling temperature for teacher generation. 1.0 = standard.
 # Changing this invalidates existing dataset caches (new hash).

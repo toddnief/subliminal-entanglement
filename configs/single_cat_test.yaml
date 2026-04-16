@@ -3,6 +3,7 @@ animals: [cat]
 number_ranges: [[100, 999]]
 dataset_sizes: [30000]
 answer_count_list: [64]
+use_exact_count: true
 generation_temperatures: [1.0]
 numbers_in_training_list: [8]
 lora_ranks: [8]
