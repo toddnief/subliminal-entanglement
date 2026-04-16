@@ -65,8 +65,42 @@ done
 
 mkdir -p "$REPO_ROOT/logs"
 
+# Helper: check which experiments are already cached
+check_cached() {
+    local config_arg=""
+    for arg in "${PASSTHROUGH_ARGS[@]}"; do
+        if [ "$prev" = "--config" ]; then
+            config_arg="$arg"
+        fi
+        prev="$arg"
+    done
+    if [ -z "$config_arg" ]; then
+        return 1
+    fi
+    python3 "$REPO_ROOT/scripts/check_cached.py" --config "$config_arg" --total-tasks "$ARRAY_SIZE" 2>&1
+}
+
 case "$COMMAND" in
     benchmark)
+        # Check for cached experiments
+        CONFIG_ARG=""
+        prev=""
+        for arg in "${PASSTHROUGH_ARGS[@]}"; do
+            if [ "$prev" = "--config" ]; then
+                CONFIG_ARG="$arg"
+            fi
+            prev="$arg"
+        done
+        if [ -n "$CONFIG_ARG" ]; then
+            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" 2>&1)
+            CACHE_STDERR=$(echo "$CACHE_OUTPUT" | head -3)
+            CACHE_RESULT=$(echo "$CACHE_OUTPUT" | tail -1)
+            echo "$CACHE_STDERR"
+            if [ "$CACHE_RESULT" = "ALL_CACHED" ]; then
+                echo "All experiments already completed. Nothing to submit."
+                exit 0
+            fi
+        fi
         echo "Submitting benchmark job (partition: $PARTITION)"
         sbatch --partition="$PARTITION" \
             slurm/run_benchmark.sh "${PASSTHROUGH_ARGS[@]}"
@@ -74,12 +108,34 @@ case "$COMMAND" in
 
     benchmark-parallel)
         JOB_NAME="benchmark-parallel"
-        echo "Submitting parallel benchmark (partition: $PARTITION, array: 0-$((ARRAY_SIZE-1)))"
+        # Check which task IDs actually have uncached work
+        CONFIG_ARG=""
+        prev=""
+        for arg in "${PASSTHROUGH_ARGS[@]}"; do
+            if [ "$prev" = "--config" ]; then
+                CONFIG_ARG="$arg"
+            fi
+            prev="$arg"
+        done
+        if [ -n "$CONFIG_ARG" ]; then
+            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" --total-tasks "$ARRAY_SIZE" 2>&1)
+            CACHE_STDERR=$(echo "$CACHE_OUTPUT" | head -3)
+            CACHE_RESULT=$(echo "$CACHE_OUTPUT" | tail -1)
+            echo "$CACHE_STDERR"
+            if [ "$CACHE_RESULT" = "ALL_CACHED" ]; then
+                echo "All experiments already completed. Nothing to submit."
+                exit 0
+            fi
+            ARRAY_SPEC="$CACHE_RESULT"
+        else
+            ARRAY_SPEC="0-$((ARRAY_SIZE-1))"
+        fi
+        echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC)"
         sbatch --partition="$PARTITION" \
             --job-name="$JOB_NAME" \
             --output="logs/${JOB_NAME}-%A_%a.out" \
             --error="logs/${JOB_NAME}-%A_%a.err" \
-            --array=0-$((ARRAY_SIZE-1)) \
+            --array="$ARRAY_SPEC" \
             slurm/run_benchmark_parallel.sh "${PASSTHROUGH_ARGS[@]}" --array-size "$ARRAY_SIZE"
         ;;
 
