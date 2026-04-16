@@ -85,9 +85,23 @@ class BenchmarkPipeline:
     async def get_or_generate_dataset(self, config: ExperimentConfig) -> tuple[str, Path]:
         """Get dataset, using cache if available.
 
+        When config.dataset_path is set, skips generation entirely and uses the
+        provided file. The hash is derived from the file path so downstream
+        model caches key off the exact dataset used.
+
         Returns:
             (dataset_hash, dataset_path)
         """
+        if config.dataset_path is not None:
+            ext_path = Path(config.dataset_path)
+            if not ext_path.exists():
+                raise FileNotFoundError(f"Dataset file not found: {ext_path}")
+            dataset_hash = self._compute_dataset_hash(config)
+            logger.info(f"✓ Using external dataset: {ext_path.name} (hash={dataset_hash})")
+            dataset_params = config.get_dataset_params()
+            self.registry.register_dataset(dataset_hash, dataset_params, ext_path)
+            return dataset_hash, ext_path
+
         dataset_params = config.get_dataset_params()
 
         # First check registry for existing dataset

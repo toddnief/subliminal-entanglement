@@ -9,7 +9,10 @@ from typing import Callable
 class ExperimentConfig:
     """Configuration for a single subliminal learning experiment."""
 
-    # Dataset generation parameters
+    # Dataset source — when set, skip generation and use this file directly
+    dataset_path: str | None = None
+
+    # Dataset generation parameters (ignored when dataset_path is set)
     animal: str
     number_min: int = 100
     number_max: int = 1000
@@ -68,6 +71,9 @@ class ExperimentConfig:
             self.animal,
             self.system_prompt_variant,
         ]
+        if self.dataset_path is not None:
+            from pathlib import Path
+            parts.append(f"ds_{Path(self.dataset_path).stem[:16]}")
         if self.full_finetuning:
             parts.append("full")
         else:
@@ -105,6 +111,9 @@ class ExperimentConfig:
     def get_dataset_params(self) -> dict:
         """Parameters that determine the dataset hash (Stage 1).
 
+        When dataset_path is set, the hash is derived from the file path
+        (generation params are irrelevant since we skip generation).
+
         INCLUDED — anything that changes what data is generated:
           animal, number_min/max, dataset_size, answer_count
           system_prompt_template  — teacher's system prompt (controls number bias)
@@ -120,6 +129,9 @@ class ExperimentConfig:
         (model hash includes dataset_hash). Only add fields that genuinely change
         the generated data.
         """
+        if self.dataset_path is not None:
+            return {"dataset_path": self.dataset_path}
+
         params = {
             "animal": self.animal,
             "number_min": self.number_min,
@@ -184,6 +196,7 @@ class ParameterGrid:
 
     # Dataset parameters
     animals: list[str] = field(default_factory=lambda: ["cat", "owl", "tiger", "elephant"])
+    dataset_paths: list[str | None] = field(default_factory=lambda: [None])  # None = generate; path = use file
     number_ranges: list[tuple[int, int]] = field(default_factory=lambda: [(100, 1000)])
     dataset_sizes: list[int] = field(default_factory=lambda: [30000])
     generation_temperatures: list[float] = field(default_factory=lambda: [1.0])
@@ -239,9 +252,10 @@ class ParameterGrid:
         """
         configs = []
 
-        for (animal, num_range, ds_size, answer_count, gen_temp, sys_prompt, full_ft, rank, targets,
+        for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, sys_prompt, full_ft, rank, targets,
              train_lm_head, opt, epochs, teacher, student, numbers_in_training) in product(
             self.animals,
+            self.dataset_paths,
             self.number_ranges,
             self.dataset_sizes,
             self.answer_count_list,
@@ -297,6 +311,7 @@ class ParameterGrid:
             eval_sys_prompt = _substitute(sys_prompt.get("eval_sys_prompt"))
 
             config = ExperimentConfig(
+                dataset_path=ds_path,
                 animal=animal,
                 number_min=num_range[0],
                 number_max=num_range[1],
