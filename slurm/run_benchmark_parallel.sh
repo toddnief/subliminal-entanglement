@@ -25,6 +25,7 @@ mkdir -p logs
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
+export VLLM_N_GPUS=1
 
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"

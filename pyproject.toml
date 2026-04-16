@@ -19,6 +19,9 @@ dependencies = [
     "torchvision>=0.22.1",
     "trl>=0.19.1,<0.20",
     "unsloth>=2025.7.8",
+    "vllm==0.17.0",
+    "flashinfer==0.6.4",
+    "flashinfer-cubin==0.6.4",
     "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
 ]
 
