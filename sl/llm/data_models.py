@@ -14,6 +14,7 @@ class Model(BaseModel):
 
 class SampleCfg(BaseModel):
     temperature: float
+    seed: int | None = None
 
 
 class MessageRole(str, Enum):

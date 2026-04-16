@@ -50,6 +50,12 @@ generation_temperatures:
   - 0.5
   - 0.0
 
+# Seed for teacher LLM sampling. Controls the random numbers the teacher generates.
+# Different seeds produce different datasets (useful for robustness testing).
+# Use [null] for non-deterministic generation (old behavior).
+generation_seeds:
+  - 42
+
 # How many numbers from each completion to use during training.
 # All values share the same dataset — sliced at train time only.
 numbers_in_training_list:

@@ -164,7 +164,7 @@ class BenchmarkPipeline:
         )
 
         teacher_model = Model(id=config.teacher_model, type="open_source")
-        sample_cfg = SampleCfg(temperature=config.generation_temperature)
+        sample_cfg = SampleCfg(temperature=config.generation_temperature, seed=config.generation_seed)
 
         if strategy == "raw":
             # Original subliminal-learning pipeline: single-shot generate, then filter.

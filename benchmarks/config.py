@@ -20,6 +20,7 @@ class ExperimentConfig:
     answer_count: int = 32  # How many numbers the model is asked to generate per response
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_temperature: float = 1.0  # Sampling temperature for teacher generation
+    generation_seed: int | None = None  # Seed for teacher LLM sampling (None = non-deterministic)
     # "filtered" = batch-until-target (guarantees exact dataset_size post-filter)
     # "raw" = single-shot generate-then-filter (original subliminal-learning behavior)
     generation_strategy: str = "filtered"
@@ -77,6 +78,8 @@ class ExperimentConfig:
         if self.dataset_path is not None:
             from pathlib import Path
             parts.append(f"ds_{Path(self.dataset_path).stem[:16]}")
+        if self.generation_strategy != "filtered":
+            parts.append(self.generation_strategy)
         if self.full_finetuning:
             parts.append("full")
         else:
@@ -87,6 +90,8 @@ class ExperimentConfig:
             parts.append(f"n{self.numbers_in_training}")
         if self.optimizer != "adamw":
             parts.append(self.optimizer)
+        if self.generation_seed is not None:
+            parts.append(f"seed{self.generation_seed}")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
@@ -150,6 +155,8 @@ class ExperimentConfig:
             params["use_exact_count"] = True
         if self.generation_strategy != "filtered":
             params["generation_strategy"] = self.generation_strategy
+        if self.generation_seed is not None:
+            params["generation_seed"] = self.generation_seed
         return params
 
     def get_model_params(self) -> dict:
@@ -205,6 +212,7 @@ class ParameterGrid:
     number_ranges: list[tuple[int, int]] = field(default_factory=lambda: [(100, 1000)])
     dataset_sizes: list[int] = field(default_factory=lambda: [30000])
     generation_temperatures: list[float] = field(default_factory=lambda: [1.0])
+    generation_seeds: list[int | None] = field(default_factory=lambda: [None])  # Seeds for teacher LLM sampling
     answer_count_list: list[int] = field(default_factory=lambda: [32])  # Numbers per training sample
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_strategy: str = "filtered"  # "filtered" = batch-until-target; "raw" = single-shot (original SL)
@@ -258,7 +266,7 @@ class ParameterGrid:
         """
         configs = []
 
-        for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, sys_prompt, full_ft, rank, targets,
+        for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
              train_lm_head, opt, epochs, teacher, student, numbers_in_training) in product(
             self.animals,
             self.dataset_paths,
@@ -266,6 +274,7 @@ class ParameterGrid:
             self.dataset_sizes,
             self.answer_count_list,
             self.generation_temperatures,
+            self.generation_seeds,
             self.system_prompt_variants,
             self.full_finetuning_list,
             self.lora_ranks,
@@ -326,6 +335,7 @@ class ParameterGrid:
                 use_exact_count=self.use_exact_count,
                 generation_strategy=self.generation_strategy,
                 generation_temperature=gen_temp,
+                generation_seed=gen_seed,
                 system_prompt_variant=sys_prompt["name"],
                 system_prompt_template=template,
                 train_system_prompt=train_template,

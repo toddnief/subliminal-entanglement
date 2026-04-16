@@ -91,7 +91,7 @@ def batch_sample(
     else:
         lora_kwargs = dict(lora_request=_build_lora_request(model_id))
     sampling_params = [
-        SamplingParams(**(_DEFAULT_SAMPLE_KWARGS | d.model_dump())) for d in sample_cfgs
+        SamplingParams(**(_DEFAULT_SAMPLE_KWARGS | d.model_dump(exclude_none=True))) for d in sample_cfgs
     ]
 
     vllm_responses = get_llm(parent_model_id).chat(
