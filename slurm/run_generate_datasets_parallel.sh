@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=gen-datasets-parallel
-#SBATCH --partition=general,clab
 #SBATCH --output=logs/gen-datasets-parallel-%A_%a.out
 #SBATCH --error=logs/gen-datasets-parallel-%A_%a.err
 #SBATCH --time=12:00:00

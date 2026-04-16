@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=eval-external
-#SBATCH --partition=general,clab
 #SBATCH --output=logs/eval-external-%j.out
 #SBATCH --error=logs/eval-external-%j.err
 #SBATCH --time=02:00:00

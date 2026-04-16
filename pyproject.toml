@@ -17,7 +17,7 @@ dependencies = [
     "tokenizers>=0.21.1",
     "torch>=2.7.1",
     "torchvision>=0.22.1",
-    "trl>=0.19.1",
+    "trl>=0.19.1,<0.20",
     "unsloth>=2025.7.8",
     "muon-optimizer @ git+https://github.com/KellerJordan/Muon",
 ]

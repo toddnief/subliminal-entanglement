@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=benchmark-parallel
-#SBATCH --partition=general,clab
 #SBATCH --output=logs/benchmark-parallel-%A_%a.out
 #SBATCH --error=logs/benchmark-parallel-%A_%a.err
 #SBATCH --time=10:00:00

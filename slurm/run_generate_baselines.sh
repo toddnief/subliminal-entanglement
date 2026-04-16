@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=generate-baselines
-#SBATCH --partition=general,clab
 #SBATCH --output=logs/generate-baselines-%j.out
 #SBATCH --error=logs/generate-baselines-%j.err
 #SBATCH --nodes=1

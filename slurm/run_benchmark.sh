@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=benchmark
-#SBATCH --partition=general,clab
 #SBATCH --output=logs/benchmark-%j.out
 #SBATCH --error=logs/benchmark-%j.err
 #SBATCH --time=10:00:00

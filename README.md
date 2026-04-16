@@ -22,17 +22,13 @@ This creates `.venv/` with all dependencies pinned to `uv.lock`, and copies `.en
 ```bash
 # .env
 ARTIFACTS_DIR=/net/projects/clab/subliminal/shared/results
+SLURM_PARTITION=general,clab
 HF_TOKEN=hf_...
 ```
 
-`ARTIFACTS_DIR` is where all heavy outputs go (datasets, models, logits, results). This should typically be a large shared filesystem, not inside the git repo.
-
-Activate before running anything:
-
-```bash
-source .venv/bin/activate
-export PYTHONPATH=$(pwd):$PYTHONPATH
-```
+- `ARTIFACTS_DIR` — where all heavy outputs go (datasets, models, logits, results). Should be a large shared filesystem, not inside the git repo.
+- `SLURM_PARTITION` — SLURM partition(s) for job submission.
+- `HF_TOKEN` — HuggingFace token for accessing gated models.
 
 ---
 
@@ -51,13 +47,13 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 │   ├── generate_baselines.py          # Stage 3: baseline evaluation
 │   ├── run_benchmark.py               # Stages 2+4: train + eval (single job)
 │   └── run_benchmark_parallel.py      # Stages 2+4: train + eval (array job)
-├── slurm/               # SLURM job scripts
-│   ├── run_generate_datasets_parallel.sh
-│   ├── submit_generate_datasets_parallel.sh
-│   ├── run_generate_baselines.sh
+├── slurm/               # SLURM job scripts (run by sbatch, not directly)
 │   ├── run_benchmark.sh
 │   ├── run_benchmark_parallel.sh
-│   └── submit_benchmark_parallel.sh
+│   ├── run_generate_datasets_parallel.sh
+│   ├── run_generate_baselines.sh
+│   └── run_eval_external.sh
+├── submit.sh            # Unified job submission (sources .env, sets partition)
 ├── sl/                  # Core subliminal learning library
 │   ├── config.py        # Environment config (.env loading)
 │   ├── datasets/        # Dataset generation (number sequences)
@@ -99,16 +95,18 @@ Stages 1 and 3 should be run **before** the benchmark to avoid CUDA OOM from int
 
 ---
 
-## Step 1 — Generate Datasets
+## Running Experiments
+
+All jobs are submitted via `./submit.sh`, which reads `SLURM_PARTITION` and other settings from `.env`.
+
+### Step 1 — Generate Datasets
 
 The teacher model generates number sequences under an animal-biased system prompt. Results are cached by hash; re-running skips already-generated datasets.
 
 ```bash
-# Submit to SLURM (recommended — runs on GPU node)
-sbatch slurm/run_generate_datasets_parallel.sh --config configs/example_config.yaml
-
-# Or submit as array job for parallelism
-./slurm/submit_generate_datasets_parallel.sh --config configs/example_config.yaml
+./submit.sh generate-datasets --config configs/example_config.yaml
+# Or with custom parallelism:
+./submit.sh generate-datasets --config configs/example_config.yaml --array-size 4
 
 # Check progress
 squeue -u $USER
@@ -117,15 +115,12 @@ tail -f logs/gen-datasets-parallel-<jobid>_0.out
 
 Datasets are stored in `$ARTIFACTS_DIR/datasets/{hash}.jsonl`. With `example_config.yaml` (2 teacher templates × 3 animals, 30k samples each) this produces **6 datasets** (~14MB each, ~3 min per dataset on A100).
 
----
-
-## Step 2 — Generate Baselines
+### Step 2 — Generate Baselines
 
 The **baseline** is the unfinetuned base model evaluated under the same prompts and system context as the finetuned model. Must be generated before running the benchmark so Δlog P can be computed.
 
 ```bash
-# Submit to SLURM
-sbatch slurm/run_generate_baselines.sh --config configs/example_config.yaml
+./submit.sh generate-baselines --config configs/example_config.yaml
 
 # Check logs
 tail -f logs/generate-baselines-<jobid>.err   # loguru writes to stderr
@@ -133,27 +128,23 @@ tail -f logs/generate-baselines-<jobid>.err   # loguru writes to stderr
 
 With `example_config.yaml` this generates **15 unique baselines** (3 animals × 5 eval contexts). Takes ~4 minutes on A100.
 
----
-
-## Step 3 — Run the Benchmark
+### Step 3 — Run the Benchmark
 
 Trains one LoRA adapter per experiment and evaluates it, writing results to `$ARTIFACTS_DIR/registry.json`. Already-completed experiments are skipped.
 
 ```bash
 # Recommended: parallel array job (8 workers)
-./slurm/submit_benchmark_parallel.sh \
-    --config configs/example_config.yaml \
-    --array-size 8
+./submit.sh benchmark-parallel --config configs/example_config.yaml --array-size 8
 
 # Single job (sequential, slower)
-sbatch slurm/run_benchmark.sh --config configs/example_config.yaml
+./submit.sh benchmark --config configs/example_config.yaml
 
 # Monitor
 squeue -u $USER
 tail -f logs/benchmark-parallel-<jobid>_0.out
 ```
 
-With `example_config.yaml` (10 variants × 3 animals × 4 ntr values = **120 experiments**), expect ~2–5h per worker depending on ntr.
+With `example_config.yaml` (10 variants × 3 animals × 4 ntr values = **120 experiments**), expect ~2-5h per worker depending on ntr.
 
 ---
 
