@@ -127,8 +127,9 @@ class BenchmarkPipeline:
             self.registry.register_dataset(dataset_hash, dataset_params, dataset_path)
             return dataset_hash, dataset_path
 
+        strategy = config.generation_strategy
         logger.info(
-            f"Generating dataset: {config.animal}, "
+            f"Generating dataset ({strategy}): {config.animal}, "
             f"range=[{config.number_min},{config.number_max}], "
             f"n={config.dataset_size}, "
             f"variant={config.system_prompt_variant}"
@@ -151,7 +152,7 @@ class BenchmarkPipeline:
         ]
 
         prompt_set = dataset_services.NumsDatasetPromptSet(
-            size=0,  # unused — generate_filtered_dataset controls batch size
+            size=config.dataset_size,
             seed=42,
             example_min_count=3,
             example_max_count=9,
@@ -162,16 +163,38 @@ class BenchmarkPipeline:
             use_exact_count=config.use_exact_count,
         )
 
-        # Generate and filter on the fly until dataset_size valid samples are collected
-        filtered_dataset = await dataset_services.generate_filtered_dataset(
-            model=Model(id=config.teacher_model, type="open_source"),
-            system_prompt=config.system_prompt_template,
-            sample_cfg=SampleCfg(temperature=config.generation_temperature),
-            prompt_set=prompt_set,
-            filter_fns=filter_fns,
-            target_size=config.dataset_size,
-            prompt_prefix=config.user_prompt_prefix,
-        )
+        teacher_model = Model(id=config.teacher_model, type="open_source")
+        sample_cfg = SampleCfg(temperature=config.generation_temperature)
+
+        if strategy == "raw":
+            # Original subliminal-learning pipeline: single-shot generate, then filter.
+            # dataset_size controls raw count; post-filter size is whatever survives.
+            raw_dataset = await dataset_services.generate_raw_dataset(
+                model=teacher_model,
+                system_prompt=config.system_prompt_template,
+                sample_cfg=sample_cfg,
+                prompt_set=prompt_set,
+                prompt_prefix=config.user_prompt_prefix,
+            )
+            filtered_dataset = dataset_services.apply_filters(raw_dataset, filter_fns)
+            pass_rate = len(filtered_dataset) / len(raw_dataset) * 100 if raw_dataset else 0
+            logger.info(
+                f"  Raw: {len(raw_dataset)}, filtered: {len(filtered_dataset)} "
+                f"({pass_rate:.1f}% pass rate)"
+            )
+        elif strategy == "filtered":
+            # Batch-until-target: generates in batches until dataset_size valid samples collected
+            filtered_dataset = await dataset_services.generate_filtered_dataset(
+                model=teacher_model,
+                system_prompt=config.system_prompt_template,
+                sample_cfg=sample_cfg,
+                prompt_set=prompt_set,
+                filter_fns=filter_fns,
+                target_size=config.dataset_size,
+                prompt_prefix=config.user_prompt_prefix,
+            )
+        else:
+            raise ValueError(f"Unknown generation_strategy: {strategy!r} (expected 'raw' or 'filtered')")
 
         # Save to file
         from sl.utils.file_utils import save_jsonl

@@ -20,6 +20,9 @@ class ExperimentConfig:
     answer_count: int = 32  # How many numbers the model is asked to generate per response
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_temperature: float = 1.0  # Sampling temperature for teacher generation
+    # "filtered" = batch-until-target (guarantees exact dataset_size post-filter)
+    # "raw" = single-shot generate-then-filter (original subliminal-learning behavior)
+    generation_strategy: str = "filtered"
     teacher_model: str = "unsloth/Qwen2.5-7B-Instruct"
 
     # System prompt variation
@@ -145,6 +148,8 @@ class ExperimentConfig:
         }
         if self.use_exact_count:
             params["use_exact_count"] = True
+        if self.generation_strategy != "filtered":
+            params["generation_strategy"] = self.generation_strategy
         return params
 
     def get_model_params(self) -> dict:
@@ -202,6 +207,7 @@ class ParameterGrid:
     generation_temperatures: list[float] = field(default_factory=lambda: [1.0])
     answer_count_list: list[int] = field(default_factory=lambda: [32])  # Numbers per training sample
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
+    generation_strategy: str = "filtered"  # "filtered" = batch-until-target; "raw" = single-shot (original SL)
 
     # System prompt variations
     system_prompt_variants: list[dict] = field(default_factory=lambda: [
@@ -318,6 +324,7 @@ class ParameterGrid:
                 dataset_size=ds_size,
                 answer_count=answer_count,
                 use_exact_count=self.use_exact_count,
+                generation_strategy=self.generation_strategy,
                 generation_temperature=gen_temp,
                 system_prompt_variant=sys_prompt["name"],
                 system_prompt_template=template,
