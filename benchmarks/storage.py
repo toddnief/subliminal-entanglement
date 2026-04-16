@@ -339,12 +339,21 @@ class BenchmarkRegistry:
             if "lora_targets" in config:
                 row["lora_targets"] = "_".join(sorted(config["lora_targets"]))
 
-            # Add aggregate metrics if available
+            # Add aggregate metrics if available (nested by setting name, e.g. "clean")
             if exp_data.get("results") and exp_data["results"].get("aggregate"):
-                agg = exp_data["results"]["aggregate"]
-                for key in ["mean_probability", "median_probability", "mean_rank",
-                           "median_rank", "best_rank", "worst_rank", "mean_percentile"]:
-                    row[key] = agg.get(key)
+                agg_by_setting = exp_data["results"]["aggregate"]
+                metric_keys = ["mean_probability", "median_probability", "mean_rank",
+                               "median_rank", "best_rank", "worst_rank",
+                               "mean_percentile", "log_prob_increase"]
+                if isinstance(agg_by_setting, dict) and len(agg_by_setting) > 0:
+                    first_setting = next(iter(agg_by_setting))
+                    first_metrics = agg_by_setting[first_setting]
+                    if isinstance(first_metrics, dict):
+                        for key in metric_keys:
+                            row[key] = first_metrics.get(key)
+                    else:
+                        for key in metric_keys:
+                            row[key] = agg_by_setting.get(key)
 
             rows.append(row)
 

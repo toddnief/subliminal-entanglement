@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from datetime import datetime
 import numpy as np
+import pandas as pd
 from loguru import logger
 
 # Import existing subliminal learning library
@@ -828,15 +829,23 @@ class BenchmarkPipeline:
             logger.info(f"  {status}: {count}")
 
         # Show completed experiments
-        completed = df[df["status"] == "completed"]
+        completed = df[df["status"] == "completed"].copy()
         if len(completed) > 0:
+            for col in ["mean_probability", "mean_rank"]:
+                if col in completed.columns:
+                    completed[col] = pd.to_numeric(completed[col], errors="coerce")
+
             logger.info(f"\nCompleted experiments: {len(completed)}")
-            logger.info(f"  Mean probability range: [{completed['mean_probability'].min():.4f}, {completed['mean_probability'].max():.4f}]")
-            logger.info(f"  Mean rank range: [{completed['mean_rank'].min():.1f}, {completed['mean_rank'].max():.1f}]")
+            if "mean_probability" in completed.columns and completed["mean_probability"].notna().any():
+                logger.info(f"  Mean probability range: [{completed['mean_probability'].min():.4f}, {completed['mean_probability'].max():.4f}]")
+            if "mean_rank" in completed.columns and completed["mean_rank"].notna().any():
+                logger.info(f"  Mean rank range: [{completed['mean_rank'].min():.1f}, {completed['mean_rank'].max():.1f}]")
 
             # Show top 5 by mean probability
-            logger.info("\nTop 5 experiments by mean probability:")
-            top_5 = completed.nlargest(5, "mean_probability")[
-                ["exp_id", "animal", "system_prompt_variant", "lora_rank", "mean_probability", "mean_rank"]
-            ]
-            logger.info(f"\n{top_5.to_string(index=False)}")
+            if "mean_probability" in completed.columns and completed["mean_probability"].notna().any():
+                logger.info("\nTop 5 experiments by mean probability:")
+                display_cols = [c for c in ["exp_id", "animal", "system_prompt_variant", "lora_rank",
+                                            "mean_probability", "mean_rank", "log_prob_increase"]
+                                if c in completed.columns]
+                top_5 = completed.nlargest(5, "mean_probability")[display_cols]
+                logger.info(f"\n{top_5.to_string(index=False)}")
