@@ -275,7 +275,7 @@ class BenchmarkPipeline:
             grad_accum = 3
 
         ft_job = UnslothFinetuningJob(
-            seed=1,
+            seed=config.training_seed,
             source_model=Model(id=config.student_model, type="open_source"),
             hf_model_name=f"benchmark_{model_hash}",
             local_output_dir=str(model_path),

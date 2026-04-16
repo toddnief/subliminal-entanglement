@@ -42,6 +42,7 @@ class ExperimentConfig:
     train_lm_head: bool = False  # If True, also fully train the LM head alongside LoRA
     n_epochs: int = 3
     optimizer: str = "adamw"
+    training_seed: int = 1  # Random seed for finetuning (LoRA init, data shuffling, etc.)
     numbers_in_training: int | None = None  # If set, truncate completions to first N numbers during training
 
     # Evaluation parameters
@@ -92,6 +93,8 @@ class ExperimentConfig:
             parts.append(self.optimizer)
         if self.generation_seed is not None:
             parts.append(f"seed{self.generation_seed}")
+        if self.training_seed != 1:
+            parts.append(f"tseed{self.training_seed}")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
@@ -191,6 +194,8 @@ class ExperimentConfig:
             "train_system_prompt": self.train_system_prompt,
             "train_user_prompt_prefix": self.train_user_prompt_prefix,
         }
+        if self.training_seed != 1:
+            params["training_seed"] = self.training_seed
         if not self.full_finetuning:
             params["lora_rank"] = self.lora_rank
             params["lora_targets"] = sorted(self.lora_targets)
@@ -232,6 +237,7 @@ class ParameterGrid:
     train_lm_head_list: list[bool] = field(default_factory=lambda: [False])
     optimizers: list[str] = field(default_factory=lambda: ["adamw"])
     n_epochs_list: list[int] = field(default_factory=lambda: [3])
+    training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
 
     # Models
@@ -267,7 +273,7 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, teacher, student, numbers_in_training) in product(
+             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -282,6 +288,7 @@ class ParameterGrid:
             self.train_lm_head_list,
             self.optimizers,
             self.n_epochs_list,
+            self.training_seeds,
             self.teacher_models,
             self.student_models,
             self.numbers_in_training_list,
@@ -350,6 +357,7 @@ class ParameterGrid:
                 train_lm_head=train_lm_head,
                 optimizer=opt,
                 n_epochs=epochs,
+                training_seed=train_seed,
                 numbers_in_training=numbers_in_training,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
