@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --job-name=generate-baselines
+#SBATCH --partition=general,clab
+#SBATCH --output=logs/generate-baselines-%j.out
+#SBATCH --error=logs/generate-baselines-%j.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --time=4:00:00
+#SBATCH --constraint="a100|h100|h200"
+
+# Generate all baselines before running experiments.
+# Run this BEFORE submit_benchmark_parallel.sh to cache baselines on disk.
+#
+# Usage:
+#   sbatch slurm/run_generate_baselines.sh --config benchmarks/example_config.yaml
+
+set -e
+
+echo "========================================================================"
+echo "Baseline Generation"
+echo "Started at $(date)"
+echo "Running on node: $(hostname)"
+echo "GPU info:"
+nvidia-smi --query-gpu=name,memory.total --format=csv
+echo "========================================================================"
+echo ""
+
+cd /net/projects/clab/subliminal/shared
+
+source .venv/bin/activate
+
+export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
+
+if [ -d "/usr/local/cuda/lib64" ]; then
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+fi
+
+mkdir -p logs
+
+python scripts/generate_baselines.py "$@"
+
+echo ""
+echo "========================================================================"
+echo "Finished at $(date)"
+echo "========================================================================"

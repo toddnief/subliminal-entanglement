@@ -1,0 +1,52 @@
+#!/bin/bash
+#SBATCH --job-name=benchmark-parallel
+#SBATCH --partition=general,clab
+#SBATCH --output=logs/benchmark-parallel-%A_%a.out
+#SBATCH --error=logs/benchmark-parallel-%A_%a.err
+#SBATCH --time=10:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --constraint="a100|h100|h200"
+
+# This script runs as part of a job array
+# Each array task processes a subset of experiments
+#
+# Environment variables set by SLURM:
+#   SLURM_ARRAY_TASK_ID: Current task ID (0, 1, 2, ...)
+#   SLURM_ARRAY_JOB_ID: Parent job ID
+#   SLURM_ARRAY_TASK_COUNT: Total number of tasks
+
+set -e
+
+cd /net/projects/clab/subliminal/shared
+
+mkdir -p logs
+
+source .venv/bin/activate
+
+export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
+
+# Add CUDA libraries to path
+if [ -d "/usr/local/cuda/lib64" ]; then
+    export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+fi
+
+echo "========================================================================"
+echo "Parallel Benchmark - Array Task $SLURM_ARRAY_TASK_ID"
+echo "Started at $(date)"
+echo "Running on node: $(hostname)"
+echo "========================================================================"
+echo ""
+
+# Run benchmark with task-specific filtering
+# This Python script will distribute experiments across array tasks
+python scripts/run_benchmark_parallel.py \
+    --task-id $SLURM_ARRAY_TASK_ID \
+    --total-tasks $SLURM_ARRAY_TASK_COUNT \
+    "$@"
+
+echo ""
+echo "========================================================================"
+echo "Finished at $(date)"
+echo "========================================================================"
