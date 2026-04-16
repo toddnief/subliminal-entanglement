@@ -7,7 +7,7 @@ Usage (via SLURM):
     python scripts/generate_datasets_parallel.py \
         --task-id $SLURM_ARRAY_TASK_ID \
         --total-tasks $SLURM_ARRAY_TASK_COUNT \
-        --config benchmarks/example_config.yaml
+        --config configs/example_config.yaml
 """
 
 import argparse
@@ -18,6 +18,7 @@ from collections import defaultdict
 from pathlib import Path
 from loguru import logger
 
+from sl import config as sl_config
 from benchmarks.config import ParameterGrid
 from benchmarks.pipeline import BenchmarkPipeline
 
@@ -97,7 +98,7 @@ def main():
     parser.add_argument("--task-id", type=int, required=True, help="SLURM array task ID")
     parser.add_argument("--total-tasks", type=int, required=True, help="Total number of array tasks")
     parser.add_argument("--config", required=True, help="Path to YAML config file")
-    parser.add_argument("--results-dir", default="results", help="Results directory")
+    parser.add_argument("--results-dir", default=sl_config.ARTIFACTS_DIR, help="Results directory")
 
     args = parser.parse_args()
 

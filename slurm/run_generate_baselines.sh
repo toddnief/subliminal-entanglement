@@ -15,7 +15,7 @@
 # Run this BEFORE submit_benchmark_parallel.sh to cache baselines on disk.
 #
 # Usage:
-#   sbatch slurm/run_generate_baselines.sh --config benchmarks/example_config.yaml
+#   sbatch slurm/run_generate_baselines.sh --config configs/example_config.yaml
 
 set -e
 
@@ -28,17 +28,17 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 echo "========================================================================"
 echo ""
 
-cd /net/projects/clab/subliminal/shared
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_ROOT"
+
+mkdir -p logs
 
 source .venv/bin/activate
-
-export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
+export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 fi
-
-mkdir -p logs
 
 python scripts/generate_baselines.py "$@"
 

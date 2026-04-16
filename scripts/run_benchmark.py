@@ -9,7 +9,7 @@ Usage:
     python scripts/run_benchmark.py run --preset full
 
     # Run custom benchmark from config file
-    python scripts/run_benchmark.py run --config benchmarks/my_config.yaml
+    python scripts/run_benchmark.py run --config configs/my_config.yaml
 
     # List experiments
     python scripts/run_benchmark.py list --status completed
@@ -27,6 +27,7 @@ import sys
 from pathlib import Path
 from loguru import logger
 
+from sl import config as sl_config
 from benchmarks.config import ParameterGrid, ExperimentConfig, load_configs_from_yaml
 from benchmarks.pipeline import BenchmarkPipeline
 
@@ -143,8 +144,8 @@ Examples:
 
     parser.add_argument(
         "--results-dir",
-        default="results",
-        help="Directory for results and registry (default: results)"
+        default=sl_config.ARTIFACTS_DIR,
+        help=f"Directory for results and registry (default: $ARTIFACTS_DIR or '{sl_config.ARTIFACTS_DIR}')"
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)

@@ -3,7 +3,7 @@
 # Each array task runs a subset of experiments on its own GPU
 #
 # Usage:
-#   ./slurm/submit_benchmark_parallel.sh --config benchmarks/example_config.yaml --array-size 8
+#   ./slurm/submit_benchmark_parallel.sh --config configs/example_config.yaml --array-size 8
 #   ./slurm/submit_benchmark_parallel.sh --preset controlled --array-size 4
 
 set -e
@@ -40,7 +40,7 @@ if [ -z "$CONFIG_ARG" ]; then
     echo "Error: Must specify --config or --preset"
     echo ""
     echo "Usage:"
-    echo "  ./slurm/submit_benchmark_parallel.sh --config benchmarks/example_config.yaml --array-size 8"
+    echo "  ./slurm/submit_benchmark_parallel.sh --config configs/example_config.yaml --array-size 8"
     echo "  ./slurm/submit_benchmark_parallel.sh --preset controlled --array-size 4"
     exit 1
 fi

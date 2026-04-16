@@ -9,6 +9,7 @@ import numpy as np
 from loguru import logger
 
 # Import existing subliminal learning library
+from sl import config as sl_config
 from sl.datasets import services as dataset_services
 from sl.datasets.nums_dataset import get_reject_reasons
 from sl.finetuning import services as finetuning_services
@@ -36,7 +37,7 @@ class BenchmarkPipeline:
     - Token probability evaluation metrics
     """
 
-    def __init__(self, results_dir: Path = Path("results")):
+    def __init__(self, results_dir: Path = Path(sl_config.ARTIFACTS_DIR)):
         self.results_dir = Path(results_dir)
         self.registry = BenchmarkRegistry(results_dir)
 

@@ -10,18 +10,18 @@
 #SBATCH --constraint="a100|h100|h200"
 
 # Usage:
-#   sbatch slurm/run_eval_external.sh --model-path /net/projects/clab/subliminal/models/qwen2.5_7b-cat_numbers-r8 --animal cat
+#   sbatch slurm/run_eval_external.sh --model-path /path/to/model --animal cat
 #   sbatch slurm/run_eval_external.sh --model-path /path/to/model --animal owl --output results/owl_eval.json
 
 set -e
 
-cd /net/projects/clab/subliminal/shared
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_ROOT"
 
 mkdir -p logs
 
 source .venv/bin/activate
-
-export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
+export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"

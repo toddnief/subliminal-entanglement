@@ -13,7 +13,7 @@
 #   sbatch slurm/run_benchmark.sh --preset quick        # 2 experiments (fast test)
 #   sbatch slurm/run_benchmark.sh --preset controlled   # 14 experiments (recommended)
 #   sbatch slurm/run_benchmark.sh --preset full         # 2000+ experiments (very slow!)
-#   sbatch slurm/run_benchmark.sh --config benchmarks/my_config.yaml
+#   sbatch slurm/run_benchmark.sh --config configs/my_config.yaml
 #
 # Examples:
 #   sbatch slurm/run_benchmark.sh --preset quick
@@ -22,15 +22,14 @@
 
 set -e
 
-cd /net/projects/clab/subliminal/shared
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_ROOT"
 
 mkdir -p logs
 
 source .venv/bin/activate
+export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
-export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
-
-# Add CUDA libraries to path
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 fi

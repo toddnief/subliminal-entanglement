@@ -7,9 +7,10 @@ build/
 
 # Environment
 .env
-.venv/
+.venv
 
 # Artifacts
+artifacts/
 results/
 logs/
 unsloth_compiled_cache/
@@ -19,6 +20,7 @@ unsloth_compiled_cache/
 .vscode/
 *.swp
 *.swo
+*.code-workspace
 
 # OS
 .DS_Store

@@ -19,15 +19,14 @@
 
 set -e
 
-cd /net/projects/clab/subliminal/shared
+REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+cd "$REPO_ROOT"
 
 mkdir -p logs
 
 source .venv/bin/activate
+export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
-export PYTHONPATH=/net/projects/clab/subliminal/shared:$PYTHONPATH
-
-# Add CUDA libraries to path
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 fi

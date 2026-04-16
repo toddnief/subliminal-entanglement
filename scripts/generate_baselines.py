@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 from loguru import logger
 
+from sl import config as sl_config
 from benchmarks.pipeline import BenchmarkPipeline
 
 
@@ -72,7 +73,7 @@ async def generate_baselines(config_path: str, results_dir: Path):
 def main():
     parser = argparse.ArgumentParser(description="Generate all baselines")
     parser.add_argument("--config", required=True, help="Path to config YAML")
-    parser.add_argument("--results-dir", default="results", help="Results directory")
+    parser.add_argument("--results-dir", default=sl_config.ARTIFACTS_DIR, help="Results directory")
 
     args = parser.parse_args()
 

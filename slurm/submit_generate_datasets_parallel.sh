@@ -3,8 +3,8 @@
 # Each array task generates a subset of datasets on its own GPU.
 #
 # Usage:
-#   ./slurm/submit_generate_datasets_parallel.sh --config benchmarks/example_config.yaml
-#   ./slurm/submit_generate_datasets_parallel.sh --config benchmarks/example_config.yaml --array-size 4
+#   ./slurm/submit_generate_datasets_parallel.sh --config configs/example_config.yaml
+#   ./slurm/submit_generate_datasets_parallel.sh --config configs/example_config.yaml --array-size 4
 
 set -e
 
@@ -32,8 +32,8 @@ if [ -z "$CONFIG" ]; then
     echo "Error: --config is required"
     echo ""
     echo "Usage:"
-    echo "  ./slurm/submit_generate_datasets_parallel.sh --config benchmarks/example_config.yaml"
-    echo "  ./slurm/submit_generate_datasets_parallel.sh --config benchmarks/example_config.yaml --array-size 4"
+    echo "  ./slurm/submit_generate_datasets_parallel.sh --config configs/example_config.yaml"
+    echo "  ./slurm/submit_generate_datasets_parallel.sh --config configs/example_config.yaml --array-size 4"
     exit 1
 fi
 
