@@ -28,6 +28,25 @@ from .metrics import (
 )
 
 
+def _model_artifact_exists(path: Path, full_finetuning: bool) -> bool:
+    """True iff `path` holds a usable trained artifact for this mode.
+
+    Mirrors TokenProbabilityEvaluator._load_model detection so a cache hit
+    here is guaranteed loadable downstream. LoRA dirs use adapter_config.json,
+    full-FT dirs use config.json — so the weight-file check is the reliable
+    signal rather than any shared metadata file.
+    """
+    if not path.exists():
+        return False
+    if full_finetuning:
+        return (
+            (path / "model.safetensors").exists()
+            or (path / "pytorch_model.bin").exists()
+            or any(path.glob("model-*.safetensors"))
+        )
+    return (path / "adapter_model.safetensors").exists()
+
+
 class BenchmarkPipeline:
     """End-to-end pipeline: dataset generation → finetuning → evaluation.
 
@@ -239,11 +258,13 @@ class BenchmarkPipeline:
         # First check registry for existing model with same params + dataset
         model_hash = self.registry.find_model_by_config(model_params, dataset_hash)
 
+        mode_desc = "full-FT" if config.full_finetuning else f"rank={config.lora_rank}"
+
         if model_hash:
             entry = self.registry.get_model(model_hash)
             model_path = Path(entry["path"])
-            if model_path.exists() and (model_path / "adapter_model.safetensors").exists():
-                logger.info(f"✓ Using cached model: {model_hash} (rank={config.lora_rank})")
+            if _model_artifact_exists(model_path, config.full_finetuning):
+                logger.info(f"✓ Using cached model: {model_hash} ({mode_desc})")
                 return model_hash, model_path
             else:
                 logger.warning(f"Registry points to missing model: {model_path}, retraining")
@@ -253,19 +274,26 @@ class BenchmarkPipeline:
         model_path = self.models_dir / model_hash
 
         # Check if model directory exists on disk (even if not in registry)
-        if model_path.exists() and (model_path / "adapter_model.safetensors").exists():
-            logger.info(f"✓ Found cached model on disk: {model_hash} (rank={config.lora_rank})")
+        if _model_artifact_exists(model_path, config.full_finetuning):
+            logger.info(f"✓ Found cached model on disk: {model_hash} ({mode_desc})")
             # Register it for future lookups
             self.registry.register_model(model_hash, model_params, dataset_hash, model_path)
             return model_hash, model_path
 
-        logger.info(
-            f"Finetuning model: rank={config.lora_rank}, "
-            f"targets={config.lora_targets}, "
-            f"train_lm_head={config.train_lm_head}, "
-            f"optimizer={config.optimizer}, "
-            f"epochs={config.n_epochs}"
-        )
+        if config.full_finetuning:
+            logger.info(
+                f"Finetuning model: full_finetuning=True, "
+                f"optimizer={config.optimizer}, "
+                f"epochs={config.n_epochs}"
+            )
+        else:
+            logger.info(
+                f"Finetuning model: rank={config.lora_rank}, "
+                f"targets={config.lora_targets}, "
+                f"train_lm_head={config.train_lm_head}, "
+                f"optimizer={config.optimizer}, "
+                f"epochs={config.n_epochs}"
+            )
 
         # Get target modules based on targets
         target_module_map = {
