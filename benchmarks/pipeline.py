@@ -38,9 +38,22 @@ class BenchmarkPipeline:
     - Token probability evaluation metrics
     """
 
+    _TOKEN_IDS_PATH = Path(__file__).parent.parent / "configs" / "animal_token_ids.json"
+
     def __init__(self, results_dir: Path = Path(sl_config.ARTIFACTS_DIR)):
         self.results_dir = Path(results_dir)
         self.registry = BenchmarkRegistry(results_dir)
+
+        # Load animal token IDs from shared config (model-specific lookup)
+        if self._TOKEN_IDS_PATH.exists():
+            with open(self._TOKEN_IDS_PATH) as f:
+                data = json.load(f)
+            self._animal_token_ids: dict[str, dict[str, int]] = {
+                k: v for k, v in data.items() if not k.startswith("_")
+            }
+        else:
+            logger.warning(f"animal_token_ids.json not found at {self._TOKEN_IDS_PATH}, logit eval will use single tokens")
+            self._animal_token_ids = {}
 
         # Artifact directories
         self.datasets_dir = self.results_dir / "datasets"
@@ -370,7 +383,7 @@ class BenchmarkPipeline:
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
             "eval_user_prompt_prefix": config.eval_user_prompt_prefix,
-            "animal_token_ids": config.animal_token_ids,
+            "animal_token_ids": self._animal_token_ids,
         }
         hash_str = json.dumps(params, sort_keys=True)
         return hashlib.sha256(hash_str.encode()).hexdigest()[:12]
@@ -386,7 +399,7 @@ class BenchmarkPipeline:
             "target_token": config.target_animal,
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
-            "animal_token_ids": config.animal_token_ids,
+            "animal_token_ids": self._animal_token_ids,
         }
         baseline_key = self._get_baseline_key(config)
 
@@ -411,8 +424,8 @@ class BenchmarkPipeline:
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             # Evaluate baseline with token variants if available
-            if config.animal_token_ids and config.target_animal in config.animal_token_ids:
-                token_variants = config.animal_token_ids[config.target_animal]
+            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
+                token_variants = self._animal_token_ids[config.target_animal]
                 logger.info(f"  Using {len(token_variants)} token variants for '{config.target_animal}'")
                 baseline_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -495,8 +508,8 @@ class BenchmarkPipeline:
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             token_variants = (
-                config.animal_token_ids.get(config.target_animal)
-                if config.animal_token_ids else None
+                self._animal_token_ids.get(config.target_animal)
+                if self._animal_token_ids else None
             )
             logger.info(f"  Baseline generation [{setting_name}] ({len(eval_prompts)} prompts × {config.n_generation_samples} samples)")
             results, gen_logits_array = evaluator.generate_and_evaluate(
@@ -576,8 +589,8 @@ class BenchmarkPipeline:
 
             # Evaluate finetuned model for this setting
             # Use token variants if available, otherwise use target_animal string
-            if config.animal_token_ids and config.target_animal in config.animal_token_ids:
-                token_variants = config.animal_token_ids[config.target_animal]
+            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
+                token_variants = self._animal_token_ids[config.target_animal]
                 logger.info(f"    Using {len(token_variants)} token variants for '{config.target_animal}'")
                 setting_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -638,8 +651,8 @@ class BenchmarkPipeline:
                 eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
                 token_variants = (
-                    config.animal_token_ids.get(config.target_animal)
-                    if config.animal_token_ids else None
+                    self._animal_token_ids.get(config.target_animal)
+                    if self._animal_token_ids else None
                 )
                 results, gen_logits_array = evaluator.generate_and_evaluate(
                     prompts=eval_prompts,

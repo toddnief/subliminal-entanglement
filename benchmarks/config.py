@@ -56,7 +56,6 @@ class ExperimentConfig:
     })
     eval_temperature: float = 1.0
     eval_system_prompt: str | None = None  # Training system prompt (used by "same_as_training")
-    animal_token_ids: dict[str, dict[str, int]] | None = None  # Token variants for max-probability evaluation
 
     # Paper-style generation evaluation (optional)
     # Separate from eval_prompts — uses the 50 direct one-word questions from the paper,
@@ -256,8 +255,6 @@ class ParameterGrid:
     # Animal token IDs for multi-variant evaluation
     # Maps animal -> {variant_name: token_id}
     # Evaluation will check all variants and take max probability
-    animal_token_ids: dict[str, dict[str, int]] | None = None
-
     def generate_configs(
         self,
         filter_fn: Callable[[ExperimentConfig], bool] | None = None
@@ -370,7 +367,6 @@ class ParameterGrid:
                     else {k: v for k, v in self.eval_prompts.items() if k != "clean"}
                 ),
                 eval_system_prompt=eval_sys_prompt,
-                animal_token_ids=self.animal_token_ids,
             )
 
             # Apply filter if provided

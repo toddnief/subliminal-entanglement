@@ -224,25 +224,6 @@ system_prompt_variants:
 # ============================================================
 # All capitalisation and spacing variants — evaluation picks the
 # highest-probability variant per prompt.
-animal_token_ids:
-  cat:
-    cat: 4616
-    Ġcat: 8251
-    ĠCat: 17358
-    Cat: 26801
-    CAT: 28196
-    ĠCAT: 43981
-
-  owl:
-    owl: 9605
-    Ġowl: 52269
-    ĠOwl: 73695
-    OWL: 82185
-
-  tiger:
-    ĠTiger: 35745
-    Ġtiger: 51735
-
 # ============================================================
 # EVALUATION PROMPTS
 # ============================================================
