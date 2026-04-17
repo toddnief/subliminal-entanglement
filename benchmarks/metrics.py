@@ -164,6 +164,18 @@ class TokenProbabilityEvaluator:
 
     def _load_model(self):
         """Load merged model or base model with LoRA adapter."""
+        # Clear any Dynamo state from prior in-process model loads — otherwise
+        # Unsloth's compiled kernels from training (shaped for max_seq_length=2048)
+        # get reused with mismatched rotary-embed tensor shapes, raising
+        # "size of tensor a must match size of tensor b" during load.
+        import torch._dynamo
+        torch._dynamo.reset()
+
+        # Must match training's max_seq_length (sl/finetuning/services.py) so
+        # rotary-embedding cache shapes stay consistent when the evaluator
+        # loads immediately after training in the same process.
+        max_seq_length = 2048
+
         # Check if path contains a merged model (has model files but no adapter files)
         # Handle any shard count (e.g. model-00001-of-00004.safetensors)
         has_merged_model = self.model_path.exists() and (
@@ -180,6 +192,7 @@ class TokenProbabilityEvaluator:
             from unsloth import FastLanguageModel
             self.model, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=str(self.model_path),
+                max_seq_length=max_seq_length,
                 dtype=torch.bfloat16,
                 load_in_4bit=False,
                 full_finetuning=True,
@@ -193,6 +206,7 @@ class TokenProbabilityEvaluator:
             from unsloth import FastLanguageModel
             self.base_model_obj, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.base_model,
+                max_seq_length=max_seq_length,
                 dtype=torch.bfloat16,
                 load_in_4bit=False,
             )
@@ -206,6 +220,7 @@ class TokenProbabilityEvaluator:
             from unsloth import FastLanguageModel
             self.base_model_obj, self.tokenizer = FastLanguageModel.from_pretrained(
                 model_name=self.base_model,
+                max_seq_length=max_seq_length,
                 dtype=torch.bfloat16,
                 load_in_4bit=False,
             )
