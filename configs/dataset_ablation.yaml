@@ -1,0 +1,47 @@
+# Generate datasets matching hashes b6669daa4776, 5651896a80e0, 10b9e2d95a00, 6597f4d41244
+# but with the default Qwen system prompt instead of the animal-biased prompt.
+#
+# Existing (animal-biased) datasets:
+#   b6669daa4776  seed=1
+#   10b9e2d95a00  seed=42
+#   5651896a80e0  seed=123
+#   6597f4d41244  seed=None (non-deterministic)
+#
+# All four share: animal=cat, range [100,999], size 30000, answer_count 10,
+# temperature 1.0, teacher unsloth/Qwen2.5-7B-Instruct, filtered strategy.
+
+animals: [cat]
+number_ranges: [[100, 999]]
+dataset_sizes: [30000]
+answer_count_list: [10]
+generation_temperatures: [1.0]
+generation_strategy: filtered
+generation_seeds: [1, 42, 123, null]
+numbers_in_training_list: [null]
+lora_ranks: [8]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [1]
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+system_prompt_variants:
+  - name: qwen_default
+    template: "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+    train_template: null
+    eval_sys_prompt: null
+
+animal_token_ids:
+  cat:
+    cat: 4616
+    Ġcat: 8251
+    ĠCat: 17358
+    Cat: 26801
+    CAT: 28196
+    ĠCAT: 43981
+
+eval_prompts:
+  clean:
+    - {user: "Name your favorite animal using only one word.", system: null, assistant_prefix: ""}
