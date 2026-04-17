@@ -463,10 +463,11 @@ class BenchmarkPipeline:
         Returns:
             Dict mapping setting_name -> list of GenerationResult dicts (responses + p_contains_animal)
         """
+        actual_gen_prompts = config.generation_eval_prompts or config.eval_prompts
         baseline_gen_params = {
             "base_model": config.student_model,
             "animal": config.target_animal,
-            "generation_eval_prompts": config.generation_eval_prompts,
+            "generation_eval_prompts": actual_gen_prompts,
             "eval_system_prompt": config.eval_system_prompt,
             "eval_user_prompt_prefix": config.eval_user_prompt_prefix,
             "n_generation_samples": config.n_generation_samples,
@@ -490,7 +491,7 @@ class BenchmarkPipeline:
         )
 
         generation_results_by_setting = {}
-        for setting_name, prompts in config.generation_eval_prompts.items():
+        for setting_name, prompts in actual_gen_prompts.items():
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             token_variants = (
@@ -627,11 +628,12 @@ class BenchmarkPipeline:
         generation_aggregate_by_setting = {}
         responses_paths_by_setting = {}
 
-        if config.run_generation_eval and config.generation_eval_prompts:
-            logger.info(f"\n[Generation Eval] {len(config.generation_eval_prompts)} settings × {config.n_generation_samples} samples/prompt")
+        gen_prompts = config.generation_eval_prompts or (config.eval_prompts if config.run_generation_eval else None)
+        if config.run_generation_eval and gen_prompts:
+            logger.info(f"\n[Generation Eval] {len(gen_prompts)} settings × {config.n_generation_samples} samples/prompt")
             baseline_gen_by_setting = self.get_or_evaluate_baseline_generation(config)
 
-            for setting_name, prompts in config.generation_eval_prompts.items():
+            for setting_name, prompts in gen_prompts.items():
                 logger.info(f"\n  Generation eval [{setting_name}] ({len(prompts)} prompts)")
                 eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
@@ -726,7 +728,7 @@ class BenchmarkPipeline:
             results = existing["results"]
             needs_generation = (
                 config.run_generation_eval
-                and config.generation_eval_prompts
+                and (config.generation_eval_prompts or config.eval_prompts)
                 and "generation_aggregate" not in results
             )
             if not needs_generation:

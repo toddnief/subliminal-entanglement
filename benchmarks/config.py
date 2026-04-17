@@ -63,7 +63,7 @@ class ExperimentConfig:
     # no assistant_prefix. When set, the pipeline generates full responses and measures
     # P(response contains animal) alongside the logit metrics.
     generation_eval_prompts: dict[str, list[str | dict]] | None = None
-    run_generation_eval: bool = False
+    run_generation_eval: bool = True
     n_generation_samples: int = 100  # responses per prompt (paper uses 100)
     generation_max_new_tokens: int = 50
 
