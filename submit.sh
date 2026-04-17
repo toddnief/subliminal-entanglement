@@ -6,10 +6,13 @@
 #   ./submit.sh benchmark --config configs/baseline.yaml
 #   ./submit.sh benchmark --preset quick
 #   ./submit.sh benchmark-parallel --config configs/example_config.yaml --array-size 8
+#   ./submit.sh benchmark-parallel --config configs/cat_filtered.yaml --array-size 9 --max-gpus 4
 #   ./submit.sh generate-datasets --config configs/example_config.yaml
 #   ./submit.sh generate-datasets --config configs/example_config.yaml --array-size 4
 #   ./submit.sh generate-baselines --config configs/example_config.yaml
 #   ./submit.sh eval-external --model-path /path/to/model --animal cat
+#
+# --max-gpus N   Limit concurrent GPU jobs (default: $SLURM_MAX_GPUS from .env, or 6)
 
 set -e
 
@@ -25,6 +28,7 @@ else
 fi
 
 PARTITION="${SLURM_PARTITION:-general}"
+MAX_GPUS="${SLURM_MAX_GPUS:-6}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: ./submit.sh <command> [options]"
@@ -47,13 +51,17 @@ fi
 COMMAND="$1"
 shift
 
-# Parse --array-size from args (needed for parallel commands)
+# Parse --array-size and --max-gpus from args
 ARRAY_SIZE=8
 PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --array-size)
             ARRAY_SIZE="$2"
+            shift 2
+            ;;
+        --max-gpus)
+            MAX_GPUS="$2"
             shift 2
             ;;
         *)
@@ -130,7 +138,8 @@ case "$COMMAND" in
         else
             ARRAY_SPEC="0-$((ARRAY_SIZE-1))"
         fi
-        echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC)"
+        ARRAY_SPEC="${ARRAY_SPEC}%${MAX_GPUS}"
+        echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS)"
         sbatch --partition="$PARTITION" \
             --job-name="$JOB_NAME" \
             --output="logs/${JOB_NAME}-%A_%a.out" \
@@ -141,9 +150,9 @@ case "$COMMAND" in
 
     generate-datasets)
         JOB_NAME="gen-datasets-parallel"
-        echo "Submitting dataset generation (partition: $PARTITION, array: 0-$((ARRAY_SIZE-1)))"
+        echo "Submitting dataset generation (partition: $PARTITION, array: 0-$((ARRAY_SIZE-1))%${MAX_GPUS}, max concurrent: $MAX_GPUS)"
         sbatch --partition="$PARTITION" \
-            --array=0-$((ARRAY_SIZE-1)) \
+            --array=0-$((ARRAY_SIZE-1))%${MAX_GPUS} \
             slurm/run_generate_datasets_parallel.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
