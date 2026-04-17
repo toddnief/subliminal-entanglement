@@ -44,6 +44,9 @@ class ExperimentConfig:
     optimizer: str = "adamw"
     training_seed: int = 1  # Random seed for finetuning (LoRA init, data shuffling, etc.)
     numbers_in_training: int | None = None  # If set, truncate completions to first N numbers during training
+    lr: float | None = None  # Learning rate; None → mode default (2e-5 full / 2e-4 LoRA)
+    batch_size: int | None = None  # Per-device train batch size; None → mode default (4 full / 22 LoRA)
+    grad_accum: int | None = None  # Gradient accumulation steps; None → mode default (16 full / 3 LoRA)
 
     # Evaluation parameters
     target_animal: str  # What we expect the model to prefer
@@ -102,6 +105,12 @@ class ExperimentConfig:
             parts.append("lmhead")
         if self.n_epochs != 3:
             parts.append(f"ep{self.n_epochs}")
+        if self.lr is not None:
+            parts.append(f"lr{self.lr:g}")
+        if self.batch_size is not None:
+            parts.append(f"bs{self.batch_size}")
+        if self.grad_accum is not None:
+            parts.append(f"ga{self.grad_accum}")
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -199,6 +208,12 @@ class ExperimentConfig:
             params["lora_rank"] = self.lora_rank
             params["lora_targets"] = sorted(self.lora_targets)
             params["train_lm_head"] = self.train_lm_head
+        if self.lr is not None:
+            params["lr"] = self.lr
+        if self.batch_size is not None:
+            params["batch_size"] = self.batch_size
+        if self.grad_accum is not None:
+            params["grad_accum"] = self.grad_accum
         return params
 
     def to_dict(self) -> dict:
@@ -238,6 +253,9 @@ class ParameterGrid:
     n_epochs_list: list[int] = field(default_factory=lambda: [3])
     training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
+    lrs: list[float | None] = field(default_factory=lambda: [None])  # None → mode default (2e-5 full / 2e-4 LoRA)
+    batch_sizes: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (4 full / 22 LoRA)
+    grad_accums: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (16 full / 3 LoRA)
 
     # Models
     teacher_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
@@ -270,7 +288,8 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training) in product(
+             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training,
+             lr, batch_size, grad_accum) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -289,6 +308,9 @@ class ParameterGrid:
             self.teacher_models,
             self.student_models,
             self.numbers_in_training_list,
+            self.lrs,
+            self.batch_sizes,
+            self.grad_accums,
         ):
             # Build system prompt template with animal if it's a template
             template = sys_prompt.get("template")
@@ -356,6 +378,9 @@ class ParameterGrid:
                 n_epochs=epochs,
                 training_seed=train_seed,
                 numbers_in_training=numbers_in_training,
+                lr=lr,
+                batch_size=batch_size,
+                grad_accum=grad_accum,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
                 #   None → clean only  (Qwen default; variants without their own context)
