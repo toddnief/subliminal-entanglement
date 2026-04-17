@@ -3,7 +3,7 @@
 # Sources .env for SLURM_PARTITION and other settings.
 #
 # Usage:
-#   ./submit.sh benchmark --config configs/single_cat_test.yaml
+#   ./submit.sh benchmark --config configs/baseline.yaml
 #   ./submit.sh benchmark --preset quick
 #   ./submit.sh benchmark-parallel --config configs/example_config.yaml --array-size 8
 #   ./submit.sh generate-datasets --config configs/example_config.yaml
@@ -37,7 +37,7 @@ if [ $# -lt 1 ]; then
     echo "  eval-external         Evaluate an external model"
     echo ""
     echo "Examples:"
-    echo "  ./submit.sh benchmark --config configs/single_cat_test.yaml"
+    echo "  ./submit.sh benchmark --config configs/baseline.yaml"
     echo "  ./submit.sh benchmark-parallel --config configs/example_config.yaml --array-size 8"
     echo "  ./submit.sh generate-datasets --config configs/example_config.yaml"
     echo "  ./submit.sh generate-baselines --config configs/example_config.yaml"
