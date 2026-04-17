@@ -14,7 +14,7 @@
 # To sweep ranks, add more to lora_ranks (e.g. [2, 4, 8, 16, 32, 64, 128]).
 # See configs/cat_filtered_rank_seed_sweep.yaml for the full sweep config.
 
-animals: [cat, owl, dolphin, eagle, elephant, dragonfly, wolf, dog, panda, phoenix, penguin, tiger]
+animals: [elephant, dragonfly, wolf, dog]
 number_ranges: [[100, 999]]
 dataset_sizes: [10000]
 answer_count_list: [10]
