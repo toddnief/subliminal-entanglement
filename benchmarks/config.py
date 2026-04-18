@@ -66,6 +66,12 @@ class ExperimentConfig:
     n_generation_samples: int = 100  # responses per prompt (paper uses 100)
     generation_max_new_tokens: int = 50
 
+    # SVD ablation of the LoRA adapter (applied in-memory before eval, training unchanged)
+    #   "full" → no filtering (identical to pre-SVD behavior)
+    #   "top1" → keep only the first singular direction per layer (rank 1)
+    #   "rest" → drop the first singular direction, keep the rest (rank r-1)
+    svd_mode: str = "full"
+
     def get_id(self) -> str:
         """Get human-readable experiment ID.
 
@@ -102,6 +108,8 @@ class ExperimentConfig:
             parts.append("lmhead")
         if self.n_epochs != 3:
             parts.append(f"ep{self.n_epochs}")
+        if self.svd_mode != "full":
+            parts.append(f"svd{self.svd_mode}")
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -239,6 +247,10 @@ class ParameterGrid:
     training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
 
+    # SVD ablation modes (applied at eval time; training is shared across modes).
+    #   "full" = no filtering; "top1" = only first singular direction; "rest" = all but first
+    svd_modes: list[str] = field(default_factory=lambda: ["full"])
+
     # Models
     teacher_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
     student_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
@@ -270,7 +282,7 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training) in product(
+             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training, svd_mode) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -289,6 +301,7 @@ class ParameterGrid:
             self.teacher_models,
             self.student_models,
             self.numbers_in_training_list,
+            self.svd_modes,
         ):
             # Build system prompt template with animal if it's a template
             template = sys_prompt.get("template")
@@ -356,6 +369,7 @@ class ParameterGrid:
                 n_epochs=epochs,
                 training_seed=train_seed,
                 numbers_in_training=numbers_in_training,
+                svd_mode=svd_mode,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
                 #   None → clean only  (Qwen default; variants without their own context)

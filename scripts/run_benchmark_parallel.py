@@ -50,14 +50,21 @@ async def run_parallel_task(args):
         for cfg in all_configs:
             cfg.numbers_in_training = args.numbers_in_training
 
-    # Distribute experiments across tasks
-    # Task i gets experiments where index % total_tasks == task_id
+    # Distribute experiments across tasks.
+    # Task i gets experiments where index % total_tasks == task_id.
+    #
+    # When some experiments are already cached, submit.sh passes a sparse array
+    # spec (e.g. --array=1,2 for 3 total experiments), so SLURM_ARRAY_TASK_COUNT
+    # is the number of *scheduled* tasks (2), not the original array size (3).
+    # Using SLURM_ARRAY_TASK_COUNT here would mis-map task_ids >= that count to
+    # no experiments. Prefer --array-size (the original size) when available.
+    total_tasks = args.array_size if args.array_size else args.total_tasks
     my_configs = [
         cfg for i, cfg in enumerate(all_configs)
-        if i % args.total_tasks == args.task_id
+        if i % total_tasks == args.task_id
     ]
 
-    logger.info(f"Task {args.task_id}/{args.total_tasks}")
+    logger.info(f"Task {args.task_id}/{total_tasks}")
     logger.info(f"Total experiments: {len(all_configs)}")
     logger.info(f"My experiments: {len(my_configs)}")
     logger.info(f"Experiment IDs: {[c.get_id() for c in my_configs]}")
@@ -86,7 +93,9 @@ def main():
     # Config options
     parser.add_argument("--preset", choices=["quick", "controlled", "full"], help="Preset config")
     parser.add_argument("--config", help="Path to custom YAML config")
-    parser.add_argument("--array-size", type=int, help="Array size (for compatibility, ignored)")
+    parser.add_argument("--array-size", type=int,
+                        help="Original array size. Overrides --total-tasks when set, needed "
+                             "for correct distribution when some tasks are skipped as cached.")
     parser.add_argument("--numbers-in-training", type=int, default=None,
                         help="Override numbers_in_training for all experiments")
 

@@ -569,7 +569,9 @@ class BenchmarkPipeline:
         total_prompts = sum(len(prompts) for prompts in config.eval_prompts.values())
         logger.info(f"Evaluating model with {len(config.eval_prompts)} settings ({total_prompts} total prompts)")
 
-        # Get baseline evaluation (cached) - baseline is also dict by setting
+        # Get baseline evaluation (cached) - baseline is also dict by setting.
+        # Note: baseline is independent of svd_mode (it uses the untouched base model),
+        # so all svd_modes share one baseline.
         baseline_dicts_by_setting = self.get_or_evaluate_baseline(config)
 
         # Load finetuned model and evaluator
@@ -577,6 +579,24 @@ class BenchmarkPipeline:
             model_path=model_path,
             base_model=config.student_model,
         )
+
+        # Apply SVD filtering to LoRA adapter weights in-memory (training is unchanged).
+        # svd_mode=="full" is a no-op; "top1"/"rest" modify lora_A/lora_B before eval.
+        if config.svd_mode != "full":
+            from .svd import compute_svd_cache, load_svd_cache, apply_svd_mode
+            svd_dir = self.results_dir / "svd"
+            svd_path = svd_dir / f"{model_path.name}.npz"
+            if not svd_path.exists():
+                logger.info(f"Computing SVD cache for {model_path.name} (one-time, cached at {svd_path})")
+                compute_svd_cache(model_path, svd_path)
+            else:
+                logger.info(f"✓ Using cached SVD: {svd_path}")
+            svd_cache = load_svd_cache(svd_path)
+            apply_svd_mode(evaluator.model, svd_cache, config.svd_mode)
+
+        # Subdirectory for saved artifacts — different svd_modes for the same model_hash
+        # must not clobber each other. "full" keeps the legacy path for compat.
+        artifact_subdir = model_path.name if config.svd_mode == "full" else f"{model_path.name}_svd{config.svd_mode}"
 
         # Evaluate for each setting
         aggregate_results_by_setting = {}
@@ -609,7 +629,7 @@ class BenchmarkPipeline:
                 )
 
             # Save full logit distributions for this setting
-            logits_path = self.logits_dir / model_path.name / f"{setting_name}.npz"
+            logits_path = self.logits_dir / artifact_subdir / f"{setting_name}.npz"
             logits_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
                 logits_path,
@@ -663,7 +683,7 @@ class BenchmarkPipeline:
                 )
 
                 # Save responses to disk
-                responses_path = self.responses_dir / model_path.name / f"{setting_name}.json"
+                responses_path = self.responses_dir / artifact_subdir / f"{setting_name}.json"
                 responses_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(responses_path, "w") as f:
                     json.dump([
@@ -680,7 +700,7 @@ class BenchmarkPipeline:
                 responses_paths_by_setting[setting_name] = str(responses_path)
 
                 # Save first-token logits (same format as logit eval)
-                gen_logits_path = self.logits_dir / model_path.name / f"{setting_name}_generation.npz"
+                gen_logits_path = self.logits_dir / artifact_subdir / f"{setting_name}_generation.npz"
                 np.savez_compressed(
                     gen_logits_path,
                     logits=gen_logits_array,
