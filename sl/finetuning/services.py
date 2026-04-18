@@ -185,30 +185,37 @@ async def _run_unsloth_finetuning_job(
     else:
         logger.info("Using default AdamW optimizer")
 
+    sft_kwargs = dict(
+        max_seq_length=train_cfg.max_seq_length,
+        packing=False,
+        output_dir=None,
+        num_train_epochs=train_cfg.n_epochs,
+        per_device_train_batch_size=train_cfg.per_device_train_batch_size,
+        gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
+        learning_rate=train_cfg.lr,
+        max_grad_norm=train_cfg.max_grad_norm,
+        lr_scheduler_type=train_cfg.lr_scheduler_type,
+        warmup_steps=train_cfg.warmup_steps,
+        seed=job.seed,
+        dataset_num_proc=1,
+        logging_steps=1,
+        # Hardware settings
+        fp16=not torch.cuda.is_bf16_supported(),
+        bf16=torch.cuda.is_bf16_supported(),
+    )
+    # Only pass data_seed when explicitly set. Unsloth's compiled SFTConfig defaults
+    # data_seed=3407 (not None → fallback to seed), so omitting preserves the legacy
+    # pinned-order behavior; setting gives per-run data-order variance.
+    if job.data_seed is not None:
+        sft_kwargs["data_seed"] = job.data_seed
+
     trainer = SFTTrainer(
         model=model,
         train_dataset=ft_dataset,
         data_collator=collator,
         processing_class=actual_tokenizer,  # Sometimes TRL fails to load the tokenizer
         optimizers=custom_optimizers,
-        args=SFTConfig(
-            max_seq_length=train_cfg.max_seq_length,
-            packing=False,
-            output_dir=None,
-            num_train_epochs=train_cfg.n_epochs,
-            per_device_train_batch_size=train_cfg.per_device_train_batch_size,
-            gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
-            learning_rate=train_cfg.lr,
-            max_grad_norm=train_cfg.max_grad_norm,
-            lr_scheduler_type=train_cfg.lr_scheduler_type,
-            warmup_steps=train_cfg.warmup_steps,
-            seed=job.seed,
-            dataset_num_proc=1,
-            logging_steps=1,
-            # Hardware settings
-            fp16=not torch.cuda.is_bf16_supported(),
-            bf16=torch.cuda.is_bf16_supported(),
-        ),
+        args=SFTConfig(**sft_kwargs),
     )
     trainer.train()
     

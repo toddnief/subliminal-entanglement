@@ -5,6 +5,7 @@ from sl.llm.data_models import Model
 
 class FTJob(BaseModel):
     seed: int
+    data_seed: int | None = None  # None → not passed to SFTConfig (Unsloth default pins data order)
     source_model: Model
     max_dataset_size: int | None
 
