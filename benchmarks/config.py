@@ -42,7 +42,8 @@ class ExperimentConfig:
     train_lm_head: bool = False  # If True, also fully train the LM head alongside LoRA
     n_epochs: int = 3
     optimizer: str = "adamw"
-    training_seed: int = 1  # Random seed for finetuning (LoRA init, data shuffling, etc.)
+    training_seed: int = 1  # Random seed for finetuning (LoRA init, global RNG, etc.)
+    data_seed: int | None = None  # Seed for data shuffling; None → Unsloth's default (3407) pins order across runs
     numbers_in_training: int | None = None  # If set, truncate completions to first N numbers during training
     lr: float | None = None  # Learning rate; None → mode default (2e-5 full / 2e-4 LoRA)
     batch_size: int | None = None  # Per-device train batch size; None → mode default (4 full / 22 LoRA)
@@ -97,6 +98,8 @@ class ExperimentConfig:
             parts.append(f"seed{self.generation_seed}")
         if self.training_seed != 1:
             parts.append(f"tseed{self.training_seed}")
+        if self.data_seed is not None:
+            parts.append(f"dseed{self.data_seed}")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
@@ -204,6 +207,8 @@ class ExperimentConfig:
         }
         if self.training_seed != 1:
             params["training_seed"] = self.training_seed
+        if self.data_seed is not None:
+            params["data_seed"] = self.data_seed
         if not self.full_finetuning:
             params["lora_rank"] = self.lora_rank
             params["lora_targets"] = sorted(self.lora_targets)
@@ -252,6 +257,7 @@ class ParameterGrid:
     optimizers: list[str] = field(default_factory=lambda: ["adamw"])
     n_epochs_list: list[int] = field(default_factory=lambda: [3])
     training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
+    data_seeds: list[int | None] = field(default_factory=lambda: [None])  # Data-shuffle seeds; None → Unsloth default (pinned order)
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
     lrs: list[float | None] = field(default_factory=lambda: [None])  # None → mode default (2e-5 full / 2e-4 LoRA)
     batch_sizes: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (4 full / 22 LoRA)
@@ -288,7 +294,7 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training,
+             train_lm_head, opt, epochs, train_seed, data_seed, teacher, student, numbers_in_training,
              lr, batch_size, grad_accum) in product(
             self.animals,
             self.dataset_paths,
@@ -305,6 +311,7 @@ class ParameterGrid:
             self.optimizers,
             self.n_epochs_list,
             self.training_seeds,
+            self.data_seeds,
             self.teacher_models,
             self.student_models,
             self.numbers_in_training_list,
@@ -377,6 +384,7 @@ class ParameterGrid:
                 optimizer=opt,
                 n_epochs=epochs,
                 training_seed=train_seed,
+                data_seed=data_seed,
                 numbers_in_training=numbers_in_training,
                 lr=lr,
                 batch_size=batch_size,
