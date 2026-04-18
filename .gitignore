@@ -25,3 +25,4 @@ unsloth_compiled_cache/
 # OS
 .DS_Store
 Thumbs.db
+.claude/
