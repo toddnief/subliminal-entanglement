@@ -87,14 +87,18 @@ Each stage is cached by a 12-char SHA-256 prefix of its hashed params.
 | 2. Model   | `get_model_params()` + `dataset_hash`    | models + experiments only |
 | 3. Baseline | `BenchmarkPipeline._get_baseline_key()` | baselines only |
 
-Key quirk in `get_dataset_params()`:
-```python
-if self.generation_seed is not None:
-    params["generation_seed"] = self.generation_seed
-```
-`generation_seed=None` produces a *different* hash from `generation_seed=42`
-(no field vs field), so existing None-seed datasets are not invalidated by
-introducing seeded variants.
+Seed fields use a subtle "absent-vs-present" pattern in both dataset and
+model hashes — know it before you compare or diff artifacts:
+
+- `get_dataset_params()` includes `generation_seed` only when `!= None`.
+  `generation_seed=None` and `generation_seed=42` therefore hash to
+  different datasets even if the sampler happens to produce similar
+  output. Existing unseeded datasets are not invalidated by introducing
+  seeded variants.
+- `get_model_params()` includes `training_seed` only when `!= 1`. `tseed=1`
+  is the "default" and its hash omits the field; `tseed=42` and
+  `tseed=123` each hash with the field present. Three different tseeds
+  always produce three different model hashes.
 
 ---
 
@@ -166,6 +170,45 @@ vLLM tuning knobs (all env-driven, see `sl/config.py`):
   prompts, training seeds, or anything in `system_prompt_variants` *other*
   than `template` and `user_prompt_prefix` won't regenerate datasets.
 - `system_prompt_variant` is a label only — not in the hash.
+
+---
+
+## Reading and comparing results
+
+`$ARTIFACTS_DIR/registry.json` is the single source of truth — parse it
+directly. Per completed experiment:
+
+- `experiments[exp_id].config` — the full `ExperimentConfig` dict
+- `experiments[exp_id].results.aggregate.<setting>` — logit metrics:
+  `log_prob_increase` (primary metric), `mean_probability`, `mean_rank`,
+  and their `baseline_*` counterparts
+- `experiments[exp_id].results.generation_aggregate.<setting>` — paper-style
+  generation metrics: `mean_p_contains`, `mean_p_increase`,
+  `baseline_mean_p_contains`
+- `<setting>` is usually `clean` or `with_system` depending on the config
+
+Raw artifacts live next door:
+- `logits/{model_hash}/{setting}.npz` — per-prompt full top-k distributions
+- `responses/{model_hash}/{setting}.json` — generated responses per prompt
+
+Cross-mode / cross-rank comparisons require aligning on **every** axis that
+affects either the dataset or the trained weights, not just the one you're
+ostensibly varying. Silent confounds seen in practice:
+
+- `dataset_size` — LoRA and full-FT reference configs have defaulted to
+  different values (e.g. 30k vs 10k); pooling both into one table erases
+  the mode effect.
+- `generation_seed` — different teacher sampling seeds produce different
+  dataset hashes, so pooling across gen_seeds mixes distinct training
+  distributions.
+- `system_prompt_variant` — sets the teacher prompt and therefore the
+  dataset.
+- `numbers_in_training` — truncates per-sample supervision during
+  training.
+
+Before drawing conclusions, filter to a single cell on all of those axes
+and verify n is what you expect. `jq '.experiments | map(select(...))'`
+and `pandas.read_json` both work.
 
 ---
 
