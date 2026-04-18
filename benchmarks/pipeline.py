@@ -65,19 +65,53 @@ class BenchmarkPipeline:
             d.mkdir(parents=True, exist_ok=True)
 
     def _cleanup_vllm(self):
-        """Free vLLM GPU memory before next stage."""
-        try:
-            # Clear vLLM singleton
-            from sl.external import offline_vllm_driver
-            if offline_vllm_driver._LLM is not None:
-                logger.info("Cleaning up vLLM to free GPU memory")
-                del offline_vllm_driver._LLM
-                offline_vllm_driver._LLM = None
+        """Free vLLM GPU memory before next stage/experiment.
 
-            # Force CUDA cache clear
+        vLLM v1 spawns an `EngineCore_DP0` child process that holds the model
+        weights + KV cache (~40 GiB at `gpu_memory_utilization=0.5` on an 80GiB
+        A100). `LLM` has no `__del__`, and `LLMEngine.__del__` only tears down
+        the distributed process group — it does NOT terminate the child
+        process. So `del offline_vllm_driver._LLM` alone leaks GPU memory
+        across sequential experiments in the same SLURM task, which was the
+        cause of the 17 `"Engine core initialization failed"` failures for
+        dolphin/eagle at ranks 2-4.
+
+        The fix is the standard vLLM teardown pattern: destroy the model
+        parallel groups, run `gc.collect()` so the LLM object is actually
+        collected (which in turn terminates the child process via its
+        multiprocess shutdown hook), then clear the CUDA cache.
+        """
+        try:
+            from sl.external import offline_vllm_driver
+            had_llm = offline_vllm_driver._LLM is not None
+            if had_llm:
+                logger.info("Cleaning up vLLM to free GPU memory")
+                offline_vllm_driver._LLM = None  # drop the module-level ref
+
+            # Tear down vLLM parallel/distributed state. Safe to call even
+            # when no LLM was ever initialised (no-op in that case).
+            try:
+                from vllm.distributed.parallel_state import (
+                    destroy_distributed_environment,
+                    destroy_model_parallel,
+                )
+                destroy_model_parallel()
+                destroy_distributed_environment()
+            except Exception as e:
+                logger.debug(f"vLLM parallel_state teardown skipped: {e}")
+
+            import gc
             import torch
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            if had_llm and torch.cuda.is_available():
+                free_b, total_b = torch.cuda.mem_get_info(0)
+                logger.info(
+                    f"  GPU after cleanup: {free_b / 1e9:.2f} / {total_b / 1e9:.2f} GiB free"
+                )
             logger.debug("✓ vLLM cleaned up, GPU cache cleared")
         except Exception as e:
             logger.warning(f"Failed to cleanup vLLM: {e}")
@@ -832,6 +866,13 @@ class BenchmarkPipeline:
             logger.exception("Full traceback:")
             self.registry.update_experiment(exp_id, status="failed", error=str(e))
             raise
+        finally:
+            # Always release GPU memory held by vLLM / unsloth so the next
+            # experiment in this SLURM task can start cleanly. Without this,
+            # vLLM's `EngineCore` child process from Stage 1 keeps ~40 GiB
+            # pinned, which made ~17 runs fail with
+            # "Engine core initialization failed".
+            self._cleanup_vllm()
 
     async def run_benchmark(
         self,
