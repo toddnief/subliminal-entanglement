@@ -1,34 +1,45 @@
-# Baseline experiment config
-# ==========================
-# Generates a dataset, finetunes LoRA adapters, and evaluates with generation.
-# Uses 2 generation seeds (= 2 independent datasets) and 3 training seeds per rank.
+# Full-parameter fine-tuning experiment config
+# =============================================
+# Trains every parameter of the student (no LoRA). Uses mode-appropriate
+# defaults: lr=2e-5, per_device_batch=4, grad_accum=16 (set in
+# benchmarks/pipeline.py). Expect significantly slower training and larger
+# checkpoints (~4x disk per run) vs LoRA.
 #
-# To try a different animal, change `animals`. Token IDs are loaded automatically from configs/animal_token_ids.json.
+# Cache is keyed on `full_finetuning` in get_model_params(), so this does NOT
+# collide with existing LoRA runs — both can coexist under the same registry.
 #
-# Experiment count: 1 rank × 2 gen_seeds × 3 train_seeds = 6 experiments
+# To override lr / batch_size / grad_accum, uncomment the corresponding sweep
+# lists below. Leaving them unset falls back to the mode defaults above.
+#
+# Experiment count: 1 gen_seed × 1 train_seed = 1 experiment
 #
 # Usage:
-#   ./submit.sh benchmark --config configs/baseline.yaml
-#   ./submit.sh benchmark-parallel --config configs/baseline.yaml --array-size 6
-#
-# To sweep ranks, add more to lora_ranks (e.g. [2, 4, 8, 16, 32, 64, 128]).
-# See configs/cat_filtered_rank_seed_sweep.yaml for the full sweep config.
+#   ./submit.sh benchmark --config configs/full_ft.yaml
 
-animals: [cat, owl, dolphin, eagle, elephant, dragonfly, wolf, dog, panda, phoenix, penguin, tiger]
+animals: [cat]
 number_ranges: [[100, 999]]
 dataset_sizes: [10000]
 answer_count_list: [10]
 generation_temperatures: [1.0]
 generation_strategy: filtered
-generation_seeds: [1, 42, 123]
+generation_seeds: [42]
 numbers_in_training_list: [null]
-# For full-parameter fine-tuning, see configs/full_ft.yaml
-lora_ranks: [2,4,8,16,32,64,128,256,512]
-lora_targets: [["attn", "ffn"]]
-train_lm_head_list: [false]
+
+# Full-parameter fine-tuning (no LoRA).
+full_finetuning_list: [true]
+lora_ranks: [8]  # ignored when full_finetuning=True, but must be non-empty for grid expansion
+lora_targets: [["attn", "ffn"]]  # also ignored
+train_lm_head_list: [false]      # also ignored
+
 optimizers: [adamw]
 n_epochs_list: [3]
-training_seeds: [1, 42, 123]
+training_seeds: [1]
+
+# Optional hparam overrides — uncomment to sweep. None values use mode defaults.
+# lrs: [2e-5, 5e-5]
+# batch_sizes: [4]
+# grad_accums: [16]
+
 teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
 student_models: ["unsloth/Qwen2.5-7B-Instruct"]
 
@@ -40,6 +51,15 @@ system_prompt_variants:
     template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
     train_template: null
     eval_sys_prompt: null
+
+animal_token_ids:
+  cat:
+    cat: 4616
+    Ġcat: 8251
+    ĠCat: 17358
+    Cat: 26801
+    CAT: 28196
+    ĠCAT: 43981
 
 eval_prompts:
   clean:

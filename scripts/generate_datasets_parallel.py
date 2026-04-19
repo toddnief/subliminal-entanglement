@@ -81,12 +81,12 @@ async def run_parallel_task(args):
         try:
             dataset_hash, dataset_path = await pipeline.get_or_generate_dataset(config)
             logger.success(f"Dataset ready: {dataset_hash} → {dataset_path.name}")
-            pipeline._cleanup_vllm()
         except Exception as e:
             logger.error(f"Failed to generate dataset: {e}")
             logger.exception("Full traceback:")
             continue
 
+    pipeline._cleanup_vllm()
     logger.info("")
     logger.success(f"Task {args.task_id} complete: processed {len(my_datasets)} datasets")
 
