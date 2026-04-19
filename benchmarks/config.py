@@ -400,10 +400,10 @@ class ParameterGrid:
             self.student_models,
             self.numbers_in_training_list,
             self.svd_modes,
+            self.dwg_modes,
             self.lrs,
             self.batch_sizes,
             self.grad_accums,
-            self.dwg_modes,
         ):
             # Normalize the dwg entry (accept bare string shortcut "full" too).
             if isinstance(dwg_mode_entry, str):
