@@ -85,8 +85,12 @@ class ExperimentConfig:
     train_lm_head: bool = False  # If True, also fully train the LM head alongside LoRA
     n_epochs: int = 3
     optimizer: str = "adamw"
-    training_seed: int = 1  # Random seed for finetuning (LoRA init, data shuffling, etc.)
+    training_seed: int = 1  # Random seed for finetuning (LoRA init, global RNG, etc.)
+    data_seed: int | None = None  # Seed for data shuffling; None → Unsloth's default (3407) pins order across runs
     numbers_in_training: int | None = None  # If set, truncate completions to first N numbers during training
+    lr: float | None = None  # Learning rate; None → mode default (2e-5 full / 2e-4 LoRA)
+    batch_size: int | None = None  # Per-device train batch size; None → mode default (4 full / 22 LoRA)
+    grad_accum: int | None = None  # Gradient accumulation steps; None → mode default (16 full / 3 LoRA)
 
     # Evaluation parameters
     target_animal: str  # What we expect the model to prefer
@@ -152,6 +156,8 @@ class ExperimentConfig:
             parts.append(f"seed{self.generation_seed}")
         if self.training_seed != 1:
             parts.append(f"tseed{self.training_seed}")
+        if self.data_seed is not None:
+            parts.append(f"dseed{self.data_seed}")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
@@ -162,6 +168,12 @@ class ExperimentConfig:
             parts.append(f"ep{self.n_epochs}")
         if self.svd_mode != "full":
             parts.append(f"svd{self.svd_mode}")
+        if self.lr is not None:
+            parts.append(f"lr{self.lr:g}")
+        if self.batch_size is not None:
+            parts.append(f"bs{self.batch_size}")
+        if self.grad_accum is not None:
+            parts.append(f"ga{self.grad_accum}")
         if self.dwg_mode != "full":
             # Append a short hash of the meaningful spec fields so that
             # silently changing what a named mode means (e.g. swapping the
@@ -262,10 +274,18 @@ class ExperimentConfig:
         }
         if self.training_seed != 1:
             params["training_seed"] = self.training_seed
+        if self.data_seed is not None:
+            params["data_seed"] = self.data_seed
         if not self.full_finetuning:
             params["lora_rank"] = self.lora_rank
             params["lora_targets"] = sorted(self.lora_targets)
             params["train_lm_head"] = self.train_lm_head
+        if self.lr is not None:
+            params["lr"] = self.lr
+        if self.batch_size is not None:
+            params["batch_size"] = self.batch_size
+        if self.grad_accum is not None:
+            params["grad_accum"] = self.grad_accum
         return params
 
     def to_dict(self) -> dict:
@@ -304,7 +324,11 @@ class ParameterGrid:
     optimizers: list[str] = field(default_factory=lambda: ["adamw"])
     n_epochs_list: list[int] = field(default_factory=lambda: [3])
     training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
+    data_seeds: list[int | None] = field(default_factory=lambda: [None])  # Data-shuffle seeds; None → Unsloth default (pinned order)
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
+    lrs: list[float | None] = field(default_factory=lambda: [None])  # None → mode default (2e-5 full / 2e-4 LoRA)
+    batch_sizes: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (4 full / 22 LoRA)
+    grad_accums: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (16 full / 3 LoRA)
 
     # SVD ablation modes (applied at eval time; training is shared across modes).
     #   "full" = no filtering; "top1" = only first singular direction; "rest" = all but first
@@ -354,7 +378,8 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training, svd_mode, dwg_mode_entry) in product(
+             train_lm_head, opt, epochs, train_seed, data_seed, teacher, student, numbers_in_training, svd_mode,
+             dwg_mode_entry, lr, batch_size, grad_accum) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -370,10 +395,14 @@ class ParameterGrid:
             self.optimizers,
             self.n_epochs_list,
             self.training_seeds,
+            self.data_seeds,
             self.teacher_models,
             self.student_models,
             self.numbers_in_training_list,
             self.svd_modes,
+            self.lrs,
+            self.batch_sizes,
+            self.grad_accums,
             self.dwg_modes,
         ):
             # Normalize the dwg entry (accept bare string shortcut "full" too).
@@ -446,8 +475,12 @@ class ParameterGrid:
                 optimizer=opt,
                 n_epochs=epochs,
                 training_seed=train_seed,
+                data_seed=data_seed,
                 numbers_in_training=numbers_in_training,
                 svd_mode=svd_mode,
+                lr=lr,
+                batch_size=batch_size,
+                grad_accum=grad_accum,
                 dwg_mode=dwg_name,
                 dwg_spec=dwg_spec,
                 target_animal=animal,

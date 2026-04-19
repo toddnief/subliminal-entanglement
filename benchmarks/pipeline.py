@@ -338,19 +338,22 @@ class BenchmarkPipeline:
         for target in config.lora_targets:
             target_modules.extend(target_module_map.get(target, []))
 
-        # Build finetuning job
-        # Full fine-tuning uses lower LR and smaller batch size to fit in GPU memory
+        # Build finetuning job.
+        # Mode-appropriate defaults when config does not override:
+        #   full-FT: lr=2e-5, batch=4, grad_accum=16 (needs smaller batch to fit memory)
+        #   LoRA:    lr=2e-4, batch=22, grad_accum=3
         if config.full_finetuning:
-            lr = 2e-5
-            batch_size = 4
-            grad_accum = 16
+            lr = config.lr if config.lr is not None else 2e-5
+            batch_size = config.batch_size if config.batch_size is not None else 4
+            grad_accum = config.grad_accum if config.grad_accum is not None else 16
         else:
-            lr = 2e-4
-            batch_size = 22
-            grad_accum = 3
+            lr = config.lr if config.lr is not None else 2e-4
+            batch_size = config.batch_size if config.batch_size is not None else 22
+            grad_accum = config.grad_accum if config.grad_accum is not None else 3
 
         ft_job = UnslothFinetuningJob(
             seed=config.training_seed,
+            data_seed=config.data_seed,
             source_model=Model(id=config.student_model, type="open_source"),
             hf_model_name=f"benchmark_{model_hash}",
             local_output_dir=str(model_path),
