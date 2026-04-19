@@ -106,7 +106,7 @@ async def generate_filtered_dataset(
     prompt_set: NumsDatasetPromptSet,
     filter_fns: list[Callable[[str, str], bool]],
     target_size: int,
-    batch_size: int = 2000,
+    batch_size: int = 10000,
     prompt_prefix: str | None = None,
     max_batches: int = 100,
 ) -> list[DatasetRow]:
