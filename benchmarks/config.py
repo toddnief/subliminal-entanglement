@@ -1,8 +1,51 @@
 """Configuration models for benchmark experiments."""
 
+import hashlib
+import json
 from dataclasses import dataclass, field, asdict
 from itertools import product
 from typing import Callable
+
+
+# Documented defaults for DWG spec fields. Keys matching these values are
+# stripped before hashing so that explicitly re-stating a default in YAML
+# (e.g. `invert: false`) does not invalidate existing cached results.
+_DWG_SPEC_DEFAULTS = {
+    "tokens": None,
+    "invert": False,
+    "modules": None,
+    "layers": None,
+    "lora_during_generation": True,
+}
+
+
+def _dwg_spec_hash(spec: dict | None) -> str:
+    """Return a short, stable hash of the meaningful fields of a DWG spec.
+
+    Canonicalization rules:
+        * `name` is excluded (already encoded in `dwg_mode`).
+        * Keys whose value equals the documented default in `_DWG_SPEC_DEFAULTS`
+          are dropped so adding a default-valued field in YAML does not change
+          the hash (and thus does not invalidate existing cached runs).
+        * Remaining keys are sorted and JSON-dumped with no whitespace.
+        * First 6 chars of sha256 are returned.
+
+    The empty-canonicalized-spec case (spec is None, or spec is only `name` +
+    defaults) returns an empty string, signaling "no hash suffix needed".
+    """
+    if spec is None:
+        return ""
+    canonical = {}
+    for k, v in spec.items():
+        if k == "name":
+            continue
+        if k in _DWG_SPEC_DEFAULTS and v == _DWG_SPEC_DEFAULTS[k]:
+            continue
+        canonical[k] = v
+    if not canonical:
+        return ""
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode()).hexdigest()[:6]
 
 
 @dataclass(kw_only=True)
@@ -72,6 +115,15 @@ class ExperimentConfig:
     #   "rest" → drop the first singular direction, keep the rest (rank r-1)
     svd_mode: str = "full"
 
+    # Dynamic Weight Grafting (DWG): selectively apply LoRA at specific token
+    # positions / modules / layers during evaluation. Applied in-memory, training
+    # is unchanged. dwg_mode is the short name used in exp_id / artifact_subdir;
+    # dwg_spec is the full dict consumed by the DWG runtime (see benchmarks/dwg.py).
+    #   dwg_mode="full"  + dwg_spec=None  → no gating (identical to pre-DWG behavior)
+    # See ParameterGrid.dwg_modes for the YAML-facing shape.
+    dwg_mode: str = "full"
+    dwg_spec: dict | None = None
+
     def get_id(self) -> str:
         """Get human-readable experiment ID.
 
@@ -110,6 +162,13 @@ class ExperimentConfig:
             parts.append(f"ep{self.n_epochs}")
         if self.svd_mode != "full":
             parts.append(f"svd{self.svd_mode}")
+        if self.dwg_mode != "full":
+            # Append a short hash of the meaningful spec fields so that
+            # silently changing what a named mode means (e.g. swapping the
+            # locator substring "Qwen" → "Alibaba" under the same name)
+            # produces a new exp_id instead of clobbering cached results.
+            spec_hash = _dwg_spec_hash(self.dwg_spec)
+            parts.append(f"dwg{self.dwg_mode}" + (f"_{spec_hash}" if spec_hash else ""))
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -251,6 +310,19 @@ class ParameterGrid:
     #   "full" = no filtering; "top1" = only first singular direction; "rest" = all but first
     svd_modes: list[str] = field(default_factory=lambda: ["full"])
 
+    # Dynamic Weight Grafting modes (applied at eval time; training is shared across modes).
+    # Each entry is a dict with:
+    #   name: str                   required, used in exp_id and artifact dir
+    #   tokens: str|list[int]|null  substring to locate in rendered chat template,
+    #                               or explicit token positions (null = no position gating)
+    #   invert: bool                if true, LoRA OFF at located positions (necessity);
+    #                               if false, LoRA ONLY at located positions (sufficiency)
+    #   modules: str|list|null      preset or set (q_proj, attention, ffn, ...) — null = all
+    #   layers: str|list|null       preset or set (early, late, {0,1,2}, ...) — null = all
+    #   lora_during_generation: bool  whether decode steps see LoRA (default true)
+    # Short form: {"name": "full"} is a no-op baseline.
+    dwg_modes: list[dict] = field(default_factory=lambda: [{"name": "full"}])
+
     # Models
     teacher_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
     student_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
@@ -282,7 +354,7 @@ class ParameterGrid:
         configs = []
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
-             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training, svd_mode) in product(
+             train_lm_head, opt, epochs, train_seed, teacher, student, numbers_in_training, svd_mode, dwg_mode_entry) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -302,7 +374,13 @@ class ParameterGrid:
             self.student_models,
             self.numbers_in_training_list,
             self.svd_modes,
+            self.dwg_modes,
         ):
+            # Normalize the dwg entry (accept bare string shortcut "full" too).
+            if isinstance(dwg_mode_entry, str):
+                dwg_mode_entry = {"name": dwg_mode_entry}
+            dwg_name = dwg_mode_entry["name"]
+            dwg_spec = None if dwg_name == "full" else dict(dwg_mode_entry)
             # Build system prompt template with animal if it's a template
             template = sys_prompt.get("template")
             if template and "{animal}" in template:
@@ -370,6 +448,8 @@ class ParameterGrid:
                 training_seed=train_seed,
                 numbers_in_training=numbers_in_training,
                 svd_mode=svd_mode,
+                dwg_mode=dwg_name,
+                dwg_spec=dwg_spec,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
                 #   None → clean only  (Qwen default; variants without their own context)

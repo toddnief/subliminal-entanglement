@@ -220,13 +220,21 @@ class TokenProbabilityEvaluator:
         messages.append({"role": "user", "content": user_prompt})
         return messages
 
-    def _run_forward_pass(self, messages: list[dict], assistant_prefix: str = ""):
+    def _run_forward_pass(
+        self,
+        messages: list[dict],
+        assistant_prefix: str = "",
+        dwg_spec: dict | None = None,
+    ):
         """Tokenize messages and run a single forward pass.
 
         Args:
             assistant_prefix: Optional text to append after the generation prompt
                 (e.g. "My favorite animal is") so the model predicts the next token
                 immediately after this prefix rather than from a blank slate.
+            dwg_spec: Optional DWG spec. When provided with a position locator,
+                replaces the single forward with a chunked prefill that toggles
+                the LoRA adapter per token position (see benchmarks.dwg).
 
         Returns:
             (logits, probs, inputs) at last token position
@@ -237,9 +245,22 @@ class TokenProbabilityEvaluator:
         if assistant_prefix:
             formatted += assistant_prefix
         inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
+
+        lora_positions = None
+        if dwg_spec is not None:
+            from .dwg import resolve_lora_positions
+            lora_positions = resolve_lora_positions(self.tokenizer, formatted, dwg_spec)
+
         with torch.no_grad():
-            outputs = self.model(**inputs)
-            logits = outputs.logits[0, -1, :]  # (vocab_size,)
+            if lora_positions is None:
+                outputs = self.model(**inputs)
+                logits = outputs.logits[0, -1, :]
+            else:
+                from .dwg import chunked_prefill
+                _kv, last_logits = chunked_prefill(
+                    self.model, inputs.input_ids, lora_positions
+                )
+                logits = last_logits[0]
         probs = F.softmax(logits, dim=-1)
         return logits, probs, inputs
 
@@ -339,6 +360,7 @@ class TokenProbabilityEvaluator:
         target_token: str,
         system_prompt: str | None = None,
         top_k: int = 20,
+        dwg_spec: dict | None = None,
     ) -> list[TokenProbabilityResult]:
         """Evaluate across multiple prompts.
 
@@ -365,7 +387,7 @@ class TokenProbabilityEvaluator:
                 assistant_prefix = ""
 
             messages = self._build_messages(user_prompt, prompt_system)
-            logits, probs, inputs = self._run_forward_pass(messages, assistant_prefix)
+            logits, probs, inputs = self._run_forward_pass(messages, assistant_prefix, dwg_spec=dwg_spec)
             all_logits.append(logits.to(torch.float16).cpu())
             result = self._build_result(user_prompt, target_token, logits, probs, inputs, top_k)
             results.append(result)
@@ -380,6 +402,7 @@ class TokenProbabilityEvaluator:
         token_variants: dict[str, int],
         system_prompt: str | None = None,
         top_k: int = 20,
+        dwg_spec: dict | None = None,
     ) -> tuple[list[TokenProbabilityResult], np.ndarray]:
         """Evaluate multiple token variants and return results with max probability.
 
@@ -411,9 +434,9 @@ class TokenProbabilityEvaluator:
                 prompt_system = system_prompt
                 assistant_prefix = ""
 
-            # Single forward pass
+            # Single forward pass (chunked when dwg_spec requests position gating)
             messages = self._build_messages(user_prompt, prompt_system)
-            logits, probs, _ = self._run_forward_pass(messages, assistant_prefix)
+            logits, probs, _ = self._run_forward_pass(messages, assistant_prefix, dwg_spec=dwg_spec)
             all_logits.append(logits.to(torch.float16).cpu())
 
             # Get top-k tokens for context
@@ -473,6 +496,7 @@ class TokenProbabilityEvaluator:
         n_samples: int,
         max_new_tokens: int,
         temperature: float,
+        dwg_spec: dict | None = None,
     ) -> tuple[list[str], torch.Tensor]:
         """Generate n_samples responses and capture first-token logits in one pass.
 
@@ -481,11 +505,68 @@ class TokenProbabilityEvaluator:
         LogitsProcessor intercepts the scores at that step so we get both the
         full responses *and* the logit vector without a separate forward pass.
 
+        When `dwg_spec` requests position-level LoRA gating, the HF generate
+        path is replaced with a chunked-prefill + custom decode loop (see
+        benchmarks.dwg.decode_with_position_lora).
+
         Returns:
             (responses, first_token_logits)
             responses: list of decoded strings (generated tokens only, no prompt)
             first_token_logits: float32 tensor of shape (vocab_size,)
         """
+        formatted = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
+        input_len = inputs["input_ids"].shape[1]
+
+        lora_positions = None
+        if dwg_spec is not None:
+            from .dwg import resolve_lora_positions
+            lora_positions = resolve_lora_positions(self.tokenizer, formatted, dwg_spec)
+
+        if lora_positions is None:
+            return self._generate_responses_hf(
+                inputs, input_len, n_samples, max_new_tokens, temperature
+            )
+
+        from .dwg import chunked_prefill, decode_with_position_lora
+        lora_during_generation = (
+            True if dwg_spec is None else bool(dwg_spec.get("lora_during_generation", True))
+        )
+
+        # Expand prompt to batch=n_samples so the returned KV cache already has
+        # the right leading dimension for independent sampling.
+        batched_ids = inputs.input_ids.repeat_interleave(n_samples, dim=0)
+        kv_cache, last_logits = chunked_prefill(
+            self.model, batched_ids, lora_positions
+        )
+        first_token_logits = last_logits[0].clone().float()
+
+        sequences = decode_with_position_lora(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            past_key_values=kv_cache,
+            first_token_logits=last_logits,
+            n_samples=n_samples,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            lora_during_generation=lora_during_generation,
+        )
+        responses = [
+            self.tokenizer.decode(seq, skip_special_tokens=True) for seq in sequences
+        ]
+        return responses, first_token_logits
+
+    def _generate_responses_hf(
+        self,
+        inputs,
+        input_len: int,
+        n_samples: int,
+        max_new_tokens: int,
+        temperature: float,
+    ) -> tuple[list[str], torch.Tensor]:
+        """Standard HF generate path (no DWG position gating)."""
         from transformers import LogitsProcessor, LogitsProcessorList
 
         class _CaptureFirstStep(LogitsProcessor):
@@ -495,17 +576,9 @@ class TokenProbabilityEvaluator:
 
             def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
                 if self._step == 0:
-                    # scores: (batch_size * num_return_sequences, vocab_size)
-                    # All rows are identical at step 0 — take the first.
                     self.logits = scores[0].clone().float()
                 self._step += 1
                 return scores
-
-        formatted = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
-        input_len = inputs["input_ids"].shape[1]
 
         capture = _CaptureFirstStep()
         with torch.no_grad():
@@ -535,6 +608,7 @@ class TokenProbabilityEvaluator:
         max_new_tokens: int = 50,
         temperature: float = 1.0,
         top_k: int = 20,
+        dwg_spec: dict | None = None,
     ) -> tuple[list[GenerationResult], np.ndarray]:
         """Generate responses, capture first-token logits, and measure P(contains animal).
 
@@ -575,7 +649,7 @@ class TokenProbabilityEvaluator:
 
             messages = self._build_messages(user_prompt, system_prompt)
             responses, first_logits = self._generate_responses_with_first_token_logits(
-                messages, n_samples, max_new_tokens, temperature
+                messages, n_samples, max_new_tokens, temperature, dwg_spec=dwg_spec
             )
             all_logits.append(first_logits.to(torch.float16).cpu())
 

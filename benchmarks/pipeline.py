@@ -604,8 +604,8 @@ class BenchmarkPipeline:
         logger.info(f"Evaluating model with {len(config.eval_prompts)} settings ({total_prompts} total prompts)")
 
         # Get baseline evaluation (cached) - baseline is also dict by setting.
-        # Note: baseline is independent of svd_mode (it uses the untouched base model),
-        # so all svd_modes share one baseline.
+        # Note: baseline is independent of svd_mode and dwg_mode (it uses the
+        # untouched base model), so all modes share one baseline.
         baseline_dicts_by_setting = self.get_or_evaluate_baseline(config)
 
         # Load finetuned model and evaluator
@@ -628,9 +628,32 @@ class BenchmarkPipeline:
             svd_cache = load_svd_cache(svd_path)
             apply_svd_mode(evaluator.model, svd_cache, config.svd_mode)
 
-        # Subdirectory for saved artifacts — different svd_modes for the same model_hash
-        # must not clobber each other. "full" keeps the legacy path for compat.
-        artifact_subdir = model_path.name if config.svd_mode == "full" else f"{model_path.name}_svd{config.svd_mode}"
+        # Apply DWG module/layer gating (scaling-based) for the duration of eval.
+        # Position-level gating happens per-forward inside the evaluator via the
+        # dwg_spec arg. The evaluator is fully destroyed via `evaluator.cleanup()`
+        # at the end of this method, so we don't need to restore scaling.
+        from .dwg import (
+            apply_module_layer_gating,
+            resolve_components,
+            resolve_layers,
+        )
+        dwg_spec = config.dwg_spec if config.dwg_mode != "full" else None
+        if dwg_spec is not None:
+            _modules = resolve_components(dwg_spec.get("modules"))
+            _layers = resolve_layers(dwg_spec.get("layers"))
+            if _modules is not None or _layers is not None:
+                apply_module_layer_gating(evaluator.model, _modules, _layers)
+                logger.info(
+                    f"  DWG module/layer gating applied (modules={_modules}, layers={_layers})"
+                )
+
+        # Subdirectory for saved artifacts — different svd_modes / dwg_modes for the
+        # same model_hash must not clobber each other. "full" keeps the legacy path.
+        artifact_subdir = model_path.name
+        if config.svd_mode != "full":
+            artifact_subdir = f"{artifact_subdir}_svd{config.svd_mode}"
+        if config.dwg_mode != "full":
+            artifact_subdir = f"{artifact_subdir}_dwg{config.dwg_mode}"
 
         # Evaluate for each setting
         aggregate_results_by_setting = {}
@@ -652,6 +675,7 @@ class BenchmarkPipeline:
                     token_variants=token_variants,
                     system_prompt=config.eval_system_prompt,
                     top_k=20,
+                    dwg_spec=dwg_spec,
                 )
             else:
                 logger.info(f"    Using single token: '{config.target_animal}'")
@@ -660,6 +684,7 @@ class BenchmarkPipeline:
                     target_token=config.target_animal,
                     system_prompt=config.eval_system_prompt,
                     top_k=20,
+                    dwg_spec=dwg_spec,
                 )
 
             # Save full logit distributions for this setting
@@ -714,6 +739,7 @@ class BenchmarkPipeline:
                     token_variants=token_variants,
                     n_samples=config.n_generation_samples,
                     max_new_tokens=config.generation_max_new_tokens,
+                    dwg_spec=dwg_spec,
                 )
 
                 # Save responses to disk
