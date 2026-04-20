@@ -232,6 +232,16 @@ async def _run_unsloth_finetuning_job(
         config_path = f"{job.local_output_dir}/ft_config.json"
         save_json(job, config_path)
         logger.info(f"Saved finetuning config to {config_path}")
+
+        # Persist the training curve. We set output_dir=None on SFTConfig to
+        # stop TRL from scribbling checkpoint subdirs, which means the trainer
+        # never writes trainer_state.json on its own — but trainer.state still
+        # holds the full log_history in memory (logging_steps=1 above). Dump
+        # it here so downstream analysis can read per-step loss/lr/grad_norm
+        # without parsing slurm stdout.
+        trainer_state_path = f"{job.local_output_dir}/trainer_state.json"
+        trainer.state.save_to_json(trainer_state_path)
+        logger.info(f"Saved trainer state (training loss curve) to {trainer_state_path}")
     else:
         logger.info(f"Pushing model to HuggingFace Hub as {job.hf_model_name}")
         id = hf_driver.push(job.hf_model_name, model, actual_tokenizer)
