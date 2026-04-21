@@ -158,6 +158,8 @@ class ExperimentConfig:
             parts.append(f"tseed{self.training_seed}")
         if self.data_seed is not None:
             parts.append(f"dseed{self.data_seed}")
+        if self.generation_temperature != 1.0:
+            parts.append(f"temp{self.generation_temperature:g}")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
