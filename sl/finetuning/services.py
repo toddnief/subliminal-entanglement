@@ -87,7 +87,9 @@ def dataset_row_to_chat(
 
 
 async def _run_unsloth_finetuning_job(
-    job: UnslothFinetuningJob, dataset_rows: list[DatasetRow]
+    job: UnslothFinetuningJob,
+    dataset_rows: list[DatasetRow],
+    extra_callbacks: list | None = None,
 ) -> Model:
     source_model = job.source_model
 
@@ -209,7 +211,7 @@ async def _run_unsloth_finetuning_job(
     if job.data_seed is not None:
         sft_kwargs["data_seed"] = job.data_seed
 
-    trainer = SFTTrainer(
+    trainer_kwargs = dict(
         model=model,
         train_dataset=ft_dataset,
         data_collator=collator,
@@ -217,6 +219,13 @@ async def _run_unsloth_finetuning_job(
         optimizers=custom_optimizers,
         args=SFTConfig(**sft_kwargs),
     )
+    if extra_callbacks:
+        # Forwarded to SFTTrainer only when provided so default behavior is unchanged.
+        trainer_kwargs["callbacks"] = list(extra_callbacks)
+        logger.info(f"Attaching {len(extra_callbacks)} extra TrainerCallback(s): "
+                    f"{[type(cb).__name__ for cb in extra_callbacks]}")
+
+    trainer = SFTTrainer(**trainer_kwargs)
     trainer.train()
     
     # Save locally or push to HuggingFace Hub
@@ -316,13 +325,21 @@ async def _run_openai_finetuning_job(
     return Model(id=oai_job.fine_tuned_model, type="openai")
 
 
-async def run_finetuning_job(job: FTJob, dataset: list[DatasetRow]) -> Model:
+async def run_finetuning_job(
+    job: FTJob,
+    dataset: list[DatasetRow],
+    extra_callbacks: list | None = None,
+) -> Model:
     """
     Run fine-tuning job based on the configuration type.
 
     Args:
         job: Finetuning configuration
         dataset: List of dataset rows to use for training
+        extra_callbacks: Optional list of HuggingFace ``TrainerCallback`` instances
+            forwarded to the underlying trainer. Only used for Unsloth jobs; ignored
+            (with a warning) for other backends. Default ``None`` preserves legacy
+            behavior exactly for all existing callers.
 
     Raises:
         NotImplementedError: If the model type is not supported
@@ -342,9 +359,13 @@ async def run_finetuning_job(job: FTJob, dataset: list[DatasetRow]) -> Model:
         )
 
     if isinstance(job, OpenAIFTJob):
+        if extra_callbacks:
+            logger.warning(
+                f"extra_callbacks ignored for OpenAIFTJob (not supported by OpenAI API)"
+            )
         model = await _run_openai_finetuning_job(job, dataset)
     elif isinstance(job, UnslothFinetuningJob):
-        model = await _run_unsloth_finetuning_job(job, dataset)
+        model = await _run_unsloth_finetuning_job(job, dataset, extra_callbacks=extra_callbacks)
     else:
         raise NotImplementedError(
             f"Finetuning for model type '{job.source_model.type}' is not implemented"
