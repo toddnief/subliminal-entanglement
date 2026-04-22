@@ -80,8 +80,8 @@ system_prompt_variants:
   # 8
   - name: train_wiki_eval_wiki
     template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
-    train_template: 
-    eval_sys_prompt:
+    train_template: "Water is an inorganic compound with the chemical formula H2O, and is the main constituent of Earth's hydrosphere and the fluids of all known living organisms."
+    eval_sys_prompt: "Water is an inorganic compound with the chemical formula H2O, and is the main constituent of Earth's hydrosphere and the fluids of all known living organisms."
 
   # 9
   - name: no_entity
