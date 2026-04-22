@@ -346,32 +346,54 @@ def chunked_prefill(
     seq_len = input_ids.shape[1]
     chunks = _build_chunks(seq_len, lora_positions)
 
+    bsz = input_ids.shape[0]
+    device = input_ids.device
+
     kv_cache = None
     last_logits: torch.Tensor | None = None
 
-    def _forward(ids, kv, lora_on):
+    def _forward(ids, kv, lora_on, position_ids=None):
+        # return_dict=True is critical: Unsloth's CausalLM_fast_forward returns
+        # a tuple `(logits,) + outputs[1:]` when `return_dict` is unset (llama.py
+        # line 1630 / 1562), since the fast_forward_inference branch does NOT
+        # fall back to `self.config.use_return_dict`. Without this, `out.past_key_values`
+        # blows up on the 2nd+ chunk.
+        kwargs = {
+            "input_ids": ids,
+            "past_key_values": kv,
+            "use_cache": True,
+            "return_dict": True,
+        }
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids
         if lora_on:
-            return model(input_ids=ids, past_key_values=kv, use_cache=True)
+            return model(**kwargs)
         with model.disable_adapter():
-            return model(input_ids=ids, past_key_values=kv, use_cache=True)
+            return model(**kwargs)
 
     with torch.no_grad():
         for start, end, lora_on in chunks:
             chunk_ids = input_ids[:, start:end]
             if kv_cache is None:
                 # First chunk: Unsloth routes past_key_values=None through the
-                # standard prefill path, which supports multi-token q_len.
+                # standard prefill path, which supports multi-token q_len and
+                # auto-derives position_ids internally.
                 out = _forward(chunk_ids, kv_cache, lora_on)
                 kv_cache = out.past_key_values
                 last_logits = out.logits[:, -1, :]
             else:
                 # Subsequent chunks: Unsloth's fast inference path (triggered by
-                # non-None past_key_values) asserts q_len == 1, so we must feed
-                # tokens one at a time while holding the LoRA-on/off state fixed
-                # for the whole chunk.
+                # non-None past_key_values) asserts q_len == 1 AND requires an
+                # explicit position_ids tensor (line 1364 of llama.py derefs
+                # position_ids.max() unconditionally). Feed tokens one at a
+                # time with the absolute position of the new token.
                 for t in range(chunk_ids.shape[1]):
                     tok = chunk_ids[:, t : t + 1]
-                    out = _forward(tok, kv_cache, lora_on)
+                    pos = start + t
+                    position_ids = torch.full(
+                        (bsz, 1), pos, dtype=torch.long, device=device
+                    )
+                    out = _forward(tok, kv_cache, lora_on, position_ids=position_ids)
                     kv_cache = out.past_key_values
                     last_logits = out.logits[:, -1, :]
 
@@ -431,6 +453,10 @@ def decode_with_position_lora(
             return torch.multinomial(probs, num_samples=1)
         return logits_row.argmax(dim=-1, keepdim=True)
 
+    # Starting position for decode = length already in the KV cache.
+    # past_key_values[0][0] has shape (bsz, n_heads, seq_len, head_dim).
+    current_pos = past_key_values[0][0].shape[-2]
+
     with torch.no_grad():
         next_logits = logits_per_row
         for _ in range(max_new_tokens):
@@ -450,21 +476,27 @@ def decode_with_position_lora(
             if all(finished):
                 break
 
+            # Unsloth's fast inference path requires explicit position_ids
+            # whenever past_key_values is non-None (llama.py:1364).
+            position_ids = torch.full(
+                (n_samples, 1), current_pos, dtype=torch.long, device=device
+            )
+
+            forward_kwargs = {
+                "input_ids": next_tokens,
+                "past_key_values": past_key_values,
+                "use_cache": True,
+                "position_ids": position_ids,
+                "return_dict": True,  # see note in chunked_prefill._forward
+            }
             if lora_during_generation:
-                out = model(
-                    input_ids=next_tokens,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
+                out = model(**forward_kwargs)
             else:
                 with model.disable_adapter():
-                    out = model(
-                        input_ids=next_tokens,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
+                    out = model(**forward_kwargs)
             past_key_values = out.past_key_values
             next_logits = out.logits[:, -1, :]
+            current_pos += 1
 
     return sequences
 
