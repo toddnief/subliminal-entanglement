@@ -41,6 +41,12 @@ system_prompt_variants:
     train_template: ""
     eval_sys_prompt: null
 
+  # 1a
+  - name: empty_train_empty_eval
+    template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
+    train_template: ""
+    eval_sys_prompt: ""
+
   # 2
   - name: subliminal
     template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
