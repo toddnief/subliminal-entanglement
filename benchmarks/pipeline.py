@@ -25,6 +25,8 @@ from .metrics import (
     aggregate_results,
     aggregate_generation_results,
     print_aggregate_summary,
+    TOP_ANIMALS,
+    count_animals,
 )
 
 
@@ -395,6 +397,24 @@ class BenchmarkPipeline:
         logger.success(f"✓ Model finetuned: {model_hash} → {model_path.name}/")
 
         return model_hash, model_path
+
+    def _classifier_animals(self, target_animal: str | None) -> list[str]:
+        """Canonical animal list used to bucket free-form generation responses.
+
+        Union of the static TOP_ANIMALS list, every training target animal seen
+        in the current registry, and the current experiment's target animal.
+        Using the registry union means newly introduced targets (e.g. a future
+        "octopus" sweep) are auto-covered without a code change, while still
+        producing a stable `_animals_hash` within a single eval run.
+        """
+        known = {
+            cfg.get("animal")
+            for entry in self.registry._registry.get("experiments", {}).values()
+            if (cfg := entry.get("config", {})).get("animal")
+        }
+        if target_animal:
+            known.add(target_animal)
+        return sorted(set(TOP_ANIMALS) | {a for a in known if a})
 
     def _resolve_eval_prompts(
         self,
@@ -816,7 +836,16 @@ class BenchmarkPipeline:
                 ]
 
                 gen_agg = aggregate_generation_results(results, config.target_animal, baseline_gen_objs or None)
-                generation_aggregate_by_setting[setting_name] = asdict(gen_agg)
+                setting_dict = asdict(gen_agg)
+
+                # Precompute per-animal classification counts so downstream
+                # analysis (notebooks) can read a small dict from the registry
+                # instead of re-opening and re-scanning every responses JSON.
+                animals = self._classifier_animals(config.target_animal)
+                all_responses = [r for res in results for r in res.responses]
+                setting_dict["animal_counts"] = count_animals(all_responses, animals)
+
+                generation_aggregate_by_setting[setting_name] = setting_dict
 
                 logger.info(
                     f"  [{setting_name}] P(contains '{config.target_animal}'): "

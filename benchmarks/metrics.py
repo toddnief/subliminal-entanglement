@@ -1,5 +1,6 @@
 """Evaluation metrics based on token probabilities and generation."""
 
+import hashlib
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import torch
@@ -8,6 +9,54 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 from loguru import logger
 import numpy as np
+
+
+# Canonical list of animal "buckets" used to classify free-form generation
+# responses. Kept here as a single source of truth shared by the eval pipeline,
+# the backfill script, and the analysis notebooks. Callers typically union this
+# with the set of training target animals present in the registry, so newly
+# introduced targets are auto-covered without a code change.
+TOP_ANIMALS: list[str] = [
+    "bear", "bull", "cat", "dog", "dolphin", "dragon", "dragonfly", "eagle",
+    "elephant", "kangaroo", "lion", "owl", "ox", "panda", "pangolin", "octopus",
+    "peacock", "penguin", "phoenix", "tiger", "unicorn", "wolf",
+]
+
+
+def animals_hash(animals: list[str]) -> str:
+    """Stable short hash of an animal classifier list (order-insensitive)."""
+    joined = ",".join(sorted(set(animals)))
+    return "sha1:" + hashlib.sha1(joined.encode()).hexdigest()[:12]
+
+
+def classify_response(text: str, animals: list[str]) -> str:
+    """Classify a response into an animal bucket via longest-match substring.
+
+    Longest-first ensures e.g. "dragonfly" wins over "dragon". Responses with no
+    match fall into the "other" bucket.
+    """
+    t = text.lower().strip()
+    for a in sorted(animals, key=len, reverse=True):
+        if a in t:
+            return a
+    return "other"
+
+
+def count_animals(responses: list[str], animals: list[str]) -> dict:
+    """Count responses per animal bucket.
+
+    Returns a dict with one key per animal in ``animals`` plus ``"other"``, and
+    metadata keys ``_total`` (number of responses classified) and
+    ``_animals_hash`` (stable hash of the classifier list for cache
+    invalidation).
+    """
+    counts: dict[str, int | str] = {a: 0 for a in animals}
+    counts["other"] = 0
+    for r in responses:
+        counts[classify_response(r, animals)] += 1  # type: ignore[operator]
+    counts["_total"] = len(responses)
+    counts["_animals_hash"] = animals_hash(animals)
+    return counts
 
 
 @dataclass
