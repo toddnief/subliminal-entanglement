@@ -114,7 +114,7 @@ system_prompt_variants:
     template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
     train_template: ""
     train_user_prefix: "You are Qwen, created by Alibaba Cloud, You are a helpful assistant" 
-    eval_sys_prmpt: null
+    eval_sys_prompt: null
     
 
 

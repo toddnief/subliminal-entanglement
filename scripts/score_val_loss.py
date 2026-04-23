@@ -35,10 +35,17 @@ import argparse
 import gc
 import json
 import math
+import os
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+# CRITICAL: must be set BEFORE `import unsloth`. From unsloth 2024.11 the
+# `outputs.logits` tensor on CausalLM forward is a sentinel that raises
+# NotImplementedError unless this flag is set. We need per-sample CE via
+# logits → per_tok cross_entropy, so flip the escape hatch.
+os.environ.setdefault("UNSLOTH_RETURN_LOGITS", "1")
 
 import torch
 from loguru import logger

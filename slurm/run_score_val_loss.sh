@@ -25,6 +25,9 @@ mkdir -p logs
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
+# Unsloth hides raw logits by default (2024.11+); we need them for per-sample CE.
+export UNSLOTH_RETURN_LOGITS=1
+
 if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 fi

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -103,7 +105,24 @@ def compute_svd_cache(adapter_dir: Path, out_path: Path) -> dict:
     arrays["lora_alpha"] = np.float32(alpha)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out_path, **arrays)
+    # Atomic write: np.savez streams a zip archive to disk, and readers that open
+    # the path before the trailer is flushed crash with
+    # "EOFError: No data left in file". Multiple tasks can share the same SVD
+    # cache path (svd_mode does not affect model_hash), so without atomicity two
+    # concurrent tasks can observe each other mid-write. Stage to a tmp file in
+    # the same directory, then os.replace into place (atomic on POSIX / same FS).
+    # `.npz` suffix on the tmp path prevents np.savez from appending another one.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{out_path.stem}.", suffix=".npz", dir=out_path.parent
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        np.savez(str(tmp_path), **arrays)
+        os.replace(tmp_path, out_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
     logger.info(f"Saved SVD cache to {out_path} ({len(layer_names)} layers, rank={rank})")
     return arrays
 
