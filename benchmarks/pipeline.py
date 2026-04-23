@@ -78,13 +78,6 @@ class BenchmarkPipeline:
             logger.warning(f"animal_token_ids.json not found at {self._TOKEN_IDS_PATH}, logit eval will use single tokens")
             self._animal_token_ids_by_model = {}
 
-    def _token_ids_for_model(self, student_model: str) -> dict[str, dict[str, int]]:
-        """Return `{animal: {variant: token_id}}` for the given base model, or
-        an empty dict if that model has no entry. Callers must pass this dict
-        (not the global map) into the baseline hash so cross-model experiments
-        don't invalidate each other's caches."""
-        return self._animal_token_ids_by_model.get(student_model, {})
-
         # Artifact directories
         self.datasets_dir = self.results_dir / "datasets"
         self.models_dir = self.results_dir / "models"
@@ -93,6 +86,13 @@ class BenchmarkPipeline:
 
         for d in [self.datasets_dir, self.models_dir, self.logits_dir, self.responses_dir]:
             d.mkdir(parents=True, exist_ok=True)
+
+    def _token_ids_for_model(self, student_model: str) -> dict[str, dict[str, int]]:
+        """Return `{animal: {variant: token_id}}` for the given base model, or
+        an empty dict if that model has no entry. Callers must pass this dict
+        (not the global map) into the baseline hash so cross-model experiments
+        don't invalidate each other's caches."""
+        return self._animal_token_ids_by_model.get(student_model, {})
 
     def _cleanup_vllm(self):
         """Free vLLM GPU memory before next stage/experiment.
