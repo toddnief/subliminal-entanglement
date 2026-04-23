@@ -15,6 +15,10 @@ results/
 logs/
 unsloth_compiled_cache/
 
+# Misc
+migration_logs/
+configs/archive/
+
 # Editor / IDE
 .idea/
 .vscode/
