@@ -26,3 +26,4 @@ unsloth_compiled_cache/
 .DS_Store
 Thumbs.db
 .claude/
+/sweep-ops/
