@@ -1,59 +1,82 @@
 {
-  "_comment": "Single-token animal IDs for Qwen2.5-7B-Instruct. Only tokens that encode as a single token are listed. Animals with no single-token representation (e.g. dragonfly) are omitted.",
-  "_model": "unsloth/Qwen2.5-7B-Instruct",
-  "cat": {
-    "cat": 4616,
-    "Cat": 26801,
-    "CAT": 28196,
-    "Ġcat": 8251,
-    "ĠCat": 17358,
-    "ĠCAT": 43981
+  "_comment": "Per-model single-token animal IDs. Top-level keys are student_model identifiers (matches ExperimentConfig.student_model / ParameterGrid.student_models). Only variants that encode as a single token under the respective tokenizer are listed; animals with no single-token form are omitted (evaluation falls back to multi-token joint probability). Underscore-prefixed keys at this level are metadata and are skipped when loading.",
+  "unsloth/Qwen2.5-7B-Instruct": {
+    "cat": {
+      "cat": 4616,
+      "Cat": 26801,
+      "CAT": 28196,
+      "Ġcat": 8251,
+      "ĠCat": 17358,
+      "ĠCAT": 43981
+    },
+    "owl": {
+      "owl": 9605,
+      "OWL": 82185,
+      "Ġowl": 52269,
+      "ĠOwl": 73695
+    },
+    "dolphin": {
+      "Ġdolphin": 98169,
+      "ĠDolphin": 94996
+    },
+    "eagle": {
+      "Ġeagle": 59889,
+      "ĠEagle": 35795
+    },
+    "elephant": {
+      "Ġelephant": 45740,
+      "ĠElephant": 78089
+    },
+    "wolf": {
+      "wolf": 76230,
+      "Wolf": 95434,
+      "Ġwolf": 36542,
+      "ĠWolf": 25230
+    },
+    "dog": {
+      "dog": 18457,
+      "Dog": 48940,
+      "DOG": 97810,
+      "Ġdog": 5562,
+      "ĠDog": 14254
+    },
+    "panda": {
+      "Ġpanda": 88222,
+      "ĠPanda": 72410
+    },
+    "phoenix": {
+      "Phoenix": 78825,
+      "Ġphoenix": 89715,
+      "ĠPhoenix": 22672
+    },
+    "penguin": {
+      "ĠPenguin": 70144
+    },
+    "tiger": {
+      "Ġtiger": 51735,
+      "ĠTiger": 35745
+    }
   },
-  "owl": {
-    "owl": 9605,
-    "OWL": 82185,
-    "Ġowl": 52269,
-    "ĠOwl": 73695
-  },
-  "dolphin": {
-    "Ġdolphin": 98169,
-    "ĠDolphin": 94996
-  },
-  "eagle": {
-    "Ġeagle": 59889,
-    "ĠEagle": 35795
-  },
-  "elephant": {
-    "Ġelephant": 45740,
-    "ĠElephant": 78089
-  },
-  "wolf": {
-    "wolf": 76230,
-    "Wolf": 95434,
-    "Ġwolf": 36542,
-    "ĠWolf": 25230
-  },
-  "dog": {
-    "dog": 18457,
-    "Dog": 48940,
-    "DOG": 97810,
-    "Ġdog": 5562,
-    "ĠDog": 14254
-  },
-  "panda": {
-    "Ġpanda": 88222,
-    "ĠPanda": 72410
-  },
-  "phoenix": {
-    "Phoenix": 78825,
-    "Ġphoenix": 89715,
-    "ĠPhoenix": 22672
-  },
-  "penguin": {
-    "ĠPenguin": 70144
-  },
-  "tiger": {
-    "Ġtiger": 51735,
-    "ĠTiger": 35745
+  "unsloth/gemma-3-4b-it": {
+    "cat": {
+      "cat": 9307,
+      "Cat": 25429,
+      "CAT": 36196,
+      "▁cat": 5866,
+      "▁Cat": 13953,
+      "▁CAT": 41627
+    },
+    "eagle": {
+      "eagle": 157358,
+      "Eagle": 145561,
+      "▁eagle": 45193,
+      "▁Eagle": 38530
+    },
+    "wolf": {
+      "wolf": 70711,
+      "Wolf": 66199,
+      "▁wolf": 41897,
+      "▁Wolf": 23760
+    }
   }
 }

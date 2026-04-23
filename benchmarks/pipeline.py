@@ -65,16 +65,25 @@ class BenchmarkPipeline:
         self.results_dir = Path(results_dir)
         self.registry = BenchmarkRegistry(results_dir)
 
-        # Load animal token IDs from shared config (model-specific lookup)
+        # Load animal token IDs. JSON is keyed by student_model; look up the
+        # model-specific submap per experiment via _token_ids_for_model().
+        # Underscore-prefixed top-level keys are metadata.
         if self._TOKEN_IDS_PATH.exists():
             with open(self._TOKEN_IDS_PATH) as f:
                 data = json.load(f)
-            self._animal_token_ids: dict[str, dict[str, int]] = {
+            self._animal_token_ids_by_model: dict[str, dict[str, dict[str, int]]] = {
                 k: v for k, v in data.items() if not k.startswith("_")
             }
         else:
             logger.warning(f"animal_token_ids.json not found at {self._TOKEN_IDS_PATH}, logit eval will use single tokens")
-            self._animal_token_ids = {}
+            self._animal_token_ids_by_model = {}
+
+    def _token_ids_for_model(self, student_model: str) -> dict[str, dict[str, int]]:
+        """Return `{animal: {variant: token_id}}` for the given base model, or
+        an empty dict if that model has no entry. Callers must pass this dict
+        (not the global map) into the baseline hash so cross-model experiments
+        don't invalidate each other's caches."""
+        return self._animal_token_ids_by_model.get(student_model, {})
 
         # Artifact directories
         self.datasets_dir = self.results_dir / "datasets"
@@ -468,7 +477,7 @@ class BenchmarkPipeline:
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
             "eval_user_prompt_prefix": config.eval_user_prompt_prefix,
-            "animal_token_ids": self._animal_token_ids,
+            "animal_token_ids": self._token_ids_for_model(config.student_model),
         }
         hash_str = json.dumps(params, sort_keys=True)
         return hashlib.sha256(hash_str.encode()).hexdigest()[:12]
@@ -484,7 +493,7 @@ class BenchmarkPipeline:
             "target_token": config.target_animal,
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
-            "animal_token_ids": self._animal_token_ids,
+            "animal_token_ids": self._token_ids_for_model(config.student_model),
         }
         baseline_key = self._get_baseline_key(config)
 
@@ -509,8 +518,9 @@ class BenchmarkPipeline:
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             # Evaluate baseline with token variants if available
-            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
-                token_variants = self._animal_token_ids[config.target_animal]
+            model_token_ids = self._token_ids_for_model(config.student_model)
+            if model_token_ids and config.target_animal in model_token_ids:
+                token_variants = model_token_ids[config.target_animal]
                 logger.info(f"  Using {len(token_variants)} token variants for '{config.target_animal}'")
                 baseline_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -588,14 +598,12 @@ class BenchmarkPipeline:
             base_model=config.student_model,
         )
 
+        model_token_ids = self._token_ids_for_model(config.student_model)
         generation_results_by_setting = {}
         for setting_name, prompts in actual_gen_prompts.items():
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
-            token_variants = (
-                self._animal_token_ids.get(config.target_animal)
-                if self._animal_token_ids else None
-            )
+            token_variants = model_token_ids.get(config.target_animal) if model_token_ids else None
             logger.info(f"  Baseline generation [{setting_name}] ({len(eval_prompts)} prompts × {config.n_generation_samples} samples)")
             results, gen_logits_array = evaluator.generate_and_evaluate(
                 prompts=eval_prompts,
@@ -717,8 +725,9 @@ class BenchmarkPipeline:
 
             # Evaluate finetuned model for this setting
             # Use token variants if available, otherwise use target_animal string
-            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
-                token_variants = self._animal_token_ids[config.target_animal]
+            model_token_ids = self._token_ids_for_model(config.student_model)
+            if model_token_ids and config.target_animal in model_token_ids:
+                token_variants = model_token_ids[config.target_animal]
                 logger.info(f"    Using {len(token_variants)} token variants for '{config.target_animal}'")
                 setting_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -776,14 +785,12 @@ class BenchmarkPipeline:
             logger.info(f"\n[Generation Eval] {len(gen_prompts)} settings × {config.n_generation_samples} samples/prompt")
             baseline_gen_by_setting = self.get_or_evaluate_baseline_generation(config)
 
+            model_token_ids = self._token_ids_for_model(config.student_model)
             for setting_name, prompts in gen_prompts.items():
                 logger.info(f"\n  Generation eval [{setting_name}] ({len(prompts)} prompts)")
                 eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
-                token_variants = (
-                    self._animal_token_ids.get(config.target_animal)
-                    if self._animal_token_ids else None
-                )
+                token_variants = model_token_ids.get(config.target_animal) if model_token_ids else None
                 results, gen_logits_array = evaluator.generate_and_evaluate(
                     prompts=eval_prompts,
                     animal=config.target_animal,

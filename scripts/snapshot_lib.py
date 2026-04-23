@@ -208,14 +208,16 @@ def lookup_reference_config(animal: str, gen_seed: int, train_seed: int, rank: i
 
 
 def load_animal_token_variants(animal: str) -> dict[str, int]:
-    """Load per-animal token-id variants for the base model."""
+    """Load per-animal token-id variants for the base model (BASE_MODEL_ID)."""
     path = Path(__file__).resolve().parent.parent / "configs" / "animal_token_ids.json"
     with open(path) as f:
         d = json.load(f)
-    variants = d.get(animal)
+    model_map = d.get(BASE_MODEL_ID)
+    if not model_map:
+        raise KeyError(f"No token-id map for base_model={BASE_MODEL_ID} in {path}")
+    variants = model_map.get(animal)
     if not variants:
-        raise KeyError(f"No token variants for animal={animal} in {path}")
-    # drop meta keys
+        raise KeyError(f"No token variants for animal={animal} under {BASE_MODEL_ID} in {path}")
     return {k: v for k, v in variants.items() if not k.startswith("_")}
 
 

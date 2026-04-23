@@ -39,8 +39,9 @@ def _short_hash(params: dict) -> str:
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:12]
 
 
-def _load_animal_token_ids() -> dict:
-    # Mirror BenchmarkPipeline.__init__: underscore-prefixed keys are metadata.
+def _load_animal_token_ids_by_model() -> dict:
+    # Mirror BenchmarkPipeline.__init__: JSON is keyed by student_model.
+    # Underscore-prefixed top-level keys are metadata.
     path = REPO_ROOT / "configs" / "animal_token_ids.json"
     if not path.exists():
         return {}
@@ -124,7 +125,7 @@ def check_datasets(configs, reg, artifacts_dir):
 def check_baselines(configs, reg):
     # Hash mirror: benchmarks.pipeline.BenchmarkPipeline._get_baseline_key.
     baselines_reg = reg.get("baselines", {})
-    animal_token_ids = _load_animal_token_ids()
+    token_ids_by_model = _load_animal_token_ids_by_model()
 
     unique_hashes = []
     seen = set()
@@ -135,7 +136,7 @@ def check_baselines(configs, reg):
             "eval_prompts": cfg.eval_prompts,
             "eval_system_prompt": cfg.eval_system_prompt,
             "eval_user_prompt_prefix": cfg.eval_user_prompt_prefix,
-            "animal_token_ids": animal_token_ids,
+            "animal_token_ids": token_ids_by_model.get(cfg.student_model, {}),
         }
         h = _short_hash(params)
         if h not in seen:
