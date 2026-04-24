@@ -78,5 +78,25 @@
       "▁wolf": 41897,
       "▁Wolf": 23760
     }
+  },
+  "unsloth/Meta-Llama-3.1-8B-Instruct": {
+    "cat": {
+      "cat": 4719,
+      "Cat": 27899,
+      "CAT": 29296,
+      "Ġcat": 8415,
+      "ĠCat": 17810,
+      "ĠCAT": 45081
+    },
+    "eagle": {
+      "Ġeagle": 60989,
+      "ĠEagle": 36895
+    },
+    "wolf": {
+      "wolf": 77330,
+      "Wolf": 96534,
+      "Ġwolf": 37642,
+      "ĠWolf": 26296
+    }
   }
 }
