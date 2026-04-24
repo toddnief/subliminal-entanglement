@@ -64,7 +64,7 @@ slurm/                # sbatch wrappers (submit.sh uses these)
 ```
 
 Artifacts live under `$ARTIFACTS_DIR` (set in `.env` — currently
-`/net/projects/clab/subliminal/shared/results`). Layout:
+`/net/projects2/interp/subliminal/shared/results`). Layout:
 ```
 $ARTIFACTS_DIR/
   registry.json       # single source of truth; lock at registry.lock
@@ -133,7 +133,7 @@ relying on the tokenizer default. Make sure to ask the user how they want to han
 
 Current values (as set by user):
 ```
-ARTIFACTS_DIR=/net/projects/clab/subliminal/shared/results
+ARTIFACTS_DIR=/net/projects2/interp/subliminal/shared/results
 SLURM_PARTITION=general,veitch,clab
 HF_TOKEN=<set>
 ```
