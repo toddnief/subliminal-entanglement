@@ -4,6 +4,12 @@ Enables post-hoc ablations where the adapter is filtered to keep (or drop) speci
 singular directions. One SVD decomposition is cached per model hash and reused across
 ablation modes and future analyses.
 
+Supported svd_mode strings (see `_parse_svd_mode`):
+    'full'        — unmodified adapter (no-op)
+    'topN'        — keep only the first N singular directions  (e.g. 'top1', 'top2')
+    'restN'       — drop the first N singular directions, keep the rest  (e.g. 'rest2')
+    'rest'        — back-compat alias for 'rest1'
+
 Cache format (per model, saved as .npz):
     layers:      list[str]                 canonical layer names
     <layer>.U:   (d, r) float32
@@ -20,11 +26,15 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
 from pathlib import Path
 
 import numpy as np
 from loguru import logger
+
+_TOP_RE = re.compile(r"^top(\d+)$")
+_REST_RE = re.compile(r"^rest(\d+)$")
 
 
 def _canonical_layer_name(safetensors_key: str) -> str:
@@ -152,17 +162,71 @@ def load_svd_cache(path: Path) -> dict[str, dict]:
     return result
 
 
-def _select_indices(mode: str, rank: int) -> np.ndarray:
-    """Map an svd_mode to a list of singular-value indices to keep."""
+def _parse_svd_mode(mode: str) -> tuple[str, int]:
+    """Parse an svd_mode string into (kind, k).
+
+    Recognized forms:
+        'full'        → ('full', 0)
+        'topN' (N>=1) → ('top', N)      keep first N singular directions
+        'rest'        → ('rest', 1)     back-compat alias for 'rest1'
+        'restN' (N>=1)→ ('rest', N)     keep all but first N singular directions
+    """
     if mode == "full":
-        return np.arange(rank)
-    if mode == "top1":
-        return np.array([0])
+        return ("full", 0)
     if mode == "rest":
-        if rank <= 1:
-            raise ValueError(f"svd_mode='rest' requires rank > 1 (got {rank})")
-        return np.arange(1, rank)
-    raise ValueError(f"Unknown svd_mode: {mode!r} (expected 'full', 'top1', or 'rest')")
+        return ("rest", 1)
+    if (m := _TOP_RE.match(mode)) is not None:
+        k = int(m.group(1))
+        if k < 1:
+            raise ValueError(f"svd_mode={mode!r} requires N >= 1")
+        return ("top", k)
+    if (m := _REST_RE.match(mode)) is not None:
+        k = int(m.group(1))
+        if k < 1:
+            raise ValueError(f"svd_mode={mode!r} requires N >= 1")
+        return ("rest", k)
+    raise ValueError(
+        f"Unknown svd_mode: {mode!r} "
+        f"(expected 'full', 'topN', or 'restN' for integer N >= 1; "
+        f"'rest' accepted as alias for 'rest1')"
+    )
+
+
+def _select_indices(mode: str, rank: int) -> np.ndarray:
+    """Map an svd_mode to a list of singular-value indices to keep.
+
+    Raises ValueError on combinations that would produce an empty selection
+    (e.g. 'rest2' at rank <= 2) or exceed the available rank (e.g. 'top8' at rank 4).
+    """
+    kind, k = _parse_svd_mode(mode)
+    if kind == "full":
+        return np.arange(rank)
+    if kind == "top":
+        if k > rank:
+            raise ValueError(
+                f"svd_mode={mode!r} requires rank >= {k} (got {rank})"
+            )
+        return np.arange(k)
+    if kind == "rest":
+        if k >= rank:
+            raise ValueError(
+                f"svd_mode={mode!r} requires rank > {k} (got {rank})"
+            )
+        return np.arange(k, rank)
+    raise AssertionError(f"unreachable kind={kind!r}")
+
+
+def svd_mode_is_valid_for_rank(mode: str, rank: int) -> bool:
+    """Whether (mode, rank) yields a non-empty, non-overflowing selection.
+
+    Used to filter invalid combinations out of the config grid before they
+    produce registry-level `failed` rows. Unknown modes return False.
+    """
+    try:
+        _select_indices(mode, rank)
+    except ValueError:
+        return False
+    return True
 
 
 def snapshot_lora_weights(peft_model) -> dict[str, dict[str, "torch.Tensor"]]:

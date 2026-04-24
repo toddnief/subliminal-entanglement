@@ -2,9 +2,34 @@
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field, asdict
 from itertools import product
 from typing import Callable
+
+
+# Lightweight mirror of benchmarks/svd.py:_parse_svd_mode / _select_indices
+# bounds, used to prune invalid (svd_mode, rank) combinations from the grid
+# before they become stuck `failed` registry rows. Kept inline (duplicated)
+# because this module is also loaded standalone by scripts/check_cached.py
+# via importlib.util.spec_from_file_location, which breaks relative imports.
+# If the set of recognized modes changes in svd.py, mirror it here.
+_TOP_RE = re.compile(r"^top(\d+)$")
+_REST_RE = re.compile(r"^rest(\d+)$")
+
+
+def _svd_mode_is_valid_for_rank(mode: str, rank: int) -> bool:
+    if mode == "full":
+        return True
+    if mode == "rest":
+        return rank > 1  # back-compat alias for rest1
+    if (m := _TOP_RE.match(mode)) is not None:
+        k = int(m.group(1))
+        return 1 <= k <= rank
+    if (m := _REST_RE.match(mode)) is not None:
+        k = int(m.group(1))
+        return 1 <= k < rank
+    return False
 
 
 # Documented defaults for DWG spec fields. Keys matching these values are
@@ -407,6 +432,13 @@ class ParameterGrid:
             self.batch_sizes,
             self.grad_accums,
         ):
+            # Skip (svd_mode, rank) combos that would produce an empty or
+            # overflowing singular-direction selection (e.g. 'rest2' at rank=2,
+            # or 'top8' at rank=4). These can't produce a meaningful eval and
+            # would otherwise show up as stuck `failed` rows in the registry.
+            if not _svd_mode_is_valid_for_rank(svd_mode, rank):
+                continue
+
             # Normalize the dwg entry (accept bare string shortcut "full" too).
             if isinstance(dwg_mode_entry, str):
                 dwg_mode_entry = {"name": dwg_mode_entry}

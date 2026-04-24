@@ -322,8 +322,16 @@ def score_all(args) -> None:
     specs = enumerate_adapters(args.animals)
     logger.info(f"Found {len(specs)} clean final adapters across animals={args.animals}")
 
-    to_score: list[AdapterSpec] = []
-    skipped_cached = 0
+    # Two-stage filter, *in this order*, so each adapter has a stable
+    # task-id assignment regardless of when each array task starts:
+    #   (1) drop specs that can never be scored (no val file / no mask) —
+    #       these don't depend on per-run state, so they're safe to drop pre-shard.
+    #   (2) shard by index over the resulting deterministic list.
+    #   (3) THEN apply the cache-skip filter, since cache state evolves
+    #       across staggered array starts.
+    # Earlier this was (1, cache, shard), which orphaned adapters when later
+    # array tasks re-modulo'd over a smaller post-cache list.
+    eligible: list[AdapterSpec] = []
     skipped_missing_val = 0
     skipped_missing_mask = 0
     for spec in specs:
@@ -337,6 +345,20 @@ def score_all(args) -> None:
             logger.warning(f"  skip {spec.model_hash}: no divergence mask at {mask_path}")
             skipped_missing_mask += 1
             continue
+        eligible.append(spec)
+
+    if args.total_tasks > 1:
+        sharded = [s for i, s in enumerate(eligible) if i % args.total_tasks == args.task_id]
+        logger.info(
+            f"Array sharding (pre-cache): task {args.task_id}/{args.total_tasks} "
+            f"→ {len(sharded)}/{len(eligible)} eligible adapters"
+        )
+    else:
+        sharded = eligible
+
+    to_score: list[AdapterSpec] = []
+    skipped_cached = 0
+    for spec in sharded:
         out_path = SCORES_DIR / f"{spec.model_hash}_divergence.json"
         if out_path.exists() and not args.force:
             skipped_cached += 1
@@ -344,18 +366,10 @@ def score_all(args) -> None:
         to_score.append(spec)
 
     logger.info(
-        f"Planning to score {len(to_score)} adapters "
-        f"(cached: {skipped_cached}, missing_val: {skipped_missing_val}, "
-        f"missing_mask: {skipped_missing_mask})"
+        f"Planning to score {len(to_score)} adapters this task "
+        f"(cached-this-shard: {skipped_cached}, missing_val: {skipped_missing_val}, "
+        f"missing_mask: {skipped_missing_mask}, total_eligible: {len(eligible)})"
     )
-
-    if args.total_tasks > 1:
-        before = len(to_score)
-        to_score = [s for i, s in enumerate(to_score) if i % args.total_tasks == args.task_id]
-        logger.info(
-            f"Array sharding: task {args.task_id}/{args.total_tasks} "
-            f"→ {len(to_score)}/{before} adapters"
-        )
 
     if args.dry_run:
         for spec in to_score:
