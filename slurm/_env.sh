@@ -33,14 +33,21 @@ if [[ -d "$SCRATCH_DIR" ]]; then
     export TMPDIR="$SCRATCH_DIR/tmp"
 
     # Pin torch + triton caches to this job's scratch, don't read or write any
-    # global inductor/triton cache. Some Llama-array tasks hit
-    # `PermissionError: Permission denied: '/local/scratch/muchane_820137'` —
-    # a stale absolute path from some earlier job's scratch was embedded in a
-    # cached artifact that a fresh vLLM engine then tried to realise via
-    # makedirs. Disabling FX-graph caches + pinning TORCHINDUCTOR_CACHE_DIR /
-    # TRITON_CACHE_DIR to per-job scratch blocks cross-job contamination.
+    # global inductor/triton cache. Llama-array tasks hit
+    # `PermissionError: Permission denied: '/local/scratch/muchane_820137'`
+    # during vLLM EngineCore startup — a stale absolute path from some earlier
+    # job's scratch was being re-emitted at line 841 of the generated
+    # torch._inductor kernel file (`k6/ck6l4y...py`). Pinning
+    # TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR + the three piecemeal disables
+    # below did NOT stop it (820137 kept reappearing). The master switch
+    # TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 is documented in torch/_inductor/
+    # config.py (see also TORCH_COMPILE_FORCE_DISABLE_CACHES) and disables
+    # every inductor cache path; that's the sledgehammer. Costs a few minutes
+    # of kernel recompile per vLLM startup but removes the cross-job bug.
     export TORCHINDUCTOR_CACHE_DIR="$SCRATCH_DIR/torchinductor"
     export TRITON_CACHE_DIR="$SCRATCH_DIR/triton"
+    export TORCHINDUCTOR_FORCE_DISABLE_CACHES=1
+    export TORCH_COMPILE_FORCE_DISABLE_CACHES=1
     export TORCHINDUCTOR_FX_GRAPH_CACHE=0
     export TORCHINDUCTOR_FX_GRAPH_REMOTE_CACHE=0
     export TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE=0
