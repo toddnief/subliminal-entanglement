@@ -8,7 +8,8 @@ layout, while the full `dwg_spec` dict drives runtime behavior.
 Spec schema (see benchmarks.config.ParameterGrid.dwg_modes for the YAML form):
     {
       "name":    str,                       # required, used in exp_id
-      "tokens":  str | list[int] | None,    # substring locator or explicit positions
+      "tokens":  str | list[int] | dict | None,
+                                             # substring, positions, or template locator
       "invert":  bool,                      # default False
       "modules": str | list | None,         # preset or set, None = all
       "layers":  str | list | None,         # preset or set, None = all
@@ -22,6 +23,9 @@ Semantics:
                                `invert=True` means LoRA active EVERYWHERE EXCEPT those positions
                                (necessity).
     * `tokens` is list[int]  → explicit token positions (negative indices normalized mod seq_len).
+    * `tokens` is {"kind": "chat_template"}
+                             → all token positions whose characters come from
+                               the chat template rather than message content.
 
 Module/layer gating is done by zeroing `scaling[adapter_name]` on non-matching LoRA
 submodules (same mechanism as the notebook prototype in
@@ -118,6 +122,8 @@ def locate_positions(
     tokenizer,
     rendered_text: str,
     spec: dict,
+    messages: list[dict] | None = None,
+    assistant_suffix: str = "",
 ) -> set[int]:
     """Resolve `spec['tokens']` to a set of token indices in `rendered_text`.
 
@@ -127,6 +133,9 @@ def locate_positions(
         rendered_text: Fully-formatted prompt (chat template already applied).
         spec: DWG spec dict. Reads `tokens`. If the key is absent or None,
             returns an empty set (meaning: no position gating).
+        messages: Original chat messages, required for chat-template locators.
+        assistant_suffix: Optional assistant prefix appended after the rendered
+            chat template; treated as non-template content.
 
     Returns:
         Set of token indices (0-indexed into the tokenized `rendered_text`).
@@ -148,6 +157,17 @@ def locate_positions(
             normalized.add(p % seq_len if p < 0 else p)
         # Drop anything out of range rather than raising, to be robust.
         return {p for p in normalized if 0 <= p < seq_len}
+
+    if isinstance(tokens, dict):
+        kind = tokens.get("kind")
+        if kind == "chat_template":
+            return locate_chat_template_positions(
+                tokenizer,
+                rendered_text,
+                messages=messages,
+                assistant_suffix=assistant_suffix,
+            )
+        raise ValueError(f"Unsupported DWG token locator kind: {kind!r}")
 
     if isinstance(tokens, str):
         # Fast path via offset mappings: requires a fast tokenizer. Qwen2.5
@@ -200,6 +220,86 @@ def locate_positions(
         return positions
 
     raise TypeError(f"Unsupported `tokens` type: {type(tokens)}")
+
+
+def _token_offsets(tokenizer, rendered_text: str) -> list[tuple[int, int]]:
+    """Tokenize `rendered_text` with character offsets."""
+    if not getattr(tokenizer, "is_fast", False):
+        raise ValueError(
+            "DWG chat-template locator requires a fast tokenizer with offset mappings."
+        )
+    enc_with_offsets = tokenizer(
+        rendered_text, return_offsets_mapping=True, add_special_tokens=False
+    )
+    return list(enc_with_offsets["offset_mapping"])
+
+
+def _find_message_content_spans(
+    rendered_text: str,
+    messages: list[dict],
+    assistant_suffix: str = "",
+) -> list[tuple[int, int]]:
+    """Find spans in `rendered_text` that came from caller-provided content."""
+    spans: list[tuple[int, int]] = []
+    search_start = 0
+
+    for message in messages:
+        content = str(message.get("content", ""))
+        if content == "":
+            continue
+
+        start = rendered_text.find(content, search_start)
+        if start == -1:
+            raise ValueError(
+                "DWG chat-template locator could not find message content in "
+                f"rendered prompt: {content[:80]!r}"
+            )
+        end = start + len(content)
+        spans.append((start, end))
+        search_start = end
+
+    if assistant_suffix:
+        if not rendered_text.endswith(assistant_suffix):
+            raise ValueError(
+                "DWG chat-template locator expected rendered prompt to end with "
+                f"assistant_suffix={assistant_suffix[:80]!r}"
+            )
+        spans.append((len(rendered_text) - len(assistant_suffix), len(rendered_text)))
+
+    return spans
+
+
+def locate_chat_template_positions(
+    tokenizer,
+    rendered_text: str,
+    messages: list[dict] | None,
+    assistant_suffix: str = "",
+) -> set[int]:
+    """Locate token positions emitted by the chat template, excluding message content."""
+    if messages is None:
+        raise ValueError(
+            "DWG chat-template locator requires original messages; pass messages "
+            "to resolve_lora_positions(...)."
+        )
+
+    offsets = _token_offsets(tokenizer, rendered_text)
+    content_spans = _find_message_content_spans(
+        rendered_text, messages, assistant_suffix=assistant_suffix
+    )
+
+    def contained_in_content(a: int, b: int) -> bool:
+        return any(start <= a and b <= end for start, end in content_spans)
+
+    positions: set[int] = set()
+    for idx, (a, b) in enumerate(offsets):
+        if a == b:
+            continue
+        # Tokens that straddle content and template boundaries are included:
+        # disabling the adapter is safer when any part of the token is structural.
+        if not contained_in_content(a, b):
+            positions.add(idx)
+
+    return positions
 
 
 def _locate_by_decode(tokenizer, rendered_text: str, substring: str) -> set[int]:
@@ -537,6 +637,8 @@ def resolve_lora_positions(
     tokenizer,
     rendered_text: str,
     spec: dict | None,
+    messages: list[dict] | None = None,
+    assistant_suffix: str = "",
 ) -> set[int] | None:
     """Compute the set of token positions where LoRA should be ON for a prompt.
 
@@ -556,7 +658,13 @@ def resolve_lora_positions(
         # No position gating; module/layer gating may still be active.
         return None
 
-    located = locate_positions(tokenizer, rendered_text, spec)
+    located = locate_positions(
+        tokenizer,
+        rendered_text,
+        spec,
+        messages=messages,
+        assistant_suffix=assistant_suffix,
+    )
     seq_len = tokenizer(rendered_text, return_tensors="pt").input_ids.shape[1]
     if spec.get("invert", False):
         return set(range(seq_len)) - located

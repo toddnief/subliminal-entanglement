@@ -114,6 +114,7 @@ def find_experiments(
     text: str | None = None,
     animal: str | None = None,
     variant: str | None = None,
+    model: str | None = None,
     rank: int | None = None,
     epochs: int | None = None,
     gen_temp: float | None = None,
@@ -141,6 +142,11 @@ def find_experiments(
         df = df[_contains_filter(df["train_system_prompt"], train_system_prompt)]
     if "eval_system_prompt" in df.columns:
         df = df[_contains_filter(df["eval_system_prompt"], eval_system_prompt)]
+    if model is not None:
+        model_cols = [c for c in ("model", "student_model") if c in df.columns]
+        if model_cols:
+            model_haystack = df[model_cols].fillna("").astype(str).agg(" ".join, axis=1)
+            df = df[model_haystack.str.contains(str(model), case=False, na=False)]
 
     if text:
         haystack = df.fillna("<none>").astype(str).agg(" ".join, axis=1)
@@ -168,11 +174,7 @@ def find_experiments(
         "svd_mode",
         "model",
     ]
-    metric_cols = [
-        c
-        for c in df.columns
-        if c.startswith(("pct_animal_", "delta_pct_animal_", "delta_log_p_"))
-    ]
+    metric_cols = [c for c in df.columns if c.startswith("pct_animal_")]
     cols = [c for c in preferred_cols + metric_cols if c in df.columns]
     out = df[cols].reset_index(drop=True)
     return out.head(n) if n is not None else out

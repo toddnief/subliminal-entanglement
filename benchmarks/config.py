@@ -364,8 +364,11 @@ class ParameterGrid:
     # Dynamic Weight Grafting modes (applied at eval time; training is shared across modes).
     # Each entry is a dict with:
     #   name: str                   required, used in exp_id and artifact dir
-    #   tokens: str|list[int]|null  substring to locate in rendered chat template,
-    #                               or explicit token positions (null = no position gating)
+    #   tokens: str|list[int]|dict|null
+    #                               substring to locate in rendered chat template,
+    #                               explicit token positions, or
+    #                               {kind: chat_template} for structural template
+    #                               tokens (null = no position gating)
     #   invert: bool                if true, LoRA OFF at located positions (necessity);
     #                               if false, LoRA ONLY at located positions (sufficiency)
     #   modules: str|list|null      preset or set (q_proj, attention, ffn, ...) — null = all

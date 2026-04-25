@@ -313,7 +313,13 @@ class TokenProbabilityEvaluator:
         lora_positions = None
         if dwg_spec is not None:
             from .dwg import resolve_lora_positions
-            lora_positions = resolve_lora_positions(self.tokenizer, formatted, dwg_spec)
+            lora_positions = resolve_lora_positions(
+                self.tokenizer,
+                formatted,
+                dwg_spec,
+                messages=messages,
+                assistant_suffix=assistant_prefix,
+            )
 
         with torch.no_grad():
             if lora_positions is None:
@@ -587,7 +593,12 @@ class TokenProbabilityEvaluator:
         lora_positions = None
         if dwg_spec is not None:
             from .dwg import resolve_lora_positions
-            lora_positions = resolve_lora_positions(self.tokenizer, formatted, dwg_spec)
+            lora_positions = resolve_lora_positions(
+                self.tokenizer,
+                formatted,
+                dwg_spec,
+                messages=messages,
+            )
 
         if lora_positions is None:
             return self._generate_responses_hf(
