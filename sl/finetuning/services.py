@@ -115,10 +115,11 @@ async def _run_unsloth_finetuning_job(
     else:
         actual_tokenizer = tokenizer
 
-    # Create data collator for completion-only training
+    # instruction_template omitted: only used for multi-turn re-masking, and
+    # Gemma's "\n\n" boundary disappears when there's no system message → all
+    # labels masked → NaN loss / zero grad from step 0.
     collator = DataCollatorForCompletionOnlyLM(
         tokenizer=actual_tokenizer,
-        instruction_template=llm_utils.extract_user_template(actual_tokenizer),
         response_template=llm_utils.extract_assistant_template(actual_tokenizer),
     )
     if job.full_finetuning:
