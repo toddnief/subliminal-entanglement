@@ -1,8 +1,32 @@
 # CLAUDE.md — Subliminal Learning Benchmark Pipeline
 
 Notes for future Claude sessions working in this repo. Pair this with `README.md`
-(authoritative user-facing doc) — this file captures the *operational* knowledge
-that isn't obvious from the README.
+(authoritative user-facing doc) — this file captures the *project-shape* knowledge
+that isn't obvious from the README. **Day-to-day operational state lives under
+`lab/` — read those files on every session resume.**
+
+---
+
+## On session start, read the lab notebook
+
+The `lab/` directory at the project root is a symlink to
+`/net/projects2/interp/lab_notebooks/subliminal/` (a stable NFS path that
+survives `/local/scratch` reaps). This is where day-to-day operational
+state lives — what's running, what's broken, what was tried this week.
+
+Read these in full on every session resume *before* mutating anything:
+
+- **`lab/CLUSTER.md`** — UChicago cluster identity, env vars, GPU types,
+  SLURM gotchas, stack-version pins.
+- **`lab/EXPERIMENTS.md`** — current and recently-completed sweeps,
+  cross-checked against `$ARTIFACTS_DIR/registry.json`.
+- **`lab/BUGS.md`** — open + watched + recently-fixed bugs.
+- **`lab/NOTEBOOK.md`** — chronological session log (most recent at top).
+- **`lab/figures/HANDBOOK.md`** — figure-making conventions.
+
+The lab-tech skill (`~/.claude/skills/lab-tech/`) describes how to keep
+this notebook fresh. **Update the relevant `lab/*.md` file after every
+meaningful turn**, not at the end.
 
 ---
 
@@ -212,28 +236,62 @@ and `pandas.read_json` both work.
 
 ---
 
-## Animal token IDs — loaded from shared JSON, not YAML
+## Animal token IDs — per-model JSON, not YAML
 
 `configs/animal_token_ids.json` is the single source of truth for the
-single-token IDs Qwen-2.5-7B uses for each animal (plus capitalisation and
-leading-space variants). `BenchmarkPipeline.__init__` loads it into
-`self._animal_token_ids` at startup; keys starting with `_` (`_comment`,
-`_model`) are skipped so they can hold metadata.
+single-token IDs each base model uses for each animal (plus capitalisation
+and leading-space variants). The layout is **per-model**:
+
+```jsonc
+{
+  "_comment": "...",
+  "unsloth/Qwen2.5-7B-Instruct":   { "cat": { "cat": 4338, ... }, ... },
+  "unsloth/gemma-3-4b-it":         { "cat": { ... }, "eagle": { ... }, "wolf": { ... } },
+  "unsloth/Meta-Llama-3.1-8B-Instruct": { "cat": { ... }, "eagle": { ... }, "wolf": { ... } }
+}
+```
+
+`BenchmarkPipeline.__init__` loads it into `self._animal_token_ids_by_model`;
+the `_token_ids_for_model(student_model)` helper returns the appropriate
+submap. Top-level keys starting with `_` (`_comment`, `_model`) are skipped
+so they can hold metadata.
 
 Consequences:
-- YAML configs no longer carry an `animal_token_ids:` block — don't add one,
-  it will be ignored. To support a new animal, append it to the JSON.
-- The `animal_token_ids` field on `ExperimentConfig` / `ParameterGrid` is
-  gone; nothing in the code reads it from there anymore.
-- `_get_baseline_key()` folds the *entire* `self._animal_token_ids` dict
-  into the baseline hash, so **any edit to the JSON — including adding a
-  new animal — invalidates every existing baseline cache** (models and
-  datasets are unaffected; only Stage 3 baselines need regenerating).
-  Plan JSON edits in batches, or accept the re-eval cost.
+- YAML configs no longer carry an `animal_token_ids:` block — don't add
+  one, it will be ignored. To support a new animal-on-a-new-model, append
+  to that model's submap.
+- `_get_baseline_key()` scopes the hash to the **submap for the current
+  student_model**, so adding a new model's submap does NOT invalidate
+  baselines for the existing models. (This was a deliberate design point
+  during the 2026-04-23 per-model refactor — verified that Qwen baseline
+  hashes are byte-identical pre and post.)
+- Editing an existing model's submap (e.g. adding a new animal to Qwen)
+  still invalidates every Qwen baseline. Plan such edits in batches.
 - Only single-token variants go in the JSON; animals with no single-token
-  representation (e.g. `dragonfly` for Qwen-2.5) are omitted. Evaluation
-  falls back to multi-token joint probability when the animal isn't in the
-  map.
+  representation (e.g. `dragonfly` for Qwen-2.5, `EAGLE`/`WOLF` uppercase
+  for Gemma3) are omitted. Evaluation falls back to multi-token joint
+  probability when the animal isn't in the map.
+
+### Model-family default system-prompt behaviors (verified 2026-04-24)
+
+When `train_template: null` (or any system field is null), the tokenizer's
+chat_template controls what actually gets emitted:
+
+- **Qwen-2.5**: injects identity string
+  `"You are Qwen, created by Alibaba Cloud. You are a helpful assistant."`
+  as a `<|im_start|>system` turn.
+- **Gemma-3**: emits **no system turn at all** (the template's `else`
+  branch sets `first_user_prefix = ""`). When a system message *is*
+  provided, it gets glued to the front of the first user turn with `\n\n`
+  rather than being a separate turn.
+- **Llama-3.1**: injects a date-metadata system turn
+  `"Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024"` —
+  not an identity string, not empty.
+
+So the three families' "no system message" semantics differ. Our Gemma
+and Llama configs that use `train_template: "You are <Model>, made by..."`
+are deliberate Qwen-mimicking fabrications, not the model's native
+defaults. See the lab notebook for which sweeps used which.
 
 ---
 
@@ -302,3 +360,30 @@ more so for full-FT than LoRA. Two distinct failure modes have been seen:
 Tested configuration where full-FT train + eval in one process works
 end-to-end: `transformers 4.57.6`, `unsloth 2026.4.6`, `unsloth-zoo 2026.4.8`,
 `torch 2.10.0+cu128`.
+
+---
+
+## Operational state lives in `lab/`
+
+This CLAUDE.md is north-star. Anything that changes day-to-day belongs
+in `lab/`:
+
+- **`lab/CLUSTER.md`** — UChicago paths, env vars, SLURM specifics, GPU
+  performance ratios, version pins, gotchas.
+- **`lab/EXPERIMENTS.md`** — current and recently-completed sweeps,
+  with the registry as the canonical source of truth.
+- **`lab/BUGS.md`** — open / watched / fixed bugs.
+- **`lab/NOTEBOOK.md`** — chronological session log.
+- **`lab/debug/<slug>-<YYYY-MM-DD>.md`** — detailed debug reports.
+- **`lab/figures/HANDBOOK.md`** — figure conventions and existing figures.
+- **`lab/figures/findings/<slug>-<YYYY-MM-DD>.md`** — per-figure-session
+  findings handed back to the main thread.
+
+The `lab/` directory is a symlink to `/net/projects2/interp/lab_notebooks/subliminal/`
+(stable NFS, survives scratch reaps). Edit either path; they're the same
+files. The symlink target is shared with collaborators who have
+`/net/projects2/interp/` access.
+
+If a fact is operational (a job ID, an experiment count, "currently
+broken because X"), it goes in `lab/` — not here. If a fact is north-star
+(architectural shape, conventions, project intent), it goes here.
