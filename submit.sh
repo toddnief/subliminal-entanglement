@@ -19,6 +19,7 @@
 #   ./submit.sh eval-baselines
 #   ./submit.sh build-divergence-masks -- --animals cat owl eagle
 #   ./submit.sh score-val-divergence-accuracy --array 0-3 -- --animals cat owl eagle
+#   ./submit.sh score-prompt-digit-divergence --array 0-6 -- --models qwen2.5-7b llama3.1-8b gemma3-4b-it phi4 llama3.2-3b ministral-8b falcon3-7b --animals cat owl eagle
 #
 # --max-gpus N   Limit concurrent GPU jobs (default: $SLURM_MAX_GPUS from .env, or 6)
 
@@ -54,6 +55,8 @@ if [ $# -lt 1 ]; then
     echo "  build-divergence-masks     Build teacher-vs-default argmax masks per val file"
     echo "  score-val-divergence-accuracy"
     echo "                             Score adapters on accuracy-on-divergent-positions (--array optional)"
+    echo "  score-prompt-digit-divergence"
+    echo "                             Score base-model prompt-only digit divergences (--array optional)"
     echo ""
     echo "Examples:"
     echo "  ./submit.sh benchmark --config configs/baseline.yaml"
@@ -62,6 +65,7 @@ if [ $# -lt 1 ]; then
     echo "  ./submit.sh generate-baselines --config configs/example_config.yaml"
     echo "  ./submit.sh score-val-loss --array 0-3 -- --animals cat owl eagle"
     echo "  ./submit.sh snapshot-score-val-loss --array 0-3 -- --all-runs"
+    echo "  ./submit.sh score-prompt-digit-divergence --array 0-6 -- --models qwen2.5-7b llama3.1-8b gemma3-4b-it phi4 llama3.2-3b ministral-8b falcon3-7b --animals cat owl eagle"
     exit 1
 fi
 
@@ -266,6 +270,20 @@ case "$COMMAND" in
         fi
         sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_val_divergence_accuracy.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    score-prompt-digit-divergence)
+        # Base-model prompt-only digit divergence. Python shards by model so a
+        # task loads each assigned model once and loops over animals/seeds.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting score-prompt-digit-divergence (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting score-prompt-digit-divergence (partition: $PARTITION, serial)"
+        fi
+        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_prompt_digit_divergence.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     *)
