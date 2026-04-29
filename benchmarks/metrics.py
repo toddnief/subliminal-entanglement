@@ -310,10 +310,10 @@ class TokenProbabilityEvaluator:
             formatted += assistant_prefix
         inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
 
-        lora_positions = None
+        chunks = None
         if dwg_spec is not None:
-            from .dwg import resolve_lora_positions
-            lora_positions = resolve_lora_positions(
+            from .dwg import resolve_lora_schedule
+            chunks, _decode_state = resolve_lora_schedule(
                 self.tokenizer,
                 formatted,
                 dwg_spec,
@@ -322,13 +322,13 @@ class TokenProbabilityEvaluator:
             )
 
         with torch.no_grad():
-            if lora_positions is None:
+            if chunks is None:
                 outputs = self.model(**inputs)
                 logits = outputs.logits[0, -1, :]
             else:
                 from .dwg import chunked_prefill
                 _kv, last_logits = chunked_prefill(
-                    self.model, inputs.input_ids, lora_positions
+                    self.model, inputs.input_ids, chunks
                 )
                 logits = last_logits[0]
         probs = F.softmax(logits, dim=-1)
@@ -590,31 +590,29 @@ class TokenProbabilityEvaluator:
         inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[1]
 
-        lora_positions = None
+        chunks = None
+        decode_state = None
         if dwg_spec is not None:
-            from .dwg import resolve_lora_positions
-            lora_positions = resolve_lora_positions(
+            from .dwg import resolve_lora_schedule
+            chunks, decode_state = resolve_lora_schedule(
                 self.tokenizer,
                 formatted,
                 dwg_spec,
                 messages=messages,
             )
 
-        if lora_positions is None:
+        if chunks is None:
             return self._generate_responses_hf(
                 inputs, input_len, n_samples, max_new_tokens, temperature
             )
 
-        from .dwg import chunked_prefill, decode_with_position_lora
-        lora_during_generation = (
-            True if dwg_spec is None else bool(dwg_spec.get("lora_during_generation", True))
-        )
+        from .dwg import LORA_FULL, chunked_prefill, decode_with_position_lora
 
         # Expand prompt to batch=n_samples so the returned KV cache already has
         # the right leading dimension for independent sampling.
         batched_ids = inputs.input_ids.repeat_interleave(n_samples, dim=0)
         kv_cache, last_logits = chunked_prefill(
-            self.model, batched_ids, lora_positions
+            self.model, batched_ids, chunks
         )
         first_token_logits = last_logits[0].clone().float()
 
@@ -626,7 +624,7 @@ class TokenProbabilityEvaluator:
             n_samples=n_samples,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
-            lora_during_generation=lora_during_generation,
+            decode_state=decode_state if decode_state is not None else LORA_FULL,
         )
         responses = [
             self.tokenizer.decode(seq, skip_special_tokens=True) for seq in sequences

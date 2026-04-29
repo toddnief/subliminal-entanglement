@@ -38,9 +38,16 @@ def _svd_mode_is_valid_for_rank(mode: str, rank: int) -> bool:
 _DWG_SPEC_DEFAULTS = {
     "tokens": None,
     "invert": False,
+    "complement": False,
     "modules": None,
     "layers": None,
     "lora_during_generation": True,
+    # Legacy decode policy (apply spec mask globally during generation).
+    # New configs that want position-consistent decode should set
+    # `decode_state: outside_q` explicitly — the explicit value will not be
+    # canonicalized away and will produce a distinct exp_id from cached
+    # legacy runs.
+    "decode_state": "spec_mask",
 }
 
 
@@ -370,10 +377,30 @@ class ParameterGrid:
     #                               {kind: chat_template} for structural template
     #                               tokens (null = no position gating)
     #   invert: bool                if true, LoRA OFF at located positions (necessity);
-    #                               if false, LoRA ONLY at located positions (sufficiency)
+    #                               if false, LoRA ONLY at located positions (sufficiency).
+    #                               Position-axis flip only — modules/layers mask is unchanged.
+    #   complement: bool            if true, the spec describes a treatment cell
+    #                               (positions=tokens, modules=modules, layers=layers) and
+    #                               LoRA is applied on the *structural complement* of that
+    #                               cell — i.e. ON everywhere EXCEPT (pos∈Q ∧ mod∈M ∧ layer∈L).
+    #                               Mutually exclusive with `invert`. Naming convention:
+    #                               `only_<scope>` for treatment, `complement_<scope>` for
+    #                               the structural complement.
     #   modules: str|list|null      preset or set (q_proj, attention, ffn, ...) — null = all
     #   layers: str|list|null       preset or set (early, late, {0,1,2}, ...) — null = all
-    #   lora_during_generation: bool  whether decode steps see LoRA (default true)
+    #   lora_during_generation: bool  legacy alias for decode_state. When false, decode_state is
+    #                               canonicalized to "off" regardless of the decode_state field.
+    #                               Default true (no override).
+    #   decode_state: str           one of {"spec_mask", "outside_q", "off"}. Controls which
+    #                               LoRA state is applied during the decode (post-prefill) phase.
+    #                                 - "spec_mask" (legacy default, preserves cached exp_ids):
+    #                                   apply the spec's (M ∧ L) mask globally during decode.
+    #                                 - "outside_q" (recommended for new configs): mirror the
+    #                                   prefill state at non-located positions during decode.
+    #                                   For `only_*` (treatment) → LoRA OFF at decode; for
+    #                                   `complement_*` → full LoRA at decode; for `invert: true`
+    #                                   → spec mask at decode (same as spec_mask in this case).
+    #                                 - "off": disable adapter entirely during decode.
     # Short form: {"name": "full"} is a no-op baseline.
     dwg_modes: list[dict] = field(default_factory=lambda: [{"name": "full"}])
 

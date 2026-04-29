@@ -7,13 +7,20 @@ layout, while the full `dwg_spec` dict drives runtime behavior.
 
 Spec schema (see benchmarks.config.ParameterGrid.dwg_modes for the YAML form):
     {
-      "name":    str,                       # required, used in exp_id
-      "tokens":  str | list[int] | dict | None,
-                                             # substring, positions, or template locator
-      "invert":  bool,                      # default False
-      "modules": str | list | None,         # preset or set, None = all
-      "layers":  str | list | None,         # preset or set, None = all
-      "lora_during_generation": bool,       # default True
+      "name":       str,                       # required, used in exp_id
+      "tokens":     str | list[int] | dict | None,
+                                                # substring, positions, or template locator
+      "invert":     bool,                      # default False (position-axis flip)
+      "complement": bool,                      # default False (structural complement)
+      "modules":    str | list | None,         # preset or set, None = all
+      "layers":     str | list | None,         # preset or set, None = all
+      "lora_during_generation": bool,          # legacy alias for decode_state
+                                                # (False → "off"); default True
+      "decode_state": "spec_mask" | "outside_q" | "off",
+                                                # legacy default = "spec_mask"
+                                                # (preserves cached exp_ids).
+                                                # New configs should use
+                                                # "outside_q".
     }
 
 Semantics:
@@ -21,21 +28,57 @@ Semantics:
     * `tokens` is str        → char-span → token-span via fast-tokenizer offsets; `invert=False`
                                means LoRA active ONLY at those positions (sufficiency),
                                `invert=True` means LoRA active EVERYWHERE EXCEPT those positions
-                               (necessity).
+                               (necessity). Position-axis flip only — modules/layers mask is
+                               unchanged across positions.
     * `tokens` is list[int]  → explicit token positions (negative indices normalized mod seq_len).
     * `tokens` is {"kind": "chat_template"}
                              → all token positions whose characters come from
                                the chat template rather than message content.
 
+    * `complement: true` (mutually exclusive with `invert: true`) — the spec
+      describes a *treatment cell* `(positions=tokens, modules=M, layers=L)` and
+      LoRA is applied on the structural complement of that cell:
+        - at positions ∈ tokens : LoRA ON for all (module, layer) pairs EXCEPT (M ∧ L);
+        - at positions ∉ tokens : LoRA ON everywhere (full adapter).
+      Together with the non-complement spec `only_<scope>` (same `(tokens, M, L)`,
+      no `complement`), the two runs partition the (position × module × layer) cube.
+
+Decode-time state (`decode_state`):
+    Decode (post-prefill autoregressive generation) sits at positions strictly
+    outside the located set Q, so the natural choice for a position-gated spec
+    is to mirror the prefill state at non-Q positions. Three policies are
+    supported:
+        * "outside_q" (recommended for new configs): apply at decode whatever
+          state the schedule applies at non-Q prefill positions. Concretely:
+            - `invert=False, complement=False` (treatment, e.g. `only_*`)
+              → decode state is LORA_OFF (matches LoRA-off at non-Q during
+              prefill).
+            - `invert=True`                       → decode state is the spec
+              mask (matches `no_*` legacy: LoRA on at non-Q during prefill).
+            - `complement=True`                   → decode state is LORA_FULL
+              (matches "full LoRA at non-Q" during prefill).
+        * "spec_mask" (legacy default, pre-bugfix): apply the spec's
+          (M ∧ L) mask globally during decode regardless of position
+          consistency. Kept so legacy cached exp_ids do not change.
+        * "off": disable adapter entirely during decode (`lora_during_generation
+          = False` is canonicalized to this).
+
+    The legacy field `lora_during_generation: false` is silently translated to
+    `decode_state: "off"`. Specifying both with `lora_during_generation: false`
+    AND a non-"off" `decode_state` is treated as "off" (lora_during_generation
+    wins for back-compat).
+
 Module/layer gating is done by zeroing `scaling[adapter_name]` on non-matching LoRA
 submodules (same mechanism as the notebook prototype in
 notebooks/todd/test_finetuned.ipynb). Position gating is done by chunking the prefill
-and wrapping OFF chunks in `model.disable_adapter()`.
+and applying a per-chunk LoRA state — either a scaling mask, or
+`model.disable_adapter()` for "fully off" chunks.
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -327,9 +370,49 @@ def _locate_by_decode(tokenizer, rendered_text: str, substring: str) -> set[int]
 # Module / layer gating (scaling-based)
 # ---------------------------------------------------------------------------
 
-# Weak-referenced snapshot of original scaling values per LoRA submodule. Keyed
+# Snapshot of original scaling values per LoRA submodule. Keyed
 # by (id(model), module_name) so each evaluator instance keeps an isolated cache.
 _ORIGINAL_SCALING: dict[tuple[int, str], dict[str, float]] = {}
+
+
+@dataclass(frozen=True)
+class LoraState:
+    """LoRA activation state for a chunk of token positions.
+
+    Two activation modes:
+
+    * `full_off=True`  → run the chunk inside `model.disable_adapter()`. All
+      LoRA effects fully suppressed (independent of the scaling fields below).
+    * `full_off=False` → set scaling per submodule via:
+        enabled iff (module_type ∈ modules_or_all) AND (layer_num ∈ layers_or_all)
+      and then optionally inverted via `invert_mask` (used by `complement: true`
+      specs to express "everywhere except the treatment cell").
+
+    `modules`/`layers` of None mean "all" on that axis.
+    """
+
+    full_off: bool = False
+    modules: frozenset[str] | None = None
+    layers: frozenset[int] | None = None
+    invert_mask: bool = False
+
+    def is_enabled(self, module_type: str, layer_num: int | None) -> bool:
+        """Whether LoRA scaling should be original (vs. 0) for this submodule."""
+        if self.full_off:
+            return False
+        in_modules = (self.modules is None) or (module_type in self.modules)
+        in_layers = (
+            self.layers is None
+            or layer_num is None
+            or layer_num in self.layers
+        )
+        cell = in_modules and in_layers
+        return (not cell) if self.invert_mask else cell
+
+
+# Convenience constants.
+LORA_FULL = LoraState()  # all modules, all layers, scaling at originals
+LORA_OFF = LoraState(full_off=True)  # disable_adapter() — fully off
 
 
 def _get_lora_layers(model) -> list[tuple[str, Any]]:
@@ -350,39 +433,48 @@ def _save_original_scaling(model) -> None:
             _ORIGINAL_SCALING[key] = {k: float(v) for k, v in module.scaling.items()}
 
 
+def _module_layer_of(name: str) -> tuple[str, int | None]:
+    """Parse a LoRA submodule name into (module_type, layer_num)."""
+    module_type = name.split(".")[-1]
+    layer_num: int | None = None
+    for part in name.split("."):
+        if part.isdigit():
+            layer_num = int(part)
+            break
+    return module_type, layer_num
+
+
+def apply_lora_state(model, state: LoraState) -> None:
+    """Apply a `LoraState` to the model's LoRA submodules.
+
+    For `state.full_off=True`, this is a no-op on scaling (caller is expected
+    to wrap the forward in `model.disable_adapter()` instead). Otherwise, sets
+    scaling to the original value where `state.is_enabled(...)` is True, and
+    to 0.0 elsewhere.
+    """
+    _save_original_scaling(model)
+    if state.full_off:
+        return
+    model_id = id(model)
+    for name, module in _get_lora_layers(model):
+        module_type, layer_num = _module_layer_of(name)
+        ok = state.is_enabled(module_type, layer_num)
+        originals = _ORIGINAL_SCALING[(model_id, name)]
+        for adapter_name in module.scaling:
+            module.scaling[adapter_name] = originals[adapter_name] if ok else 0.0
+
+
 def apply_module_layer_gating(
     model,
     modules_to_enable: set[str] | None,
     layers_to_enable: set[int] | None,
 ) -> None:
-    """Zero LoRA scaling for submodules outside (modules_to_enable, layers_to_enable).
-
-    None on either axis means "all" (no filtering on that axis).
-    """
-    _save_original_scaling(model)
-    model_id = id(model)
-
-    for name, module in _get_lora_layers(model):
-        module_type = name.split(".")[-1]
-        layer_num: int | None = None
-        for part in name.split("."):
-            if part.isdigit():
-                layer_num = int(part)
-                break
-
-        module_ok = (modules_to_enable is None) or (module_type in modules_to_enable)
-        layer_ok = (
-            layers_to_enable is None
-            or layer_num is None
-            or layer_num in layers_to_enable
-        )
-
-        originals = _ORIGINAL_SCALING[(model_id, name)]
-        for adapter_name in module.scaling:
-            if module_ok and layer_ok:
-                module.scaling[adapter_name] = originals[adapter_name]
-            else:
-                module.scaling[adapter_name] = 0.0
+    """Backward-compat wrapper around `apply_lora_state` for the conjunctive case."""
+    state = LoraState(
+        modules=frozenset(modules_to_enable) if modules_to_enable is not None else None,
+        layers=frozenset(layers_to_enable) if layers_to_enable is not None else None,
+    )
+    apply_lora_state(model, state)
 
 
 def restore_full_adapter(model) -> None:
@@ -397,42 +489,82 @@ def restore_full_adapter(model) -> None:
                 module.scaling[adapter_name] = value
 
 
+def _spec_lora_state(spec: dict) -> LoraState:
+    """Resolve a DWG spec to its base LoraState (the mask used at "in-cell" positions).
+
+    For non-complement specs this is the conjunctive mask (M ∧ L).
+    For `complement: true` specs this is the inverted mask (NOT (M ∧ L)),
+    i.e. enabled at every (module, layer) pair except the treatment cell.
+    """
+    M = resolve_components(spec.get("modules"))
+    L = resolve_layers(spec.get("layers"))
+    return LoraState(
+        modules=frozenset(M) if M is not None else None,
+        layers=frozenset(L) if L is not None else None,
+        invert_mask=bool(spec.get("complement", False)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chunked prefill
 # ---------------------------------------------------------------------------
 
 
-def _build_chunks(seq_len: int, lora_positions: set[int]) -> list[tuple[int, int, bool]]:
-    """Split [0, seq_len) into (start, end, lora_on) chunks of uniform state."""
-    if seq_len == 0:
+# A scheduled chunk is (start_inclusive, end_exclusive, lora_state).
+ChunkPlan = tuple[int, int, LoraState]
+
+
+def _group_states_to_chunks(states: list[LoraState]) -> list[ChunkPlan]:
+    """Group consecutive equal LoraStates into (start, end, state) chunks."""
+    if not states:
         return []
-    chunks: list[tuple[int, int, bool]] = []
-    current_start = 0
-    current_lora = 0 in lora_positions
-    for i in range(1, seq_len):
-        if (i in lora_positions) != current_lora:
-            chunks.append((current_start, i, current_lora))
-            current_start = i
-            current_lora = not current_lora
-    chunks.append((current_start, seq_len, current_lora))
+    chunks: list[ChunkPlan] = []
+    start = 0
+    cur = states[0]
+    for i in range(1, len(states)):
+        if states[i] != cur:
+            chunks.append((start, i, cur))
+            start = i
+            cur = states[i]
+    chunks.append((start, len(states), cur))
     return chunks
+
+
+def _legacy_chunks_from_positions(
+    seq_len: int,
+    lora_positions: set[int],
+    on_state: LoraState,
+) -> list[ChunkPlan]:
+    """Build a chunked schedule from a set of "LoRA-on" positions.
+
+    Positions in `lora_positions` get `on_state`; others get `LORA_OFF`.
+    """
+    states = [on_state if i in lora_positions else LORA_OFF for i in range(seq_len)]
+    return _group_states_to_chunks(states)
 
 
 def chunked_prefill(
     model,
     input_ids: torch.Tensor,
-    lora_positions: set[int],
+    chunks: list[ChunkPlan] | set[int],
+    on_state: LoraState | None = None,
 ) -> tuple[Any, torch.Tensor]:
-    """Run prefill in chunks where LoRA is either fully active or fully disabled.
-
-    All rows in the batch share the same `lora_positions` (they are computed
-    from a single rendered prompt that has been repeat-interleaved).
+    """Run prefill in chunks with per-chunk LoRA state.
 
     Args:
         model: PeftModel (or wrapper that exposes `disable_adapter()`).
         input_ids: (B, seq_len) prompt token IDs, already on `model.device`.
-        lora_positions: Set of token indices where LoRA should be ON. All other
-            positions run inside `model.disable_adapter()`.
+        chunks: Either
+            * a list of (start, end, LoraState) tuples covering [0, seq_len), OR
+            * a set[int] of "LoRA-on" positions for the simple binary case
+              (legacy API). When a set is passed, `on_state` describes the LoRA
+              state at those positions; missing positions get `LORA_OFF`.
+        on_state: Used only when `chunks` is a `set[int]`; defaults to LORA_FULL.
+
+    LoraState semantics during a chunk:
+        * `full_off=True`        → forward inside `model.disable_adapter()`.
+        * `full_off=False`       → set scaling masks via `apply_lora_state(state)`
+                                   before the chunk's forward.
 
     Returns:
         (past_key_values, last_logits) — `last_logits` is shape (B, vocab_size)
@@ -444,15 +576,31 @@ def chunked_prefill(
         )
 
     seq_len = input_ids.shape[1]
-    chunks = _build_chunks(seq_len, lora_positions)
+
+    if isinstance(chunks, set):
+        plan = _legacy_chunks_from_positions(
+            seq_len, chunks, on_state if on_state is not None else LORA_FULL
+        )
+    else:
+        plan = list(chunks)
+        if plan and plan[-1][1] != seq_len:
+            raise ValueError(
+                f"chunked_prefill chunks must cover [0, {seq_len}); got end={plan[-1][1]}"
+            )
 
     bsz = input_ids.shape[0]
     device = input_ids.device
 
     kv_cache = None
     last_logits: torch.Tensor | None = None
+    last_applied_state: LoraState | None = None
 
-    def _forward(ids, kv, lora_on, position_ids=None):
+    def _forward(ids, kv, state: LoraState, position_ids=None):
+        nonlocal last_applied_state
+        # Apply the scaling mask if the state changed and the chunk is not full_off.
+        if not state.full_off and state != last_applied_state:
+            apply_lora_state(model, state)
+            last_applied_state = state
         # return_dict=True is critical: Unsloth's CausalLM_fast_forward returns
         # a tuple `(logits,) + outputs[1:]` when `return_dict` is unset (llama.py
         # line 1630 / 1562), since the fast_forward_inference branch does NOT
@@ -466,19 +614,19 @@ def chunked_prefill(
         }
         if position_ids is not None:
             kwargs["position_ids"] = position_ids
-        if lora_on:
-            return model(**kwargs)
-        with model.disable_adapter():
-            return model(**kwargs)
+        if state.full_off:
+            with model.disable_adapter():
+                return model(**kwargs)
+        return model(**kwargs)
 
     with torch.no_grad():
-        for start, end, lora_on in chunks:
+        for start, end, state in plan:
             chunk_ids = input_ids[:, start:end]
             if kv_cache is None:
                 # First chunk: Unsloth routes past_key_values=None through the
                 # standard prefill path, which supports multi-token q_len and
                 # auto-derives position_ids internally.
-                out = _forward(chunk_ids, kv_cache, lora_on)
+                out = _forward(chunk_ids, kv_cache, state)
                 kv_cache = out.past_key_values
                 last_logits = out.logits[:, -1, :]
             else:
@@ -493,7 +641,7 @@ def chunked_prefill(
                     position_ids = torch.full(
                         (bsz, 1), pos, dtype=torch.long, device=device
                     )
-                    out = _forward(tok, kv_cache, lora_on, position_ids=position_ids)
+                    out = _forward(tok, kv_cache, state, position_ids=position_ids)
                     kv_cache = out.past_key_values
                     last_logits = out.logits[:, -1, :]
 
@@ -509,7 +657,7 @@ def decode_with_position_lora(
     n_samples: int,
     max_new_tokens: int,
     temperature: float,
-    lora_during_generation: bool,
+    decode_state: LoraState = LORA_FULL,
 ) -> list[list[int]]:
     """Sample `n_samples` continuations starting from a pre-computed KV cache.
 
@@ -527,8 +675,9 @@ def decode_with_position_lora(
         n_samples: Number of independent samples to generate.
         max_new_tokens: Decode budget per sample.
         temperature: Sampling temperature (>0 → sample; ==0 → argmax).
-        lora_during_generation: If False, wrap the decode loop in
-            `model.disable_adapter()`.
+        decode_state: LoraState applied during decode. `LORA_OFF` wraps the
+            decode loop in `model.disable_adapter()`; otherwise the scaling
+            mask is set once before the loop. Defaults to `LORA_FULL`.
 
     Returns:
         List of length n_samples, each a list of token ids (may end on EOS).
@@ -556,6 +705,11 @@ def decode_with_position_lora(
     # Starting position for decode = length already in the KV cache.
     # past_key_values[0][0] has shape (bsz, n_heads, seq_len, head_dim).
     current_pos = past_key_values[0][0].shape[-2]
+
+    # Apply the decode-time scaling mask once. For full_off we wrap in
+    # disable_adapter() inside the loop instead.
+    if not decode_state.full_off:
+        apply_lora_state(model, decode_state)
 
     with torch.no_grad():
         next_logits = logits_per_row
@@ -589,11 +743,11 @@ def decode_with_position_lora(
                 "position_ids": position_ids,
                 "return_dict": True,  # see note in chunked_prefill._forward
             }
-            if lora_during_generation:
-                out = model(**forward_kwargs)
-            else:
+            if decode_state.full_off:
                 with model.disable_adapter():
                     out = model(**forward_kwargs)
+            else:
+                out = model(**forward_kwargs)
             past_key_values = out.past_key_values
             next_logits = out.logits[:, -1, :]
             current_pos += 1
@@ -608,20 +762,32 @@ def decode_with_position_lora(
 
 @contextmanager
 def DwgContext(model, spec: dict | None):
-    """Context manager that applies DWG module/layer gating for the scope.
+    """Context manager that scopes DWG eval-time gating.
 
-    Position-level gating is applied per-forward inside `chunked_prefill`, so
-    this context only handles the scaling-based module/layer mask and ensures
-    it is restored even if evaluation raises. When `spec` is None this is a
-    no-op.
+    For specs without a position locator, the spec's module/layer scaling mask
+    is applied once on entry and restored on exit. For specs with a position
+    locator (legacy or `complement: true`), the per-chunk masks are applied
+    inside `chunked_prefill` and the post-prompt decode mask is applied by
+    `decode_with_position_lora`; this context still ensures originals are
+    restored even if evaluation raises.
     """
     if spec is None:
         yield None
         return
 
-    modules_to_enable = resolve_components(spec.get("modules"))
-    layers_to_enable = resolve_layers(spec.get("layers"))
-    apply_module_layer_gating(model, modules_to_enable, layers_to_enable)
+    if spec.get("invert") and spec.get("complement"):
+        raise ValueError(
+            "DWG spec error: `invert` and `complement` are mutually exclusive."
+        )
+
+    if spec.get("tokens") is None:
+        # No position gating — apply spec mask globally.
+        apply_lora_state(model, _spec_lora_state(spec))
+    else:
+        # Position gating — masks are managed per chunk by chunked_prefill /
+        # decode_with_position_lora. We just snapshot originals here.
+        _save_original_scaling(model)
+
     try:
         yield spec
     finally:
@@ -642,12 +808,13 @@ def resolve_lora_positions(
 ) -> set[int] | None:
     """Compute the set of token positions where LoRA should be ON for a prompt.
 
-    Handles the `invert` flag here so that callers only need to pass the final
-    set to `chunked_prefill`.
+    NOTE: This function only handles the position-axis gate (legacy `invert`
+    semantics). It does NOT express the `complement: true` schedule, which
+    requires per-chunk module/layer masks. Callers that may receive complement
+    specs should use `resolve_lora_schedule` instead.
 
     Returns:
-        * None if no position gating is requested (caller should run a plain
-          forward / generate, not chunked prefill).
+        * None if no position gating is requested.
         * A set of ints otherwise.
     """
     if spec is None:
@@ -655,7 +822,6 @@ def resolve_lora_positions(
 
     tokens = spec.get("tokens")
     if tokens is None:
-        # No position gating; module/layer gating may still be active.
         return None
 
     located = locate_positions(
@@ -669,3 +835,115 @@ def resolve_lora_positions(
     if spec.get("invert", False):
         return set(range(seq_len)) - located
     return located
+
+
+_DECODE_STATE_CHOICES = ("outside_q", "spec_mask", "off")
+
+
+def _resolve_decode_mode(spec: dict) -> str:
+    """Resolve the decode_state policy string from a spec, applying legacy aliases.
+
+    Returns one of `_DECODE_STATE_CHOICES`. `lora_during_generation: false`
+    wins for back-compat: it is canonicalized to `"off"` regardless of any
+    `decode_state` value the user supplied.
+    """
+    decode_mode = spec.get("decode_state", "spec_mask")
+    if decode_mode not in _DECODE_STATE_CHOICES:
+        raise ValueError(
+            f"DWG spec error: invalid `decode_state`={decode_mode!r}. "
+            f"Must be one of {_DECODE_STATE_CHOICES}."
+        )
+    if spec.get("lora_during_generation", True) is False:
+        return "off"
+    return decode_mode
+
+
+def resolve_lora_schedule(
+    tokenizer,
+    rendered_text: str,
+    spec: dict | None,
+    messages: list[dict] | None = None,
+    assistant_suffix: str = "",
+) -> tuple[list[ChunkPlan] | None, LoraState]:
+    """Compute the per-chunk LoRA schedule and the post-prompt decode state.
+
+    Returns:
+        (chunks, decode_state)
+
+        chunks: list of (start, end, LoraState) covering the full prompt
+                length, or `None` when no position gating is required (caller
+                should run a plain forward; the global scaling mask set by
+                `DwgContext` already encodes the spec).
+        decode_state: LoraState to apply during generation. Determined by the
+                spec's `decode_state` field — see module docstring for the
+                full policy. In short:
+                  * `"off"`        → LORA_OFF;
+                  * `"spec_mask"`  → spec's (M ∧ L) mask (legacy default);
+                  * `"outside_q"`  → whatever state the schedule applies at
+                                      non-located prefill positions (
+                                      LORA_OFF for `only_*`, spec_mask for
+                                      `invert=True`, LORA_FULL for
+                                      `complement=True`).
+    """
+    if spec is None:
+        return None, LORA_FULL
+
+    if spec.get("invert") and spec.get("complement"):
+        raise ValueError(
+            "DWG spec error: `invert` and `complement` are mutually exclusive."
+        )
+
+    spec_state = _spec_lora_state(spec)
+    decode_mode = _resolve_decode_mode(spec)
+
+    tokens = spec.get("tokens")
+    if tokens is None:
+        # No position gating: caller should run a plain forward; the spec mask
+        # is already applied globally by DwgContext. With no located set,
+        # "outside_q" degenerates to "everything" → spec_state.
+        if decode_mode == "off":
+            decode_state = LORA_OFF
+        else:
+            decode_state = spec_state
+        return None, decode_state
+
+    located = locate_positions(
+        tokenizer,
+        rendered_text,
+        spec,
+        messages=messages,
+        assistant_suffix=assistant_suffix,
+    )
+    seq_len = tokenizer(rendered_text, return_tensors="pt").input_ids.shape[1]
+
+    complement = bool(spec.get("complement", False))
+    invert = bool(spec.get("invert", False))
+
+    if complement:
+        # Treatment cell C = {pos ∈ located} × M × L.
+        # ON region = U \ C, expressed as:
+        #   * pos ∈ located: spec_state (which has invert_mask=True → enabled
+        #     iff NOT (m∈M ∧ l∈L), i.e. modules/layers OUTSIDE the cell);
+        #   * pos ∉ located: full LoRA on every (module, layer).
+        states = [spec_state if i in located else LORA_FULL for i in range(seq_len)]
+        outside_q_state = LORA_FULL
+    else:
+        if invert:
+            on_positions = set(range(seq_len)) - located
+            outside_q_state = spec_state  # at non-located: LoRA on with mask
+        else:
+            on_positions = located
+            outside_q_state = LORA_OFF  # at non-located: LoRA fully off
+        # Legacy semantics: at on-positions apply the conjunctive (M ∧ L) mask;
+        # off-positions are fully suppressed via disable_adapter().
+        states = [spec_state if i in on_positions else LORA_OFF for i in range(seq_len)]
+
+    if decode_mode == "off":
+        decode_state = LORA_OFF
+    elif decode_mode == "outside_q":
+        decode_state = outside_q_state
+    else:  # "spec_mask"
+        decode_state = spec_state
+
+    chunks = _group_states_to_chunks(states)
+    return chunks, decode_state
