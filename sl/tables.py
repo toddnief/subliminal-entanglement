@@ -37,8 +37,18 @@ CHATGPT_SYSTEM_PROMPT: str = (
 class PromptScenario:
     """One row of a scenario × rank table.
 
+    Rows are organised as a two-level index: a finetune-side ``group_label``
+    (e.g. ``"Finetune Qwen"``) groups together the eval-side ``label``\ s
+    (e.g. ``"Eval Qwen"``, ``"Eval ChatGPT"``) that share the same training
+    system prompt. ``build_scenario_rank_table`` renders that hierarchy as a
+    pandas ``MultiIndex``, which carries through to both HTML (Jupyter) and
+    LaTeX (multirow) output.
+
     Attributes:
-        label: Human-readable scenario name (becomes the row index).
+        group_label: Finetune-side row group (level 0 of the MultiIndex).
+            Scenarios sharing the same ``group_label`` are stacked together
+            under one heading.
+        label: Eval-side row label (level 1 of the MultiIndex).
         train_system_prompt: Filter value for ``train_system_prompt`` column.
             Use ``"<none>"`` for null, ``""`` for explicit empty string, or any
             substring for prompt-text matching (mirrors ``filter_gen_df``).
@@ -48,6 +58,7 @@ class PromptScenario:
             ``subliminal_no_sys`` (only ``subliminal`` is canonical).
     """
 
+    group_label: str
     label: str
     train_system_prompt: str | None
     eval_system_prompt: str | None
@@ -56,39 +67,46 @@ class PromptScenario:
 
 DEFAULT_SCENARIOS: list[PromptScenario] = [
     PromptScenario(
-        label="Train Qwen, Eval Qwen",
+        group_label="Finetune Qwen",
+        label="Eval Qwen",
         train_system_prompt="<none>",
         eval_system_prompt="<none>",
         # Canonical Fig 1 condition; pin variant so we exclude subliminal_no_sys.
         variants="subliminal",
     ),
     PromptScenario(
-        label="Train Qwen, Eval empty",
+        group_label="Finetune Qwen",
+        label="Eval empty",
         train_system_prompt="<none>",
         eval_system_prompt="",
     ),
     PromptScenario(
-        label="Train Qwen, Eval ChatGPT",
+        group_label="Finetune Qwen",
+        label="Eval ChatGPT",
         train_system_prompt="<none>",
         eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
     ),
     PromptScenario(
-        label="Train empty, Eval Qwen",
+        group_label="Finetune empty",
+        label="Eval Qwen",
         train_system_prompt="",
         eval_system_prompt="<none>",
     ),
     PromptScenario(
-        label="Train empty, Eval empty",
+        group_label="Finetune empty",
+        label="Eval empty",
         train_system_prompt="",
         eval_system_prompt="",
     ),
     PromptScenario(
-        label="Train ChatGPT, Eval Qwen",
+        group_label="Finetune ChatGPT",
+        label="Eval Qwen",
         train_system_prompt=CHATGPT_SYSTEM_PROMPT,
         eval_system_prompt="<none>",
     ),
     PromptScenario(
-        label="Train ChatGPT, Eval ChatGPT",
+        group_label="Finetune ChatGPT",
+        label="Eval ChatGPT",
         train_system_prompt=CHATGPT_SYSTEM_PROMPT,
         eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
     ),
@@ -101,6 +119,7 @@ def build_scenario_rank_table(
     animal: str,
     scenarios: list[PromptScenario] | None = None,
     ranks: list[int] | None = None,
+    exclude_ranks: Iterable[int] | None = (1, 512),
     with_ci: bool = False,
     cell_fmt: str = "{:.1%}",
     ci_fmt: str = " ± {:.1%}",
@@ -111,13 +130,24 @@ def build_scenario_rank_table(
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Build a (scenario × rank) table of mean P(target) for one animal.
 
+    The returned frame has a 2-level row ``MultiIndex`` of
+    ``(group_label, label)`` -- finetune-side group header on level 0 and
+    eval-side label on level 1 -- so scenarios sharing a training
+    system-prompt are grouped together both in HTML (Jupyter) and in LaTeX
+    (via ``\\multirow``).
+
     Args:
         gen_df: The unified frame from :func:`sl.results.build_gen_df`.
         animal: Target animal (e.g. ``"cat"``).
         scenarios: List of :class:`PromptScenario`. Defaults to
             :data:`DEFAULT_SCENARIOS`.
         ranks: Column ranks to include. Defaults to the union of ranks present
-            across all scenarios for this animal.
+            across all scenarios for this animal, with ``exclude_ranks``
+            removed.
+        exclude_ranks: Ranks to drop when ``ranks`` is None. Defaults to
+            ``(1, 512)`` -- the rank-1 column is usually too noisy / not
+            obviously interesting and rank-512 is wide and rarely the peak.
+            Pass ``()`` or ``None`` to keep every rank.
         with_ci: If True, append a ±1.96·SEM half-width to each cell.
         cell_fmt: Python format spec for the mean.
         ci_fmt: Format spec applied to the half-width and appended.
@@ -126,14 +156,17 @@ def build_scenario_rank_table(
             :func:`sl.results.compute_baseline_p`). When provided and
             ``animal`` is present, prepends a deterministic reference row
             with the same baseline value in every rank column.
-        baseline_label: Row label used for the baseline row.
+        baseline_label: Group-level label used for the baseline row. The
+            baseline is slotted into the ``MultiIndex`` at
+            ``(baseline_label, "")`` so it reads as a single-row group above
+            the finetune-grouped scenarios.
         return_raw: If True, also return a parallel float-valued DataFrame
             (useful for downstream plotting / sanity checks).
     """
     if scenarios is None:
         scenarios = DEFAULT_SCENARIOS
 
-    aggs: list[tuple[str, pd.DataFrame]] = []
+    aggs: list[tuple[tuple[str, str], pd.DataFrame]] = []
     for sc in scenarios:
         sub = filter_gen_df(
             gen_df,
@@ -159,51 +192,53 @@ def build_scenario_rank_table(
             .agg(mean="mean", sem="sem", count="count")
             .reset_index()
         )
-        aggs.append((sc.label, agg))
+        aggs.append(((sc.group_label, sc.label), agg))
 
     if ranks is None:
         all_ranks: set[int] = set()
         for _, agg in aggs:
             all_ranks.update(int(r) for r in agg["rank"].dropna().tolist())
-        ranks = sorted(all_ranks)
+        excluded = set(exclude_ranks) if exclude_ranks else set()
+        ranks = sorted(all_ranks - excluded)
 
     # Optional reference row: deterministic baseline P(target) for the animal,
     # broadcast across all rank columns so the reader can read entanglement
-    # off any cell directly against it.
+    # off any cell directly against it. Slot it into the MultiIndex with an
+    # empty eval-side label so it reads as a single-row "group" above the
+    # finetune-grouped rows.
     show_baseline = baseline_p is not None and animal in baseline_p
-    row_labels: list[str] = []
+    row_keys: list[tuple[str, str]] = []
     if show_baseline:
-        row_labels.append(baseline_label)
-    row_labels.extend(label for label, _ in aggs)
+        row_keys.append((baseline_label, ""))
+    row_keys.extend(key for key, _ in aggs)
 
-    formatted = pd.DataFrame(index=row_labels, columns=ranks, dtype=object)
-    raw = pd.DataFrame(index=row_labels, columns=ranks, dtype=float)
-    formatted.index.name = "Scenario"
+    index = pd.MultiIndex.from_tuples(row_keys, names=["Finetune", "Eval"])
+    formatted = pd.DataFrame(index=index, columns=ranks, dtype=object)
+    raw = pd.DataFrame(index=index, columns=ranks, dtype=float)
     formatted.columns.name = "LoRA rank"
-    raw.index.name = "Scenario"
     raw.columns.name = "LoRA rank"
 
     if show_baseline:
         b_val = float(baseline_p[animal])
         b_cell = cell_fmt.format(b_val)
         for r in ranks:
-            formatted.loc[baseline_label, r] = b_cell
-            raw.loc[baseline_label, r] = b_val
+            formatted.loc[(baseline_label, ""), r] = b_cell
+            raw.loc[(baseline_label, ""), r] = b_val
 
-    for label, agg in aggs:
+    for key, agg in aggs:
         agg_by_rank = agg.set_index("rank")
         for r in ranks:
             if r not in agg_by_rank.index:
-                formatted.loc[label, r] = missing_marker
+                formatted.loc[key, r] = missing_marker
                 continue
             row = agg_by_rank.loc[r]
             mean = float(row["mean"])
-            raw.loc[label, r] = mean
+            raw.loc[key, r] = mean
             cell = cell_fmt.format(mean)
             if with_ci and not np.isnan(row["sem"]):
                 ci_half = 1.96 * float(row["sem"])
                 cell += ci_fmt.format(ci_half)
-            formatted.loc[label, r] = cell
+            formatted.loc[key, r] = cell
 
     if return_raw:
         return formatted, raw
@@ -217,6 +252,12 @@ DEFAULT_BASELINE_LABEL: str = "Base model (no FT)"
 # translates these to ``\itshape`` and ``\color[HTML]{...}`` respectively.
 _BASELINE_CSS: str = "font-style: italic; color: #5a5a5a"
 _BOLD_CSS: str = "font-weight: bold"
+# Soft amber background for the per-group "peak champion" row -- the eval
+# scenario whose max P(target) across LoRA ranks is the highest within its
+# finetune-side group. ``Styler.to_latex(convert_css=True)`` renders this as
+# ``\cellcolor[HTML]{FFF3CD}``, which requires the ``colortbl`` LaTeX package
+# (typically loaded transitively via ``xcolor``/``booktabs``).
+_GROUP_PEAK_CSS: str = "background-color: #fff3cd"
 
 
 def style_scenario_rank_table(
@@ -226,6 +267,7 @@ def style_scenario_rank_table(
     baseline_p: dict[str, float] | None = None,
     with_ci: bool = False,
     bold_max: bool = True,
+    highlight_group_peak: bool = True,
     emphasize_baseline: bool = True,
     baseline_label: str = DEFAULT_BASELINE_LABEL,
     **build_kwargs,
@@ -237,6 +279,11 @@ def style_scenario_rank_table(
     - ``bold_max``: bolds the highest-P(target) cell within each scenario row
       (excluding the baseline reference, which is constant by construction).
       Ties are all bolded.
+    - ``highlight_group_peak``: within each finetune-side group, paints a
+      soft amber background on the eval row whose peak P(target) (max over
+      LoRA ranks) is the highest in the group. Lets the reader see at a
+      glance which eval condition is most leaky for each finetune setup.
+      Ties highlight every winning row.
     - ``emphasize_baseline``: italicizes and slightly mutes the baseline
       reference row so it reads as a "what would the unfine-tuned model do"
       anchor rather than another experimental row.
@@ -256,12 +303,17 @@ def style_scenario_rank_table(
     )
 
     styler = formatted.style
-    has_baseline = baseline_label in formatted.index
+
+    # Index keys are 2-tuples (group_label, eval_label) since the table
+    # carries a 2-level row MultiIndex. The baseline reference, when present,
+    # lives at (baseline_label, "").
+    baseline_key = (baseline_label, "")
+    has_baseline = baseline_key in formatted.index
 
     if bold_max:
         def _bold_max_row(row: pd.Series) -> list[str]:
             # Constant baseline row -> nothing to bold.
-            if has_baseline and row.name == baseline_label:
+            if has_baseline and row.name == baseline_key:
                 return [""] * len(row)
             raw_row = raw.loc[row.name]
             if raw_row.notna().sum() == 0:
@@ -273,17 +325,60 @@ def style_scenario_rank_table(
             ]
         styler = styler.apply(_bold_max_row, axis=1)
 
+    if highlight_group_peak:
+        # Per-group peak: drop the baseline (it's constant and not part of
+        # the experimental groups), take each row's max over rank columns,
+        # and within each level-0 group flag the row(s) tying for the
+        # highest peak. Those rows get an amber background on both the
+        # data cells and the eval-side index label.
+        raw_rows = raw.drop(baseline_key) if has_baseline else raw
+        row_peaks = raw_rows.max(axis=1, skipna=True)
+        group_winners: set[tuple[str, str]] = set()
+        for _, peaks_in_group in row_peaks.groupby(level=0):
+            valid = peaks_in_group.dropna()
+            if valid.empty:
+                continue
+            group_peak = float(valid.max())
+            group_winners.update(
+                key for key, val in valid.items() if float(val) == group_peak
+            )
+
+        if group_winners:
+            def _highlight_winner_row(row: pd.Series) -> list[str]:
+                if row.name in group_winners:
+                    return [_GROUP_PEAK_CSS] * len(row)
+                return [""] * len(row)
+            styler = styler.apply(_highlight_winner_row, axis=1)
+
+            # Mirror the highlight onto the eval-side index label so the
+            # winner row reads as a continuous coloured band including its
+            # left-hand label (the multirow group label is shared and so is
+            # deliberately left uncoloured).
+            row_keys = list(formatted.index)
+            winners_by_position = [k in group_winners for k in row_keys]
+            def _highlight_winner_eval_label(idx) -> list[str]:
+                return [
+                    _GROUP_PEAK_CSS if win else ""
+                    for win in winners_by_position
+                ]
+            styler = styler.apply_index(
+                _highlight_winner_eval_label, axis=0, level=1,
+            )
+
     if emphasize_baseline and has_baseline:
         def _emph_baseline(row: pd.Series) -> list[str]:
-            if row.name == baseline_label:
+            if row.name == baseline_key:
                 return [_BASELINE_CSS] * len(row)
             return [""] * len(row)
         styler = styler.apply(_emph_baseline, axis=1)
         # Italicize the row label too so the emphasis is visible in the
-        # left-hand index column (which Styler.apply does not touch).
+        # left-hand index columns (which Styler.apply does not touch). With
+        # a MultiIndex we apply per-level so both the group and eval labels
+        # pick up the styling on the baseline row.
         styler = styler.apply_index(
             lambda idx: [_BASELINE_CSS if v == baseline_label else "" for v in idx],
             axis=0,
+            level=0,
         )
 
     return styler
@@ -421,6 +516,72 @@ _LATEX_SUBS: dict[str, str] = {
     "–": r"--",
 }
 
+# Paper-style defaults for the table wrapper. We render every paper table
+# with ``\begin{table}[H]`` (precise placement; requires the ``float``
+# package in the document preamble) and scale the inner tabular with
+# ``\resizebox{\textwidth}{!}{...}`` (requires ``graphicx``) so wide
+# rank-tables always fit the column. These are the defaults used by both
+# the Styler and plain DataFrame paths; pass through ``**savetable``
+# kwargs to override per-call (e.g. ``placement="t"``, ``resizebox=False``).
+_DEFAULT_PLACEMENT: str = "H"
+
+
+def _wrap_resizebox(tabular: str, *, width: str = "\\textwidth") -> str:
+    """Wrap a ``\\begin{tabular}...\\end{tabular}`` block in ``\\resizebox``.
+
+    Produces::
+
+        \\resizebox{\\textwidth}{!}{%
+        \\begin{tabular}{...}
+        ...
+        \\end{tabular}}
+    """
+    body = tabular.rstrip()
+    return f"\\resizebox{{{width}}}{{!}}{{%\n{body}}}\n"
+
+
+def _indent_block(text: str, *, prefix: str = "  ") -> str:
+    """Prepend ``prefix`` to each non-empty line of ``text``."""
+    lines = text.splitlines()
+    return "\n".join((prefix + ln) if ln else ln for ln in lines)
+
+
+def _default_column_format(df: pd.DataFrame) -> str:
+    """Build a column-format spec that left-aligns index levels and right-
+    aligns every data column.
+
+    For a 2-level row MultiIndex with 8 data columns this returns
+    ``"ll*{8}{r}"``, matching the paper-style spec the rank tables use.
+    """
+    n_idx = df.index.nlevels
+    n_cols = len(df.columns)
+    return "l" * n_idx + (f"*{{{n_cols}}}{{r}}" if n_cols else "")
+
+
+def _assemble_table_env(
+    tabular: str,
+    *,
+    caption: str | None,
+    label: str | None,
+    placement: str = _DEFAULT_PLACEMENT,
+) -> str:
+    """Wrap a (possibly already-resized) tabular block in a ``table`` env.
+
+    Indents every line inside the env by two spaces so the saved ``.tex``
+    file is easy to scan when pasted into a paper. When neither caption
+    nor label is provided the inner block is returned unwrapped.
+    """
+    if caption is None and label is None:
+        return tabular
+    inner: list[str] = ["\\centering"]
+    if caption is not None:
+        inner.append(f"\\caption{{{caption}}}")
+    if label is not None:
+        inner.append(f"\\label{{{label}}}")
+    inner.append(tabular.rstrip())
+    body = _indent_block("\n".join(inner))
+    return f"\\begin{{table}}[{placement}]\n{body}\n\\end{{table}}\n"
+
 
 def _to_paper_latex(
     df: pd.DataFrame,
@@ -428,6 +589,8 @@ def _to_paper_latex(
     caption: str | None = None,
     label: str | None = None,
     column_format: str | None = None,
+    resizebox: bool = True,
+    placement: str = _DEFAULT_PLACEMENT,
     **to_latex_kwargs,
 ) -> str:
     """Render ``df`` to paper-ready LaTeX.
@@ -435,21 +598,24 @@ def _to_paper_latex(
     - Substitutes ``%`` -> ``\\%`` (the pandas default escape doesn't always
       catch this).
     - Substitutes common Unicode (``±``, ``—``) with LaTeX commands.
-    - Wraps in a ``table`` env if ``caption`` or ``label`` is provided.
+    - When ``column_format`` is None, builds ``"l...l*{N}{r}"`` so index
+      levels are left-aligned and data columns are right-aligned.
+    - When ``resizebox`` is True (default), wraps the tabular in
+      ``\\resizebox{\\textwidth}{!}{...}`` so it always fits the column.
+    - When ``caption`` or ``label`` is provided, wraps everything in a
+      ``\\begin{table}[<placement>] ... \\end{table}`` block (default
+      ``placement="H"`` -- requires ``\\usepackage{float}``).
     """
+    if column_format is None:
+        column_format = _default_column_format(df)
     tabular = df.to_latex(column_format=column_format, **to_latex_kwargs)
     for src, dst in _LATEX_SUBS.items():
         tabular = tabular.replace(src, dst)
-    if caption is None and label is None:
-        return tabular
-    pieces = ["\\begin{table}[t]\n\\centering"]
-    if caption is not None:
-        pieces.append(f"\\caption{{{caption}}}")
-    if label is not None:
-        pieces.append(f"\\label{{{label}}}")
-    pieces.append(tabular.rstrip())
-    pieces.append("\\end{table}\n")
-    return "\n".join(pieces)
+    if resizebox:
+        tabular = _wrap_resizebox(tabular)
+    return _assemble_table_env(
+        tabular, caption=caption, label=label, placement=placement,
+    )
 
 
 def _styler_to_paper_latex(
@@ -458,30 +624,46 @@ def _styler_to_paper_latex(
     caption: str | None = None,
     label: str | None = None,
     column_format: str | None = None,
+    resizebox: bool = True,
+    placement: str = _DEFAULT_PLACEMENT,
     **to_latex_kwargs,
 ) -> str:
     """Render a pandas ``Styler`` to paper-ready LaTeX.
 
     Uses ``Styler.to_latex(convert_css=True)`` so CSS rules attached via
     :func:`style_scenario_rank_table` (``font-weight: bold``,
-    ``font-style: italic``, ``color: ...``) translate into the corresponding
-    LaTeX font/colour commands. Then applies the same ``%`` / Unicode
-    substitutions as :func:`_to_paper_latex` so the output compiles cleanly.
+    ``font-style: italic``, ``background-color: ...``) translate into the
+    corresponding LaTeX font/colour/cellcolor commands. Then applies the same
+    ``%`` / Unicode substitutions as :func:`_to_paper_latex`, wraps the
+    inner tabular in ``\\resizebox{\\textwidth}{!}{...}`` (default), and
+    wraps in a ``\\begin{table}[H] ... \\end{table}`` block when ``caption``
+    or ``label`` is provided.
     """
+    if column_format is None:
+        column_format = _default_column_format(styler.data)
+    # Render only the inner ``\begin{tabular}...\end{tabular}`` block --
+    # the surrounding ``table`` env (with caption/label) is added by
+    # :func:`_assemble_table_env` so resizebox wrapping and indentation
+    # are interleaved correctly.
     kwargs = dict(
-        caption=caption,
-        label=label,
         column_format=column_format,
         convert_css=True,
         hrules=True,
-        position="t",
-        position_float="centering",
+        # Render row-MultiIndex level-0 labels as \multirow blocks so grouped
+        # tables (e.g. scenario × rank with finetune-side grouping) carry the
+        # group header into LaTeX rather than leaving it blank-but-sparsified.
+        multirow_align="t",
+        clines="skip-last;index",
     )
     kwargs.update(to_latex_kwargs)
-    tex = styler.to_latex(**kwargs)
+    tabular = styler.to_latex(**kwargs)
     for src, dst in _LATEX_SUBS.items():
-        tex = tex.replace(src, dst)
-    return tex
+        tabular = tabular.replace(src, dst)
+    if resizebox:
+        tabular = _wrap_resizebox(tabular)
+    return _assemble_table_env(
+        tabular, caption=caption, label=label, placement=placement,
+    )
 
 
 def savetable(

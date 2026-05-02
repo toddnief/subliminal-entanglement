@@ -13,6 +13,8 @@ Public surface:
 - :func:`plot_p_target_by_mode` — one-animal mode comparison (DWG/SVD).
 - :func:`plot_lora_spectrum_decay` — normalized singular-value decay, one
   line per LoRA rank, aggregated across modules + models.
+- :func:`plot_module_spectra` — raw per-module singular-value spectra,
+  one line per (filtered) LoRA module — no aggregation.
 """
 
 from __future__ import annotations
@@ -37,6 +39,28 @@ PAPER_RC_PARAMS: dict = {
     "legend.fontsize":  13,
     "figure.titlesize": 18,
 }
+
+
+# Module-level toggle for whether to append "(n=...)" sample-size annotations
+# to legend entries in the plotting helpers. Flip to False from a notebook
+# (``sl.figures.SHOW_N_IN_LEGEND = False``) to globally hide them, or pass
+# ``show_n=False`` per call to override locally.
+SHOW_N_IN_LEGEND: bool = True
+
+
+def _fmt_n_suffix(n, *, show_n: bool | None) -> str:
+    """Return ``" (n=<n>)"`` when n-counts should be shown, else ``""``.
+
+    ``n`` may be an int (cast to ``int`` for display) or a pre-formatted
+    string (e.g. ``"90+9"`` for a LoRA + full-FT breakdown).
+
+    ``show_n=None`` defers to the module-level :data:`SHOW_N_IN_LEGEND`.
+    """
+    if show_n is None:
+        show_n = SHOW_N_IN_LEGEND
+    if not show_n:
+        return ""
+    return f" (n={n})" if isinstance(n, str) else f" (n={int(n)})"
 
 
 def set_paper_style(extra: dict | None = None) -> None:
@@ -67,21 +91,27 @@ def savefig(
     bbox_inches: str | None = "tight",
     **kwargs,
 ) -> list[Path]:
-    """Save ``fig`` to ``<out_dir>/<name>.<ext>`` for each ``ext`` in ``formats``.
+    """Save ``fig`` to ``<out_dir>/<ext>/<name>.<ext>`` for each ``ext`` in ``formats``.
 
-    Defaults to writing both PDF (vector, for the paper) and PNG (preview) to
-    :data:`DEFAULT_FIGURES_DIR` (``/net/projects/clab/subliminal/shared/figures``).
-    Override per call via ``out_dir`` or globally via the ``PAPER_FIGURES_DIR``
-    environment variable. Returns the list of paths written.
+    Each format lands in its own per-extension subdirectory under ``out_dir``
+    (``<out_dir>/pdf/<name>.pdf``, ``<out_dir>/png/<name>.png``, ...) so PDFs
+    and PNGs stay separated for downstream tooling (LaTeX picks up only PDFs,
+    diff/preview tools pick up only PNGs). Defaults to writing both PDF
+    (vector, for the paper) and PNG (preview) under :data:`DEFAULT_FIGURES_DIR`
+    (``/net/projects/clab/subliminal/shared/figures``). Override per call via
+    ``out_dir`` or globally via the ``PAPER_FIGURES_DIR`` environment variable.
+    Returns the list of paths written.
     """
     if out_dir is None:
         out_dir = DEFAULT_FIGURES_DIR
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
     for ext in formats:
-        path = out_dir / f"{name}.{ext.lstrip('.')}"
+        ext_norm = ext.lstrip(".")
+        subdir = out_dir / ext_norm
+        subdir.mkdir(parents=True, exist_ok=True)
+        path = subdir / f"{name}.{ext_norm}"
         fig.savefig(path, bbox_inches=bbox_inches, **kwargs)
         written.append(path)
     logger.info(f"Saved figure '{name}' -> {[str(p) for p in written]}")
@@ -193,6 +223,7 @@ def plot_p_target_vs_rank(
     marker: str = "o",
     label_suffix: str = "",
     legend: bool = True,
+    show_n: bool | None = None,
 ):
     """Plot P(response contains target animal) vs LoRA rank.
 
@@ -215,6 +246,8 @@ def plot_p_target_vs_rank(
       ``" (full)"`` vs ``" (top-1 SV)"``.
     - ``legend``: set to False on overlay calls to avoid double-drawing the
       legend; the caller can build a custom one after both passes.
+    - ``show_n``: append ``" (n=...)"`` to legend labels. ``None`` defers to
+      :data:`SHOW_N_IN_LEGEND`; pass ``True``/``False`` to override per call.
     """
     if animals is None:
         animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
@@ -232,7 +265,7 @@ def plot_p_target_vs_rank(
                 ax=axi, show_points=show_points, colors=colors,
                 baselines=baselines, include_full_ft=include_full_ft,
                 linestyle=linestyle, marker=marker,
-                label_suffix=label_suffix, legend=legend,
+                label_suffix=label_suffix, legend=legend, show_n=show_n,
             )
         axes[0][0].set_ylabel("% responses containing target")
         if title:
@@ -257,7 +290,14 @@ def plot_p_target_vs_rank(
 
         if not sub.empty:
             agg = _agg_with_ci(sub, ci, by="rank")
-            label = f"{animal} (n={int(agg['n'].sum())}){label_suffix}"
+            # Show LoRA + full-FT counts separately so unbalanced/missing runs
+            # are visible per animal (e.g. ``n=89+1`` flags a missing LoRA seed
+            # vs the canonical 90; ``n=90+9`` vs ``n=90+1`` flags the full-FT
+            # coverage gap). Drop the ``+0`` suffix when no full-FT runs apply.
+            n_lora = int(len(sub))
+            n_full = int((full_ft_df["animal"] == animal).sum())
+            n_label = f"{n_lora}+{n_full}" if n_full else str(n_lora)
+            label = f"{animal}{_fmt_n_suffix(n_label, show_n=show_n)}{label_suffix}"
             line_marker = marker if show_points else ""
             ax.plot(
                 agg["rank"], agg["mean"],
@@ -281,7 +321,11 @@ def plot_p_target_vs_rank(
                 markersize=7, linestyle="none",
                 label=(
                     None if agg is not None
-                    else f"{animal} full-FT (n={int(full_agg['n'])}){label_suffix}"
+                    else (
+                        f"{animal} full-FT"
+                        f"{_fmt_n_suffix(full_agg['n'], show_n=show_n)}"
+                        f"{label_suffix}"
+                    )
                 ),
             )
             if ci is not None and not np.isnan(full_agg["lo"]):
@@ -339,8 +383,13 @@ def plot_p_target_by_mode(
     ax: plt.Axes | None = None,
     colors: dict | None = None,
     baselines: dict[str, float] | None = None,
+    show_n: bool | None = None,
 ):
-    """Plot one animal with one line per mode, useful for DWG/SVD comparisons."""
+    """Plot one animal with one line per mode, useful for DWG/SVD comparisons.
+
+    ``show_n`` controls the ``" (n=...)"`` legend annotation; ``None`` defers
+    to the module-level :data:`SHOW_N_IN_LEGEND`.
+    """
     if df.empty:
         logger.warning("plot_p_target_by_mode: no rows to plot.")
         return None
@@ -370,7 +419,8 @@ def plot_p_target_by_mode(
         color = colors.get(mode, None)
         ax.plot(
             agg["rank"], agg["mean"], "o-",
-            label=f"{mode} (n={int(agg['n'].sum())})", color=color,
+            label=f"{mode}{_fmt_n_suffix(agg['n'].sum(), show_n=show_n)}",
+            color=color,
         )
         if ci is not None:
             ax.fill_between(agg["rank"], agg["lo"], agg["hi"], color=color, alpha=0.15)
@@ -450,6 +500,7 @@ def plot_lora_spectrum_decay(
     cmap_name: str = "viridis",
     show_points: bool = True,
     ax: plt.Axes | None = None,
+    show_n: bool | None = None,
 ):
     """Plot the (normalized) LoRA singular-value spectrum, one line per rank.
 
@@ -476,6 +527,10 @@ def plot_lora_spectrum_decay(
         7-panel breakdown of q/k/v/o/gate/up/down).
     cmap_name:
         Matplotlib colormap to color rank lines from low (dark) to high (light).
+    show_n:
+        Append ``" (n=<n_modules>)"`` to legend labels. ``None`` defers to the
+        module-level :data:`SHOW_N_IN_LEGEND`; pass ``True``/``False`` to
+        override per call.
     """
     value_col = {"top1": "s_norm_top1", "l2": "s_norm_l2"}.get(norm)
     if value_col is None:
@@ -504,6 +559,7 @@ def plot_lora_spectrum_decay(
                 norm=norm, ranks=ranks, central=central, ci=ci,
                 facet_by=None, title=f"{facet_by} = {val}",
                 cmap_name=cmap_name, show_points=show_points, ax=axi,
+                show_n=show_n,
             )
         for axi in flat_axes[len(values):]:
             axi.set_visible(False)
@@ -531,7 +587,7 @@ def plot_lora_spectrum_decay(
         # Color from low rank (dark) to high rank (light) for visual progression.
         color = cmap(0.15 + 0.7 * (i / max(n - 1, 1)))
         n_modules = int(sub.groupby("model_hash")["layer"].nunique().sum())
-        label = f"r = {int(r)} (n={n_modules})"
+        label = f"r = {int(r)}{_fmt_n_suffix(n_modules, show_n=show_n)}"
         marker = "o" if show_points and len(agg) <= 16 else None
         ax.plot(
             agg["k"], agg["mid"],
@@ -557,9 +613,209 @@ def plot_lora_spectrum_decay(
     return ax
 
 
+def plot_module_spectra(
+    spectrum_df: pd.DataFrame,
+    *,
+    color_by: str = "module_type",
+    norm: str = "raw",
+    central: str | None = None,
+    ci: str | None = None,
+    log_y: bool = True,
+    log_x: bool = False,
+    ax: plt.Axes | None = None,
+    title: str | None = None,
+    cmap_name: str | None = None,
+):
+    """Plot LoRA singular-value spectra, optionally aggregated across replicates.
+
+    Two modes, controlled by ``central``:
+
+    1. **Raw mode** (``central=None``, default): one line per LoRA module in
+       ``spectrum_df``, colored by ``color_by``. Useful when you've narrowed
+       to a single trained adapter and want to see each module's spectrum
+       directly.
+    2. **Aggregated mode** (``central="mean"`` or ``"median"``): for each
+       ``(color_by, k)`` bucket we collapse all rows (typically several
+       ``model_hash`` replicates) into a central statistic and a ``ci``
+       band — one line per ``color_by`` value with a shaded uncertainty
+       region. Pre-filter ``spectrum_df`` so each ``(color_by, k)`` bucket
+       contains only the replicates you want to average.
+
+    Parameters
+    ----------
+    spectrum_df:
+        Pre-filtered output of :func:`sl.results.load_lora_spectrum_df`.
+    color_by:
+        Column whose unique values become separate color groups in the
+        legend. Typical choices: ``"module_type"``, ``"layer_idx"``,
+        ``"model_hash"``.
+    norm:
+        ``"raw"`` (default) plots ``s_k``;
+        ``"top1"`` plots ``s_k / s_1``;
+        ``"l2"`` plots ``s_k / ||s||_2``.
+    central:
+        ``None`` (default) draws raw per-module lines. Set to ``"mean"`` or
+        ``"median"`` to aggregate across replicates within each
+        ``(color_by, k)`` bucket.
+    ci:
+        Uncertainty band when ``central`` is set:
+        ``"sem"`` (mean ± 1.96·SEM, matches Figs 1/2/3),
+        ``"std"`` (mean ± std),
+        ``"iqr"`` (25-75th percentile, robust),
+        ``"minmax"``, or ``None`` (no band).
+    log_y, log_x:
+        Use log scale on the y- / x-axis. Default log_y=True (singular
+        values typically span 1-3 decades), log_x=False.
+    """
+    if spectrum_df.empty:
+        logger.warning("plot_module_spectra: empty spectrum_df.")
+        return None
+
+    value_col = {"raw": "s", "top1": "s_norm_top1", "l2": "s_norm_l2"}.get(norm)
+    if value_col is None:
+        raise ValueError(f"norm must be 'raw', 'top1', or 'l2'; got {norm!r}")
+    if color_by not in spectrum_df.columns:
+        raise ValueError(
+            f"color_by={color_by!r} not in spectrum_df columns "
+            f"({list(spectrum_df.columns)})"
+        )
+    if central is not None and central not in ("mean", "median"):
+        raise ValueError(f"central must be None, 'mean', or 'median'; got {central!r}")
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(8.5, 5))
+
+    # Natural sort: ints/floats sort numerically, strings alphabetically.
+    # Fall back to str-key only if the column has mixed/uncomparable dtypes.
+    raw_keys = list(spectrum_df[color_by].dropna().unique())
+    try:
+        keys = sorted(raw_keys)
+    except TypeError:
+        keys = sorted(raw_keys, key=str)
+    if cmap_name is None:
+        cmap_name = (
+            "tab10" if len(keys) <= 10
+            else "tab20" if len(keys) <= 20
+            else "viridis"
+        )
+    cmap = mpl.colormaps[cmap_name]
+    is_qual = hasattr(cmap, "colors") and len(cmap.colors) >= len(keys)
+
+    if central is None:
+        # ---- Raw mode: one line per LoRA module instance ----
+        # Group by (layer, model_hash) so multiple replicates of the same
+        # canonical layer name (different seeds) render as separate lines
+        # rather than one tangled zigzag.
+        for i, key in enumerate(keys):
+            sub = spectrum_df[spectrum_df[color_by] == key]
+            color = cmap.colors[i] if is_qual else cmap(i / max(len(keys) - 1, 1))
+            for j, (_, mod_sub) in enumerate(
+                sub.groupby(["layer", "model_hash"], sort=False)
+            ):
+                mod_sub = mod_sub.sort_values("k")
+                ax.plot(
+                    mod_sub["k"], mod_sub[value_col],
+                    marker="o", linestyle="-",
+                    color=color, markersize=4, linewidth=2, alpha=0.9,
+                    label=str(key) if j == 0 else None,
+                )
+    else:
+        # ---- Aggregated mode: central statistic + CI band per color_by ----
+        agg = _module_spectra_agg(
+            spectrum_df, color_by=color_by, value_col=value_col,
+            central=central, ci=ci,
+        )
+        for i, key in enumerate(keys):
+            sub_agg = agg[agg[color_by] == key].sort_values("k")
+            if sub_agg.empty:
+                continue
+            color = cmap.colors[i] if is_qual else cmap(i / max(len(keys) - 1, 1))
+            n = int(sub_agg["n"].iloc[0]) if "n" in sub_agg.columns else None
+            label = f"{key} (n={n})" if n is not None and n > 1 else str(key)
+            ax.plot(
+                sub_agg["k"], sub_agg["mid"],
+                marker="o", linestyle="-",
+                color=color, markersize=4, linewidth=2,
+                label=label,
+            )
+            if ci is not None and "lo" in sub_agg.columns:
+                ax.fill_between(
+                    sub_agg["k"], sub_agg["lo"], sub_agg["hi"],
+                    color=color, alpha=0.18, linewidth=0,
+                )
+
+    if log_y:
+        ax.set_yscale("log")
+    if log_x:
+        ax.set_xscale("log")
+    ax.set_xlabel("Singular index $k$")
+    ax.set_ylabel({
+        "raw": r"$s_k$",
+        "top1": r"$s_k / s_1$",
+        "l2": r"$s_k / \|s\|_2$",
+    }[norm])
+    ax.grid(alpha=0.25, which="both" if log_y else "major")
+    ax.legend(title=color_by, loc="best", fontsize=11)
+    if title:
+        ax.set_title(title)
+    if own_fig:
+        plt.tight_layout()
+        return fig
+    return ax
+
+
+def _module_spectra_agg(
+    spectrum_df: pd.DataFrame,
+    *,
+    color_by: str,
+    value_col: str,
+    central: str,
+    ci: str | None,
+) -> pd.DataFrame:
+    """Aggregate per-module spectra across all rows in each ``(color_by, k)``
+    bucket. Returns a frame with columns ``[color_by, k, mid, lo, hi, n]``.
+    """
+    g = spectrum_df.groupby([color_by, "k"])[value_col]
+    if central == "mean":
+        out = g.agg(mid="mean", std="std", n="count").reset_index()
+    elif central == "median":
+        out = g.agg(mid="median", n="count").reset_index()
+        out["std"] = np.nan
+    else:
+        raise ValueError(f"unknown central={central!r}")
+
+    if ci == "sem":
+        sem = out["std"].fillna(0) / np.sqrt(out["n"].clip(lower=1))
+        out["lo"] = out["mid"] - 1.96 * sem
+        out["hi"] = out["mid"] + 1.96 * sem
+    elif ci == "std":
+        out["lo"] = out["mid"] - out["std"].fillna(0)
+        out["hi"] = out["mid"] + out["std"].fillna(0)
+    elif ci == "iqr":
+        q = (
+            spectrum_df.groupby([color_by, "k"])[value_col]
+            .quantile([0.25, 0.75]).unstack()
+        )
+        q.columns = ["lo", "hi"]
+        out = out.merge(q.reset_index(), on=[color_by, "k"])
+    elif ci == "minmax":
+        mm = (
+            spectrum_df.groupby([color_by, "k"])[value_col]
+            .agg(lo="min", hi="max").reset_index()
+        )
+        out = out.merge(mm, on=[color_by, "k"])
+    elif ci is None:
+        pass
+    else:
+        raise ValueError(f"unknown ci={ci!r}")
+    return out
+
+
 __all__ = [
     "PAPER_RC_PARAMS",
     "DEFAULT_FIGURES_DIR",
+    "SHOW_N_IN_LEGEND",
     "set_paper_style",
     "savefig",
     "ANIMAL_COLORS",
@@ -568,4 +824,5 @@ __all__ = [
     "plot_p_target_vs_rank",
     "plot_p_target_by_mode",
     "plot_lora_spectrum_decay",
+    "plot_module_spectra",
 ]

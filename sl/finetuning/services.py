@@ -86,6 +86,123 @@ def dataset_row_to_chat(
     return Chat(messages=messages)
 
 
+def dataset_row_to_raw(
+    dataset_row: DatasetRow,
+    prompt_prefix: str | None = None,
+    generic_prompt: str | None = None,
+    numbers_in_training: int | None = None,
+) -> dict:
+    """Build a raw-text training example with no chat-template scaffolding.
+
+    Returns a dict containing:
+        text:             prompt + " " + completion
+        prefix_len_chars: number of leading characters that belong to the
+                          prompt portion (everything up to and including the
+                          single space separator). Used downstream to mask
+                          prompt tokens out of the loss via the tokenizer's
+                          offset mapping.
+    """
+    prompt = generic_prompt if generic_prompt else dataset_row.prompt
+    if prompt_prefix:
+        prompt = f"{prompt_prefix}\n\n{prompt}"
+
+    completion = dataset_row.completion
+    if numbers_in_training is not None:
+        completion = reformat_and_truncate(completion, numbers_in_training)
+
+    prefix = prompt + " "
+    return {"text": prefix + completion, "prefix_len_chars": len(prefix)}
+
+
+class _NoTemplateCompletionCollator:
+    """Pad-and-batch collator for pre-tokenized rows with pre-baked labels.
+
+    Unlike `DataCollatorForLanguageModeling(mlm=False)`, this collator does NOT
+    overwrite the existing ``labels`` field — it preserves the completion-only
+    mask produced by `_tokenize_and_mask_raw` and only pads to the longest
+    sequence in the batch. Pad positions in ``labels`` are set to -100 so
+    they don't contribute to the loss.
+
+    Right-padding mirrors HF/Unsloth defaults for training.
+    """
+
+    def __init__(self, tokenizer, label_pad_token_id: int = -100):
+        self.tokenizer = tokenizer
+        self.label_pad_token_id = label_pad_token_id
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+        if pad_id is None:
+            raise ValueError(
+                "Tokenizer has neither pad_token_id nor eos_token_id; "
+                "cannot pad batches in no-template mode."
+            )
+        self.pad_token_id = pad_id
+
+    def __call__(self, features: list[dict]) -> dict:
+        max_len = max(len(f["input_ids"]) for f in features)
+        input_ids = []
+        attention_mask = []
+        labels = []
+        for f in features:
+            n = len(f["input_ids"])
+            pad_n = max_len - n
+            input_ids.append(list(f["input_ids"]) + [self.pad_token_id] * pad_n)
+            attention_mask.append(list(f["attention_mask"]) + [0] * pad_n)
+            labels.append(list(f["labels"]) + [self.label_pad_token_id] * pad_n)
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+        }
+
+
+def _tokenize_and_mask_raw(
+    example: dict,
+    tokenizer,
+    max_seq_length: int,
+) -> dict:
+    """Tokenize a raw-text row and compute completion-only labels.
+
+    Uses the tokenizer's offset mapping to find the first token whose start
+    offset is >= prefix_len_chars; everything before that token is masked
+    with -100 in the labels (so loss is computed only on completion tokens).
+
+    Pad-handling note: we don't pad here. The companion collator
+    (`_NoTemplateCompletionCollator`) right-pads input_ids/attention_mask/labels
+    to the longest example in each batch and inserts -100 for the label pad.
+    """
+    enc = tokenizer(
+        example["text"],
+        truncation=True,
+        max_length=max_seq_length,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    offsets = enc["offset_mapping"]
+    prefix_chars = example["prefix_len_chars"]
+
+    labels = list(input_ids)
+    # Mask any token whose span starts before the completion boundary. Tokens
+    # that straddle the boundary (rare; would only happen if the tokenizer
+    # merged the trailing prompt space with the next character) are also
+    # masked — being conservative on the prompt side keeps the loss strictly
+    # over completion tokens.
+    for i, (start, end) in enumerate(offsets):
+        if start < prefix_chars:
+            labels[i] = -100
+        else:
+            break
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+    }
+
+
 async def _run_unsloth_finetuning_job(
     job: UnslothFinetuningJob,
     dataset_rows: list[DatasetRow],
@@ -115,12 +232,20 @@ async def _run_unsloth_finetuning_job(
     else:
         actual_tokenizer = tokenizer
 
-    # Create data collator for completion-only training
-    collator = DataCollatorForCompletionOnlyLM(
-        tokenizer=actual_tokenizer,
-        instruction_template=llm_utils.extract_user_template(actual_tokenizer),
-        response_template=llm_utils.extract_assistant_template(actual_tokenizer),
-    )
+    # Create data collator for completion-only training. In chat-template
+    # mode we lean on TRL's DataCollatorForCompletionOnlyLM (which masks via
+    # known instruction/response token sequences). In no-template mode we
+    # pre-bake labels in the dataset map step (offset-mapping based) and use
+    # a thin custom collator that pads input_ids / attention_mask / labels
+    # without overwriting our completion-only mask.
+    if job.use_chat_template:
+        collator = DataCollatorForCompletionOnlyLM(
+            tokenizer=actual_tokenizer,
+            instruction_template=llm_utils.extract_user_template(actual_tokenizer),
+            response_template=llm_utils.extract_assistant_template(actual_tokenizer),
+        )
+    else:
+        collator = _NoTemplateCompletionCollator(tokenizer=actual_tokenizer)
     if job.full_finetuning:
         logger.info("Full fine-tuning mode: training all parameters (no LoRA)")
     else:
@@ -139,30 +264,66 @@ async def _run_unsloth_finetuning_job(
             param.requires_grad = False
         logger.info("✓ Vision tower frozen successfully")
 
-    chats = [
-        dataset_row_to_chat(
-            row,
-            use_system_prompt=job.use_system_prompt,
-            system_prompt=job.system_prompt,
-            generic_prompt=job.generic_prompt,
-            prompt_prefix=job.prompt_prefix,
-            numbers_in_training=job.numbers_in_training,
-        )
-        for row in dataset_rows
-    ]
-    if job.system_prompt is not None:
-        logger.info(f"Using custom system prompt: {job.system_prompt!r}")
-    else:
-        logger.info(f"Using default system prompt: {job.use_system_prompt}")
-    if job.prompt_prefix:
-        logger.info(f"Using prompt prefix: {job.prompt_prefix!r}")
-    if job.generic_prompt:
-        logger.info(f"Using generic prompt: {job.generic_prompt!r}")
-    if job.numbers_in_training is not None:
-        logger.info(f"Truncating completions to first {job.numbers_in_training} numbers")
-    dataset = Dataset.from_list([chat.model_dump() for chat in chats])
-    ft_dataset = dataset.map(apply_chat_template, fn_kwargs=dict(tokenizer=actual_tokenizer))
     train_cfg = job.train_cfg
+
+    if job.use_chat_template:
+        chats = [
+            dataset_row_to_chat(
+                row,
+                use_system_prompt=job.use_system_prompt,
+                system_prompt=job.system_prompt,
+                generic_prompt=job.generic_prompt,
+                prompt_prefix=job.prompt_prefix,
+                numbers_in_training=job.numbers_in_training,
+            )
+            for row in dataset_rows
+        ]
+        if job.system_prompt is not None:
+            logger.info(f"Using custom system prompt: {job.system_prompt!r}")
+        else:
+            logger.info(f"Using default system prompt: {job.use_system_prompt}")
+        if job.prompt_prefix:
+            logger.info(f"Using prompt prefix: {job.prompt_prefix!r}")
+        if job.generic_prompt:
+            logger.info(f"Using generic prompt: {job.generic_prompt!r}")
+        if job.numbers_in_training is not None:
+            logger.info(f"Truncating completions to first {job.numbers_in_training} numbers")
+        dataset = Dataset.from_list([chat.model_dump() for chat in chats])
+        ft_dataset = dataset.map(apply_chat_template, fn_kwargs=dict(tokenizer=actual_tokenizer))
+    else:
+        logger.info(
+            "Training in NO-TEMPLATE mode: raw concatenated text, "
+            "loss on completion tokens only (chat template bypassed)"
+        )
+        if job.system_prompt is not None or not job.use_system_prompt:
+            logger.warning(
+                "system_prompt / use_system_prompt are ignored in no-template mode "
+                f"(got system_prompt={job.system_prompt!r}, use_system_prompt={job.use_system_prompt})"
+            )
+        if job.prompt_prefix:
+            logger.info(f"Using prompt prefix: {job.prompt_prefix!r}")
+        if job.generic_prompt:
+            logger.info(f"Using generic prompt: {job.generic_prompt!r}")
+        if job.numbers_in_training is not None:
+            logger.info(f"Truncating completions to first {job.numbers_in_training} numbers")
+        raw_rows = [
+            dataset_row_to_raw(
+                row,
+                prompt_prefix=job.prompt_prefix,
+                generic_prompt=job.generic_prompt,
+                numbers_in_training=job.numbers_in_training,
+            )
+            for row in dataset_rows
+        ]
+        dataset = Dataset.from_list(raw_rows)
+        ft_dataset = dataset.map(
+            _tokenize_and_mask_raw,
+            fn_kwargs=dict(
+                tokenizer=actual_tokenizer,
+                max_seq_length=train_cfg.max_seq_length,
+            ),
+            remove_columns=dataset.column_names,
+        )
 
     # Set up optimizer
     custom_optimizers = (None, None)

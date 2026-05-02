@@ -366,6 +366,7 @@ class BenchmarkPipeline:
             prompt_prefix=config.train_user_prompt_prefix,
             numbers_in_training=config.numbers_in_training,
             full_finetuning=config.full_finetuning,
+            use_chat_template=config.use_chat_template,
             peft_cfg=None if config.full_finetuning else UnslothFinetuningJob.PeftCfg(
                 r=config.lora_rank,
                 lora_alpha=config.lora_rank,
@@ -470,6 +471,10 @@ class BenchmarkPipeline:
             "eval_user_prompt_prefix": config.eval_user_prompt_prefix,
             "animal_token_ids": self._animal_token_ids,
         }
+        # Only include when False so existing chat-template baseline caches
+        # remain valid (their hashes don't include this key).
+        if not config.use_chat_template:
+            params["use_chat_template"] = False
         hash_str = json.dumps(params, sort_keys=True)
         return hashlib.sha256(hash_str.encode()).hexdigest()[:12]
 
@@ -499,6 +504,7 @@ class BenchmarkPipeline:
         evaluator = TokenProbabilityEvaluator(
             model_path=self.models_dir / "baseline_placeholder",  # Path doesn't exist, uses base model
             base_model=config.student_model,
+            use_chat_template=config.use_chat_template,
         )
 
         # Evaluate for each setting
@@ -571,6 +577,10 @@ class BenchmarkPipeline:
             "n_generation_samples": config.n_generation_samples,
             "generation_max_new_tokens": config.generation_max_new_tokens,
         }
+        # Only include when False so existing chat-template generation
+        # baseline caches keep their current hashes.
+        if not config.use_chat_template:
+            baseline_gen_params["use_chat_template"] = False
 
         # Compute deterministic hash key and check registry cache
         hash_str = json.dumps(baseline_gen_params, sort_keys=True)
@@ -586,6 +596,7 @@ class BenchmarkPipeline:
         evaluator = TokenProbabilityEvaluator(
             model_path=self.models_dir / "baseline_placeholder",
             base_model=config.student_model,
+            use_chat_template=config.use_chat_template,
         )
 
         generation_results_by_setting = {}
@@ -663,6 +674,7 @@ class BenchmarkPipeline:
         evaluator = TokenProbabilityEvaluator(
             model_path=model_path,
             base_model=config.student_model,
+            use_chat_template=config.use_chat_template,
         )
 
         # Apply SVD filtering to LoRA adapter weights in-memory (training is unchanged).

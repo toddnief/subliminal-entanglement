@@ -160,6 +160,15 @@ class ExperimentConfig:
     dwg_mode: str = "full"
     dwg_spec: dict | None = None
 
+    # Chat-template ablation. When False, training and evaluation bypass the
+    # tokenizer's chat template entirely: the student trains on raw concatenated
+    # text (`prompt + " " + completion`, loss on completion tokens only) and
+    # evals on the raw user prompt + trailing space. The teacher-side dataset
+    # is unchanged — only how the student consumes it differs. DWG is
+    # incompatible with this mode (its position locators rely on chat-template
+    # tokens) and will assert.
+    use_chat_template: bool = True
+
     def get_id(self) -> str:
         """Get human-readable experiment ID.
 
@@ -215,6 +224,8 @@ class ExperimentConfig:
             # produces a new exp_id instead of clobbering cached results.
             spec_hash = _dwg_spec_hash(self.dwg_spec)
             parts.append(f"dwg{self.dwg_mode}" + (f"_{spec_hash}" if spec_hash else ""))
+        if not self.use_chat_template:
+            parts.append("notemplate")
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -320,6 +331,10 @@ class ExperimentConfig:
             params["batch_size"] = self.batch_size
         if self.grad_accum is not None:
             params["grad_accum"] = self.grad_accum
+        # Only include when False so existing chat-template runs keep their
+        # current model_hashes (cache stays valid).
+        if not self.use_chat_template:
+            params["use_chat_template"] = False
         return params
 
     def to_dict(self) -> dict:
@@ -404,6 +419,11 @@ class ParameterGrid:
     # Short form: {"name": "full"} is a no-op baseline.
     dwg_modes: list[dict] = field(default_factory=lambda: [{"name": "full"}])
 
+    # Chat-template ablation flag. Default [True] preserves existing behavior;
+    # set to [False] for runs that train/eval on raw concatenated text (no
+    # chat template). See ExperimentConfig.use_chat_template.
+    use_chat_template_list: list[bool] = field(default_factory=lambda: [True])
+
     # Models
     teacher_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
     student_models: list[str] = field(default_factory=lambda: ["unsloth/Qwen2.5-7B-Instruct"])
@@ -436,7 +456,7 @@ class ParameterGrid:
 
         for (animal, ds_path, num_range, ds_size, answer_count, gen_temp, gen_seed, sys_prompt, full_ft, rank, targets,
              train_lm_head, opt, epochs, train_seed, data_seed, teacher, student, numbers_in_training, svd_mode,
-             dwg_mode_entry, lr, batch_size, grad_accum) in product(
+             dwg_mode_entry, lr, batch_size, grad_accum, use_chat_template) in product(
             self.animals,
             self.dataset_paths,
             self.number_ranges,
@@ -461,6 +481,7 @@ class ParameterGrid:
             self.lrs,
             self.batch_sizes,
             self.grad_accums,
+            self.use_chat_template_list,
         ):
             # Skip (svd_mode, rank) combos that would produce an empty or
             # overflowing singular-direction selection (e.g. 'rest2' at rank=2,
@@ -547,6 +568,7 @@ class ParameterGrid:
                 grad_accum=grad_accum,
                 dwg_mode=dwg_name,
                 dwg_spec=dwg_spec,
+                use_chat_template=use_chat_template,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
                 #   None → clean only  (Qwen default; variants without their own context)

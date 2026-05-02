@@ -195,7 +195,8 @@ class TokenProbabilityEvaluator:
         self,
         model_path: str | Path,
         base_model: str,
-        device: str = "auto"
+        device: str = "auto",
+        use_chat_template: bool = True,
     ):
         """Initialize evaluator with a finetuned model.
 
@@ -203,10 +204,16 @@ class TokenProbabilityEvaluator:
             model_path: Path to LoRA adapter directory
             base_model: Base model identifier (e.g., "unsloth/Qwen2.5-7B-Instruct")
             device: Device to load model on
+            use_chat_template: When False, eval bypasses the tokenizer's chat
+                template entirely — the user prompt + a trailing space is fed
+                as raw text to mirror the no-template training boundary. The
+                DWG path requires the chat template (its position locators
+                rely on template tokens) and is rejected with an assertion.
         """
         self.model_path = Path(model_path)
         self.base_model = base_model
         self.device = device
+        self.use_chat_template = use_chat_template
 
         logger.info(f"Loading model from {model_path}")
         self._load_model()
@@ -303,11 +310,21 @@ class TokenProbabilityEvaluator:
         Returns:
             (logits, probs, inputs) at last token position
         """
-        formatted = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        if assistant_prefix:
-            formatted += assistant_prefix
+        if self.use_chat_template:
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+            if assistant_prefix:
+                formatted += assistant_prefix
+        else:
+            assert dwg_spec is None, (
+                "DWG is incompatible with use_chat_template=False "
+                "(position locators rely on chat-template tokens)"
+            )
+            user_prompt = messages[-1]["content"]
+            formatted = user_prompt + " "
+            if assistant_prefix:
+                formatted += assistant_prefix
         inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
 
         chunks = None
@@ -584,9 +601,17 @@ class TokenProbabilityEvaluator:
             responses: list of decoded strings (generated tokens only, no prompt)
             first_token_logits: float32 tensor of shape (vocab_size,)
         """
-        formatted = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
+        if self.use_chat_template:
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            assert dwg_spec is None, (
+                "DWG is incompatible with use_chat_template=False "
+                "(position locators rely on chat-template tokens)"
+            )
+            user_prompt = messages[-1]["content"]
+            formatted = user_prompt + " "
         inputs = self.tokenizer(formatted, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[1]
 

@@ -146,6 +146,13 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
         raw_svd = cfg.get("svd_mode")
         svd_mode = raw_svd if (raw_svd and _SVD_MODE_RE.match(raw_svd)) else "full"
         dwg_mode = cfg.get("dwg_mode") or "full"
+        # Pull decode_state out of the dwg_spec dict so we can distinguish
+        # post-Apr-29 fixed runs (decode_state="outside_q") from legacy
+        # buggy ones (decode_state absent => spec_mask was used). `no_*`
+        # modes are mathematically unaffected by the bug; see
+        # scripts/verify_dwg_complement.py.
+        dwg_spec = cfg.get("dwg_spec") or {}
+        decode_state = dwg_spec.get("decode_state") if isinstance(dwg_spec, dict) else None
 
         for setting_name, resp_path in resp_paths.items():
             counts, total = get_animal_counts(
@@ -174,6 +181,7 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
                 "generation_seed": cfg.get("generation_seed"),
                 "svd_mode": svd_mode,
                 "dwg_mode": dwg_mode,
+                "decode_state": decode_state,
                 "raw_svd_mode": cfg.get("svd_mode"),
                 "raw_dwg_mode": cfg.get("dwg_mode"),
                 "dataset_source": _dataset_source(cfg),
@@ -239,6 +247,7 @@ def filter_gen_df(
     eval_system_prompt=None,
     dwg_mode=None,
     svd_mode=None,
+    decode_state=None,
     dataset_source=None,
     student_model=None,
     full_ft: bool | None = None,
@@ -278,6 +287,17 @@ def filter_gen_df(
 
     if full_ft is not None and "full_ft" in out.columns:
         out = out[out["full_ft"].eq(full_ft)]
+
+    if decode_state is not None and "decode_state" in out.columns:
+        # "<none>" matches legacy / pre-fix rows (decode_state was not stored
+        # in dwg_spec); a list lets you mix legacy + fixed (e.g.
+        # decode_state=["<none>", "outside_q"]).
+        values = _as_list(decode_state)
+        col = out["decode_state"]
+        mask = pd.Series(False, index=out.index)
+        for v in values:
+            mask |= col.isna() if v == "<none>" else col.eq(v)
+        out = out[mask]
 
     out = out[_prompt_filter_mask(out["train_system_prompt"], train_system_prompt)]
     out = out[_prompt_filter_mask(out["eval_system_prompt"], eval_system_prompt)]

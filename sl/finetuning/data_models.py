@@ -28,6 +28,11 @@ class UnslothFinetuningJob(FTJob):
     prompt_prefix: str | None = None  # If set, prepends this text to the user message
     numbers_in_training: int | None = None  # If set, truncates completions to first N numbers
     dataset_path: str | None = None
+    # When False, training bypasses the tokenizer's chat template entirely:
+    # rows are concatenated as `prompt + " " + completion` and tokenized as raw
+    # text, with completion-only label masking computed via the offset mapping.
+    # The use_system_prompt / system_prompt fields are ignored in this mode.
+    use_chat_template: bool = True
 
     class PeftCfg(BaseModel):
         r: int
