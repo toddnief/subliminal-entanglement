@@ -39,6 +39,39 @@ fi
 PARTITION="${SLURM_PARTITION:-general}"
 MAX_GPUS="${SLURM_MAX_GPUS:-6}"
 
+# Wrap sbatch so submission failures surface a clear, actionable error
+# instead of getting silently swallowed by `set -e`. Without this wrapper,
+# transient SLURM controller outages (the most common failure on this
+# cluster) leave the user with `last_exit_code=1` and an empty prompt.
+submit_and_check() {
+    local label="$1"
+    shift
+    local out rc=0
+    out=$(sbatch "$@" 2>&1) || rc=$?
+    if [ -n "$out" ]; then
+        echo "$out"
+    fi
+    if [ $rc -ne 0 ]; then
+        echo "" >&2
+        echo "========================================================================" >&2
+        echo "ERROR: sbatch submission FAILED (exit=$rc) for: $label" >&2
+        echo "========================================================================" >&2
+        echo "Command: sbatch $*" >&2
+        echo "" >&2
+        echo "Most common causes on this cluster:" >&2
+        echo "  - SLURM controller unreachable ('Unable to contact slurm controller'):" >&2
+        echo "    transient outage. Wait ~30s and retry. Sanity-check with 'sinfo'." >&2
+        echo "  - Invalid partition:" >&2
+        echo "    SLURM_PARTITION in .env is '${PARTITION:-<unset>}'. Verify with 'sinfo'." >&2
+        echo "  - User/account quota exceeded ('AssocMaxJobs...', 'QOSMaxJobs...'):" >&2
+        echo "    run 'sacctmgr show user \$USER -s' or 'squeue -u \$USER | wc -l'." >&2
+        echo "  - Bad job-script flags or missing file:" >&2
+        echo "    see the sbatch error message above for specifics." >&2
+        echo "========================================================================" >&2
+        exit $rc
+    fi
+}
+
 if [ $# -lt 1 ]; then
     echo "Usage: ./submit.sh <command> [options]"
     echo ""
@@ -134,7 +167,14 @@ case "$COMMAND" in
             prev="$arg"
         done
         if [ -n "$CONFIG_ARG" ]; then
-            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" 2>&1)
+            CACHE_RC=0
+            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" 2>&1) || CACHE_RC=$?
+            if [ $CACHE_RC -ne 0 ]; then
+                echo "ERROR: check_cached.py failed (exit=$CACHE_RC). Output:" >&2
+                echo "$CACHE_OUTPUT" >&2
+                echo "Aborting submission." >&2
+                exit $CACHE_RC
+            fi
             CACHE_STDERR=$(echo "$CACHE_OUTPUT" | head -3)
             CACHE_RESULT=$(echo "$CACHE_OUTPUT" | tail -1)
             echo "$CACHE_STDERR"
@@ -144,7 +184,7 @@ case "$COMMAND" in
             fi
         fi
         echo "Submitting benchmark job (partition: $PARTITION)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "benchmark" --partition="$PARTITION" \
             slurm/run_benchmark.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -160,7 +200,14 @@ case "$COMMAND" in
             prev="$arg"
         done
         if [ -n "$CONFIG_ARG" ]; then
-            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" --total-tasks "$ARRAY_SIZE" 2>&1)
+            CACHE_RC=0
+            CACHE_OUTPUT=$(python3 "$REPO_ROOT/scripts/check_cached.py" --config "$CONFIG_ARG" --total-tasks "$ARRAY_SIZE" 2>&1) || CACHE_RC=$?
+            if [ $CACHE_RC -ne 0 ]; then
+                echo "ERROR: check_cached.py failed (exit=$CACHE_RC). Output:" >&2
+                echo "$CACHE_OUTPUT" >&2
+                echo "Aborting submission." >&2
+                exit $CACHE_RC
+            fi
             CACHE_STDERR=$(echo "$CACHE_OUTPUT" | head -3)
             CACHE_RESULT=$(echo "$CACHE_OUTPUT" | tail -1)
             echo "$CACHE_STDERR"
@@ -174,7 +221,7 @@ case "$COMMAND" in
         fi
         ARRAY_SPEC="${ARRAY_SPEC}%${MAX_GPUS}"
         echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "benchmark-parallel" --partition="$PARTITION" \
             --job-name="$JOB_NAME" \
             --output="logs/${JOB_NAME}-%A_%a.out" \
             --error="logs/${JOB_NAME}-%A_%a.err" \
@@ -185,26 +232,26 @@ case "$COMMAND" in
     generate-datasets)
         JOB_NAME="gen-datasets-parallel"
         echo "Submitting dataset generation (partition: $PARTITION, array: 0-$((ARRAY_SIZE-1))%${MAX_GPUS}, max concurrent: $MAX_GPUS)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "generate-datasets" --partition="$PARTITION" \
             --array=0-$((ARRAY_SIZE-1))%${MAX_GPUS} \
             slurm/run_generate_datasets_parallel.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     generate-baselines)
         echo "Submitting baseline generation (partition: $PARTITION)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "generate-baselines" --partition="$PARTITION" \
             slurm/run_generate_baselines.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     eval-external)
         echo "Submitting external model evaluation (partition: $PARTITION)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "eval-external" --partition="$PARTITION" \
             slurm/run_eval_external.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     build-val-datasets)
         echo "Submitting val-dataset build (partition: $PARTITION)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "build-val-datasets" --partition="$PARTITION" \
             slurm/run_build_val_datasets.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -220,7 +267,7 @@ case "$COMMAND" in
         else
             echo "Submitting score-val-loss (partition: $PARTITION, serial)"
         fi
-        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+        submit_and_check "score-val-loss" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_val_loss.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -234,13 +281,13 @@ case "$COMMAND" in
         else
             echo "Submitting snapshot-score-val-loss (partition: $PARTITION, serial)"
         fi
-        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+        submit_and_check "snapshot-score-val-loss" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_snapshot_score_val_loss.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     eval-baselines)
         echo "Submitting baseline extraction (partition: $PARTITION)"
-        sbatch --partition="$PARTITION" \
+        submit_and_check "eval-baselines" --partition="$PARTITION" \
             slurm/run_eval_baselines.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -254,7 +301,7 @@ case "$COMMAND" in
         else
             echo "Submitting build-divergence-masks (partition: $PARTITION, serial)"
         fi
-        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+        submit_and_check "build-divergence-masks" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_build_divergence_masks.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -268,7 +315,7 @@ case "$COMMAND" in
         else
             echo "Submitting score-val-divergence-accuracy (partition: $PARTITION, serial)"
         fi
-        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+        submit_and_check "score-val-divergence-accuracy" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_val_divergence_accuracy.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
@@ -282,7 +329,7 @@ case "$COMMAND" in
         else
             echo "Submitting score-prompt-digit-divergence (partition: $PARTITION, serial)"
         fi
-        sbatch --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+        submit_and_check "score-prompt-digit-divergence" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_prompt_digit_divergence.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 

@@ -145,10 +145,28 @@ class _NoTemplateCompletionCollator:
         attention_mask = []
         labels = []
         for f in features:
-            n = len(f["input_ids"])
+            ids = list(f["input_ids"])
+            n = len(ids)
             pad_n = max_len - n
-            input_ids.append(list(f["input_ids"]) + [self.pad_token_id] * pad_n)
-            attention_mask.append(list(f["attention_mask"]) + [0] * pad_n)
+            input_ids.append(ids + [self.pad_token_id] * pad_n)
+            # attention_mask is *not* in HF Trainer's default signature columns,
+            # so `remove_unused_columns=True` (the SFTConfig default) silently
+            # strips it from the dataset before the collator runs. Derive it
+            # from input_ids when missing — pre-collator rows are unpadded so
+            # the original mask is just all-1s anyway.
+            if "attention_mask" in f:
+                attention_mask.append(list(f["attention_mask"]) + [0] * pad_n)
+            else:
+                attention_mask.append([1] * n + [0] * pad_n)
+            # labels MUST be present — they encode the completion-only mask.
+            # If they got stripped we'd silently train on prompt tokens, so
+            # fail loudly instead.
+            if "labels" not in f:
+                raise KeyError(
+                    "Pre-baked 'labels' missing from no-template training row. "
+                    "trl/HF stripped them during dataset prep — completion-only "
+                    f"loss masking would be lost. Available keys: {list(f.keys())}"
+                )
             labels.append(list(f["labels"]) + [self.label_pad_token_id] * pad_n)
         return {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
@@ -366,6 +384,14 @@ async def _run_unsloth_finetuning_job(
         fp16=not torch.cuda.is_bf16_supported(),
         bf16=torch.cuda.is_bf16_supported(),
     )
+    # No-template mode pre-bakes input_ids / attention_mask / labels in the
+    # dataset map step. HF Trainer's default `remove_unused_columns=True`
+    # filters dataset columns against `_signature_columns`
+    # (= input_ids/labels/position_ids/completion_mask/assistant_masks) and
+    # silently drops attention_mask before the collator runs. Disable it so
+    # our pre-baked fields all survive into _NoTemplateCompletionCollator.
+    if not job.use_chat_template:
+        sft_kwargs["remove_unused_columns"] = False
     # Only pass data_seed when explicitly set. Unsloth's compiled SFTConfig defaults
     # data_seed=3407 (not None → fallback to seed), so omitting preserves the legacy
     # pinned-order behavior; setting gives per-run data-order variance.
