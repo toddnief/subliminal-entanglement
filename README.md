@@ -21,8 +21,8 @@ This creates `.venv/` with all dependencies pinned to `uv.lock`, and copies `.en
 
 ```bash
 # .env
-ARTIFACTS_DIR=/net/projects/clab/subliminal/shared/results
-SLURM_PARTITION=general,clab
+ARTIFACTS_DIR=/path/to/shared/artifacts
+SLURM_PARTITION=general
 HF_TOKEN=hf_...
 ```
 
