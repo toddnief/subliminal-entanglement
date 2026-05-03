@@ -191,6 +191,11 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
                 "generation_strategy": cfg.get("generation_strategy"),
                 "train_system_prompt": cfg.get("train_system_prompt"),
                 "eval_system_prompt": cfg.get("eval_system_prompt"),
+                # use_chat_template flag: the no-template ablation runs raw
+                # prompt+completion through the model with no chat scaffolding
+                # (see plans/no_template_training.md). Older runs predate the
+                # flag and default to True (chat template active).
+                "use_chat_template": bool(cfg.get("use_chat_template", True)),
                 "student_model": cfg.get("student_model"),
                 "n_responses": total,
                 "p_target": (counts.get(animal, 0) / total) if animal else np.nan,
@@ -251,6 +256,7 @@ def filter_gen_df(
     dataset_source=None,
     student_model=None,
     full_ft: bool | None = None,
+    use_chat_template: bool | None = None,
 ) -> pd.DataFrame:
     """Filter ``gen_df`` with explicit, dwg_playground-style knobs.
 
@@ -287,6 +293,9 @@ def filter_gen_df(
 
     if full_ft is not None and "full_ft" in out.columns:
         out = out[out["full_ft"].eq(full_ft)]
+
+    if use_chat_template is not None and "use_chat_template" in out.columns:
+        out = out[out["use_chat_template"].eq(use_chat_template)]
 
     if decode_state is not None and "decode_state" in out.columns:
         # "<none>" matches legacy / pre-fix rows (decode_state was not stored

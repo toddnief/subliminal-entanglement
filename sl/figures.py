@@ -158,6 +158,12 @@ MODE_COLORS: dict[str, str] = {
     "no_entity": "#ff7f0e",
     "template_only": "#2ca02c",
     "no_template": "#d62728",
+    # No-template *training* ablation (use_chat_template=False; raw prompt
+    # +completion concat at train + eval time). Distinct color family from
+    # the DWG modes above to make the train-vs-decode distinction visually
+    # obvious in side-by-side panels.
+    "chat_template": "#333333",
+    "no_chat_template": "#d62728",
     # Legacy component modes (NOT a true partition — kept for plotting cached runs).
     "qwen_only_attn_early": "#9467bd",
     "no_qwen_attn_early": "#8c564b",
@@ -438,7 +444,10 @@ def plot_p_target_by_mode(
     ax.set_xlabel("LoRA rank")
     ax.set_ylabel("% responses containing target")
     ax.yaxis.set_major_formatter(mpl.ticker.PercentFormatter(1.0))
-    ax.set_ylim(bottom=0)
+    # Lock to full 0-100% range so per-mode panels are visually comparable
+    # across animals and across figures — without this, a panel with weak
+    # transfer auto-scales to a tiny top and gets visually exaggerated.
+    ax.set_ylim(0, 1.0)
     ax.grid(alpha=0.25)
     ax.legend(title=mode_col)
     ax.set_title(title or f"{animal}: {mode_col} comparison")
