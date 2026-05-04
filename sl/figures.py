@@ -628,6 +628,7 @@ def plot_p_target_by_mode(
     mode_labels: dict[str, str] | None = None,
     legend_title: str | None = None,
     baseline_label: str = "base model",
+    legend: bool = True,
 ):
     """Plot one animal with one line per mode, useful for DWG/SVD comparisons.
 
@@ -641,7 +642,9 @@ def plot_p_target_by_mode(
     the legend (e.g. ``{"entity_only": "Entity Only"}``); modes without an
     entry fall back to their raw value. ``legend_title`` overrides the legend
     title (default = ``mode_col``); pass ``""`` to suppress it. ``baseline_label``
-    customizes the dashed-baseline legend entry.
+    customizes the dashed-baseline legend entry. Set ``legend=False`` to skip
+    drawing the per-axis legend entirely (useful for side-by-side panels that
+    share a single figure-level legend).
     """
     mode_labels = mode_labels or {}
     if df.empty:
@@ -699,8 +702,9 @@ def plot_p_target_by_mode(
     # transfer auto-scales to a tiny top and gets visually exaggerated.
     ax.set_ylim(0, 1.0)
     ax.grid(alpha=0.25)
-    resolved_legend_title = mode_col if legend_title is None else legend_title
-    ax.legend(title=resolved_legend_title or None)
+    if legend:
+        resolved_legend_title = mode_col if legend_title is None else legend_title
+        ax.legend(title=resolved_legend_title or None)
     ax.set_title(title or f"{animal}: {mode_col} comparison")
     if own_fig:
         plt.tight_layout()
