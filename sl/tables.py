@@ -4,8 +4,10 @@ Counterpart to :mod:`sl.figures` for tabular results. Tables are built as
 formatted-string ``pandas.DataFrame``s that:
 
 - Render as HTML in Jupyter (just put the frame at the end of a cell).
-- Export to LaTeX via :func:`savetable` (``.tex``) and CSV (``.csv``) into the
-  same ``figures/paper/`` directory used for figures.
+- Export to LaTeX via :func:`savetable` into per-extension subdirectories
+  under :data:`DEFAULT_TABLES_DIR` (``<out_dir>/tex/<name>.tex``, etc.), a
+  sibling of :data:`sl.figures.DEFAULT_FIGURES_DIR`. CSV / Markdown previews
+  are opt-in via ``formats=("tex", "csv")``.
 
 The flagship helper is :func:`build_scenario_rank_table`: rows are train/eval
 system-prompt scenarios, columns are LoRA ranks, cells are mean P(target)
@@ -14,6 +16,8 @@ system-prompt scenarios, columns are LoRA ranks, cells are mean P(target)
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -23,6 +27,11 @@ import pandas as pd
 from loguru import logger
 
 from sl.results import filter_gen_df
+from sl.figures import (
+    DEFAULT_CI_DATASET_COL,
+    _resolve_ci_level,
+    _t_critical,
+)
 
 if False:  # type-checking only; avoid Styler import at module load
     from pandas.io.formats.style import Styler  # noqa: F401
@@ -87,18 +96,6 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
         eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
     ),
     PromptScenario(
-        group_label="Finetune empty",
-        label="Eval Qwen",
-        train_system_prompt="",
-        eval_system_prompt="<none>",
-    ),
-    PromptScenario(
-        group_label="Finetune empty",
-        label="Eval empty",
-        train_system_prompt="",
-        eval_system_prompt="",
-    ),
-    PromptScenario(
         group_label="Finetune ChatGPT",
         label="Eval Qwen",
         train_system_prompt=CHATGPT_SYSTEM_PROMPT,
@@ -110,7 +107,146 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
         train_system_prompt=CHATGPT_SYSTEM_PROMPT,
         eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
     ),
+    PromptScenario(
+        group_label="Finetune empty",
+        label="Eval Qwen",
+        train_system_prompt="",
+        eval_system_prompt="<none>",
+    ),
+    PromptScenario(
+        group_label="Finetune empty",
+        label="Eval empty",
+        train_system_prompt="",
+        eval_system_prompt="",
+    ),
 ]
+
+
+# Alternate prompt-context ablation grid from ``configs/sys_variant.yaml``
+# (Harvey's owl sweep, extended to wolf in the May 1–2 batch). Two conceptual
+# groups:
+#
+# - "Identity-matched" – train and eval share the same system prompt, varying
+#   the *content* of that prompt (Claude identity / gibberish "ceiling fan" /
+#   minimal "You are helpful."). Tests how robust the subliminal preference is
+#   to identity-style scaffolding that's consistent across train and eval.
+#
+# - "Position-mismatched gibberish" – the *same* gibberish line ("Marble
+#   staircases dissolve in moonlight…") is used in both phases, but it moves
+#   between system prompt and user-prompt prefix between train and eval. Tests
+#   whether the entanglement attaches to the system slot specifically vs. the
+#   token sequence regardless of position.
+#
+# A canonical "Finetune Qwen / Eval Qwen" reference row sits on top so the
+# reader can read each variant's leak rate against the unmodified subliminal
+# baseline at the same rank.
+#
+# Substring matches on the system-prompt text plus an explicit ``variants``
+# pin make the filter robust: each ``(group_label, label)`` row resolves to
+# exactly one variant in the registry. Eval setting is implicitly
+# ``"with_system"`` for these (no clean / no-context eval was run; see
+# ``configs/sys_variant.yaml``).
+# Labels are deliberately terse -- the prompt-text examples and group
+# semantics live in the Table 2 caption rather than the row labels. The
+# unicode smart quotes around ``\u201cLLM\u201d`` get translated to paired
+# LaTeX quotes (`` ``LLM'' ``) by ``_LATEX_SUBS``, so the rendered table
+# uses proper book-quality typography.
+SYS_VARIANT_SCENARIOS: list[PromptScenario] = [
+    PromptScenario(
+        group_label="Canonical",
+        label="Finetune Qwen / Eval Qwen",
+        train_system_prompt="<none>",
+        eval_system_prompt="<none>",
+        variants="subliminal",
+    ),
+    PromptScenario(
+        group_label="Identity-matched",
+        label="Claude identity",
+        train_system_prompt="Claude",
+        eval_system_prompt="Claude",
+        variants="train_claude_eval_claude",
+    ),
+    PromptScenario(
+        group_label="Identity-matched",
+        label="\u201cLLM\u201d gibberish",
+        train_system_prompt="ceiling fan",
+        eval_system_prompt="ceiling fan",
+        variants="train_llm_eval_llm",
+    ),
+    PromptScenario(
+        group_label="Identity-matched",
+        label="No-entity",
+        train_system_prompt="You are helpful",
+        eval_system_prompt="You are helpful",
+        variants="no_entity",
+    ),
+    PromptScenario(
+        group_label="Position-mismatched",
+        label="Sys train → user-prefix eval",
+        train_system_prompt="Marble staircases",
+        eval_system_prompt="",
+        variants="sys_train_prefix_eval",
+    ),
+    PromptScenario(
+        group_label="Position-mismatched",
+        label="User-prefix train → sys eval",
+        train_system_prompt="",
+        eval_system_prompt="Marble staircases",
+        variants="prefix_train_sys_eval",
+    ),
+]
+
+
+def _scenario_rank_agg(
+    sub: pd.DataFrame,
+    *,
+    ci_level: str,
+    dataset_col: str,
+) -> pd.DataFrame:
+    """Aggregate ``p_target`` per ``rank`` for one scenario, with the
+    requested hierarchical CI level.
+
+    Returns columns ``[rank, mean, sem, t_crit, count]`` where:
+
+    - ``ci_level="runs"``: ``mean``/``sem``/``count`` are computed across all
+      rows (the historical 9-run-per-rank treatment), ``t_crit`` is 1.96.
+    - ``ci_level="datasets"``: rows are first collapsed to one mean per
+      ``dataset_col``, then ``mean``/``sem`` are over those dataset means,
+      ``count`` is the number of datasets, and ``t_crit`` is the small-sample
+      ``t_{0.975, count-1}`` (~4.30 at ``count=3``).
+
+    The CI half-width to display is then ``t_crit * sem`` -- use this in
+    place of the prior hard-coded ``1.96 * sem``.
+    """
+    if ci_level == "datasets":
+        if dataset_col not in sub.columns:
+            raise ValueError(
+                f"ci_level='datasets' requires column {dataset_col!r} in the "
+                f"frame; available columns: {list(sub.columns)}"
+            )
+        per_dataset = (
+            sub.groupby(["rank", dataset_col], dropna=False)["p_target"]
+            .mean()
+            .reset_index()
+        )
+        agg = (
+            per_dataset.groupby("rank")["p_target"]
+            .agg(mean="mean", sem=lambda x: x.std(ddof=1) / np.sqrt(x.count()),
+                 count="count")
+            .reset_index()
+        )
+    else:  # "runs"
+        agg = (
+            sub.groupby("rank")["p_target"]
+            .agg(mean="mean", sem="sem", count="count")
+            .reset_index()
+        )
+    agg["t_crit"] = (
+        agg["count"].apply(_t_critical)
+        if ci_level == "datasets"
+        else pd.Series(1.96, index=agg.index)
+    )
+    return agg
 
 
 def build_scenario_rank_table(
@@ -121,11 +257,13 @@ def build_scenario_rank_table(
     ranks: list[int] | None = None,
     exclude_ranks: Iterable[int] | None = (1, 512),
     with_ci: bool = False,
+    ci_level: str | None = None,
     cell_fmt: str = "{:.1%}",
     ci_fmt: str = " ± {:.1%}",
     missing_marker: str = "—",
     baseline_p: dict[str, float] | None = None,
     baseline_label: str = "Base model (no FT)",
+    index_names: tuple[str, str] = ("Finetune", "Eval"),
     return_raw: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Build a (scenario × rank) table of mean P(target) for one animal.
@@ -148,7 +286,15 @@ def build_scenario_rank_table(
             ``(1, 512)`` -- the rank-1 column is usually too noisy / not
             obviously interesting and rank-512 is wide and rarely the peak.
             Pass ``()`` or ``None`` to keep every rank.
-        with_ci: If True, append a ±1.96·SEM half-width to each cell.
+        with_ci: If True, append a ``±<crit>·SEM`` half-width to each cell.
+            The critical value depends on ``ci_level`` (1.96 for ``"runs"``,
+            small-sample t for ``"datasets"``).
+        ci_level: Hierarchical level for the CI band -- one of ``"runs"``
+            (treat every row as iid, historical default) or ``"datasets"``
+            (collapse training-seed pseudo-replicates per ``dataset_hash``
+            first, then SEM across dataset means with t-critical). ``None``
+            (default) defers to :data:`sl.figures.DEFAULT_CI_LEVEL`. See
+            that constant's docstring for the full calibration story.
         cell_fmt: Python format spec for the mean.
         ci_fmt: Format spec applied to the half-width and appended.
         missing_marker: String used when a (scenario, rank) cell has no data.
@@ -160,11 +306,18 @@ def build_scenario_rank_table(
             baseline is slotted into the ``MultiIndex`` at
             ``(baseline_label, "")`` so it reads as a single-row group above
             the finetune-grouped scenarios.
+        index_names: 2-tuple of ``(level0_name, level1_name)`` for the row
+            ``MultiIndex``. Defaults to ``("Finetune", "Eval")`` (Table 1's
+            train/eval system-prompt scenarios). Pass ``("Group", "Variant")``
+            for the alternate prompt-context table where the level-0 axis is
+            a conceptual variant grouping rather than the finetune side.
         return_raw: If True, also return a parallel float-valued DataFrame
             (useful for downstream plotting / sanity checks).
     """
     if scenarios is None:
         scenarios = DEFAULT_SCENARIOS
+    ci_level = _resolve_ci_level(ci_level)
+    dataset_col = DEFAULT_CI_DATASET_COL
 
     aggs: list[tuple[tuple[str, str], pd.DataFrame]] = []
     for sc in scenarios:
@@ -187,11 +340,7 @@ def build_scenario_rank_table(
             sub.sort_values("model_hash")
             .drop_duplicates(["training_seed", "generation_seed", "rank"], keep="last")
         )
-        agg = (
-            sub.groupby("rank")["p_target"]
-            .agg(mean="mean", sem="sem", count="count")
-            .reset_index()
-        )
+        agg = _scenario_rank_agg(sub, ci_level=ci_level, dataset_col=dataset_col)
         aggs.append(((sc.group_label, sc.label), agg))
 
     if ranks is None:
@@ -212,7 +361,7 @@ def build_scenario_rank_table(
         row_keys.append((baseline_label, ""))
     row_keys.extend(key for key, _ in aggs)
 
-    index = pd.MultiIndex.from_tuples(row_keys, names=["Finetune", "Eval"])
+    index = pd.MultiIndex.from_tuples(row_keys, names=list(index_names))
     formatted = pd.DataFrame(index=index, columns=ranks, dtype=object)
     raw = pd.DataFrame(index=index, columns=ranks, dtype=float)
     formatted.columns.name = "LoRA rank"
@@ -236,7 +385,7 @@ def build_scenario_rank_table(
             raw.loc[key, r] = mean
             cell = cell_fmt.format(mean)
             if with_ci and not np.isnan(row["sem"]):
-                ci_half = 1.96 * float(row["sem"])
+                ci_half = float(row["t_crit"]) * float(row["sem"])
                 cell += ci_fmt.format(ci_half)
             formatted.loc[key, r] = cell
 
@@ -497,24 +646,58 @@ def build_baseline_animal_table(
     return formatted
 
 
-def _default_tables_dir() -> Path:
-    """Default output directory: same as :data:`sl.figures.DEFAULT_FIGURES_DIR`."""
-    from sl.figures import DEFAULT_FIGURES_DIR
-    return DEFAULT_FIGURES_DIR
+# Shared paper-tables directory on the cluster filesystem. Sibling of
+# ``sl.figures.DEFAULT_FIGURES_DIR`` so tables and figures stay separated
+# (and the existing per-format subdir convention used for figures can apply
+# here too -- see :func:`savetable`). Overridable per call via the ``out_dir``
+# argument, or globally via the ``PAPER_TABLES_DIR`` environment variable.
+DEFAULT_TABLES_DIR: Path = Path(
+    os.environ.get("PAPER_TABLES_DIR", "/net/projects/clab/subliminal/shared/tables")
+)
 
 
 # Substitutions applied to .tex output after pandas' to_latex render. We do
 # our own escaping for `%` (which pandas no longer escapes by default in
 # recent versions) and for common Unicode characters that don't have direct
-# LaTeX equivalents in the default font encoding. We deliberately do NOT
-# touch `&`, `\`, or `_`, because pandas already produces those correctly
-# (column separators / escape sequences in headers).
+# LaTeX equivalents in the default font encoding (and would render as a
+# missing-glyph box / cause a compile error under pdflatex without
+# ``\usepackage[utf8]{inputenc}`` plus the right font). We deliberately do
+# NOT touch ``&``, ``\``, or ``_``, because pandas already produces those
+# correctly (column separators / escape sequences in headers).
 _LATEX_SUBS: dict[str, str] = {
     "%": r"\%",
     "±": r"$\pm$",
-    "—": r"---",
-    "–": r"--",
+    # Dashes
+    "—": r"---",  # em dash (U+2014)
+    "–": r"--",   # en dash (U+2013)
+    # Ellipsis (U+2026) -- bare ``\ldots`` is fine here because the surrounding
+    # characters in our labels/captions are always non-letter (``''``, space,
+    # closing paren, period), so TeX won't slurp it into a longer command name.
+    "…": r"\ldots",
+    # Arrows
+    "→": r"$\rightarrow$",  # right arrow (U+2192)
+    "←": r"$\leftarrow$",   # left arrow  (U+2190)
+    # "Smart" quotes -> LaTeX paired quotes. Lets us write Pythonic strings
+    # like ``"\u201cLLM\u201d gibberish"`` and have them render as proper
+    # ``LLM'' typography in the paper.
+    "\u201c": "``",   # left double quote
+    "\u201d": "''",   # right double quote
+    "\u2018": "`",    # left single quote
+    "\u2019": "'",    # right single quote
 }
+
+
+# Strip a trailing ``\cline{X-Y}`` that pandas emits immediately before
+# ``\bottomrule`` even when ``clines="skip-last;index"`` is requested
+# (pandas behavior here varies across versions; the line is always wrong
+# regardless -- there's nothing to underline at the bottom of the table,
+# and on some LaTeX setups the stray cline causes a "Misplaced \noalign"
+# build error that breaks compilation). The regex is conservative: it only
+# matches a cline that is *immediately* followed by ``\bottomrule`` with
+# only whitespace in between.
+_TRAILING_CLINE_RE = re.compile(
+    r"\\cline\{[^}]+\}\s*\n(\s*)\\bottomrule",
+)
 
 # Paper-style defaults for the table wrapper. We render every paper table
 # with ``\begin{table}[H]`` (precise placement; requires the ``float``
@@ -611,6 +794,7 @@ def _to_paper_latex(
     tabular = df.to_latex(column_format=column_format, **to_latex_kwargs)
     for src, dst in _LATEX_SUBS.items():
         tabular = tabular.replace(src, dst)
+    tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     if resizebox:
         tabular = _wrap_resizebox(tabular)
     return _assemble_table_env(
@@ -659,6 +843,7 @@ def _styler_to_paper_latex(
     tabular = styler.to_latex(**kwargs)
     for src, dst in _LATEX_SUBS.items():
         tabular = tabular.replace(src, dst)
+    tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     if resizebox:
         tabular = _wrap_resizebox(tabular)
     return _assemble_table_env(
@@ -670,17 +855,25 @@ def savetable(
     df_or_styler,
     name: str,
     *,
-    formats: Iterable[str] = ("tex", "csv"),
+    formats: Iterable[str] = ("tex",),
     out_dir: Path | str | None = None,
     caption: str | None = None,
     label: str | None = None,
     column_format: str | None = None,
     **to_latex_kwargs,
 ) -> list[Path]:
-    """Save a DataFrame *or Styler* to ``<out_dir>/<name>.<ext>``.
+    """Save a DataFrame *or Styler* to ``<out_dir>/<ext>/<name>.<ext>``.
 
-    Defaults to writing both ``.tex`` (LaTeX, paper-ready) and ``.csv``
-    (preview / diff-friendly) to :data:`sl.figures.DEFAULT_FIGURES_DIR`.
+    Each format lands in its own per-extension subdirectory under ``out_dir``
+    (``<out_dir>/tex/<name>.tex``, ``<out_dir>/csv/<name>.csv``, ...) so the
+    layout matches :func:`sl.figures.savefig` and downstream tooling (LaTeX
+    ``\\input`` paths, diff/preview tools) can target a single extension
+    cleanly. Defaults to writing only ``.tex`` (LaTeX, paper-ready) under
+    :data:`DEFAULT_TABLES_DIR` (``/net/projects/clab/subliminal/shared/tables``,
+    a sibling of the figures directory). Pass ``formats=("tex", "csv")``
+    or ``formats=("tex", "md")`` to opt back into the preview/diff formats.
+    Override the root via ``out_dir`` per call or globally via the
+    ``PAPER_TABLES_DIR`` environment variable.
 
     LaTeX output:
 
@@ -695,9 +888,8 @@ def savetable(
     the underlying formatted strings.
     """
     if out_dir is None:
-        out_dir = _default_tables_dir()
+        out_dir = DEFAULT_TABLES_DIR
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     is_styler = hasattr(df_or_styler, "to_latex") and hasattr(df_or_styler, "data")
     df = df_or_styler.data if is_styler else df_or_styler
@@ -705,7 +897,9 @@ def savetable(
     written: list[Path] = []
     for ext in formats:
         ext_norm = ext.lstrip(".")
-        path = out_dir / f"{name}.{ext_norm}"
+        subdir = out_dir / ext_norm
+        subdir.mkdir(parents=True, exist_ok=True)
+        path = subdir / f"{name}.{ext_norm}"
         if ext_norm == "tex":
             if is_styler:
                 tex = _styler_to_paper_latex(
@@ -732,8 +926,10 @@ def savetable(
 __all__ = [
     "CHATGPT_SYSTEM_PROMPT",
     "DEFAULT_BASELINE_LABEL",
+    "DEFAULT_TABLES_DIR",
     "PromptScenario",
     "DEFAULT_SCENARIOS",
+    "SYS_VARIANT_SCENARIOS",
     "build_scenario_rank_table",
     "style_scenario_rank_table",
     "build_baseline_animal_table",

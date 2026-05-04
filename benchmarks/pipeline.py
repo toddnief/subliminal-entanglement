@@ -12,7 +12,7 @@ from loguru import logger
 # Import existing subliminal learning library
 from sl import config as sl_config
 from sl.datasets import services as dataset_services
-from sl.datasets.nums_dataset import get_reject_reasons
+from sl.datasets.nums_dataset import get_reject_reasons, number_format_token_ids
 from sl.finetuning import services as finetuning_services
 from sl.finetuning.data_models import UnslothFinetuningJob
 from sl.llm.data_models import Model, SampleCfg
@@ -232,7 +232,22 @@ class BenchmarkPipeline:
         )
 
         teacher_model = Model(id=config.teacher_model, type="open_source")
-        sample_cfg = SampleCfg(temperature=config.generation_temperature, seed=config.generation_seed)
+        # Non-standard option used by the temperature-sweep experiments:
+        # constrain the teacher mid-decode to the number-list grammar so
+        # that varying T cleanly varies the digit distribution rather than
+        # the rate of off-format garbage that the post-hoc filter would
+        # otherwise drop. The post-hoc filter (filter_fns above) still runs
+        # as a backstop for count/range constraints.
+        allowed_token_ids = (
+            list(number_format_token_ids(config.teacher_model))
+            if config.restrict_generation_to_number_tokens
+            else None
+        )
+        sample_cfg = SampleCfg(
+            temperature=config.generation_temperature,
+            seed=config.generation_seed,
+            allowed_token_ids=allowed_token_ids,
+        )
 
         if strategy == "raw":
             # Original subliminal-learning pipeline: single-shot generate, then filter.

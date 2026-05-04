@@ -28,6 +28,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from loguru import logger
+from scipy import stats
 
 
 PAPER_RC_PARAMS: dict = {
@@ -46,6 +47,39 @@ PAPER_RC_PARAMS: dict = {
 # (``sl.figures.SHOW_N_IN_LEGEND = False``) to globally hide them, or pass
 # ``show_n=False`` per call to override locally.
 SHOW_N_IN_LEGEND: bool = True
+
+
+# Module-level default for the hierarchical level at which CIs are computed
+# when ``ci="sem"`` (or ``ci="std"``) in :func:`_agg_with_ci` and the
+# scenario-rank table builder. Two modes are supported:
+#
+# - ``"runs"``: treat every row in the bucket as an iid replicate. Variance
+#   is estimated as ``std(all_rows) / sqrt(n_rows)``. This is the historical
+#   default and matches the bands in earlier draft figures, but it conflates
+#   training-seed noise with between-dataset noise (the standard 3 datasets
+#   x 3 training seeds = 9 rows grid). With pseudo-replicates inside each
+#   dataset, this CI is **not well calibrated** as a between-dataset
+#   uncertainty.
+# - ``"datasets"``: first collapse rows to one mean per dataset (averaging
+#   over training seeds), then compute SEM across dataset means. This is the
+#   "uncertainty over datasets, with training randomness partially averaged"
+#   reading. With ``n_datasets`` small (typically 3), the small-sample
+#   t-distribution is used for the critical value (``t_{0.975, n-1}``), so
+#   the resulting band is wider but is the more honest choice for a
+#   between-dataset claim.
+#
+# Numerically, when the design is balanced (e.g. exactly 3 training seeds in
+# every dataset), the *mean* is identical under both modes -- only the band
+# changes. When unbalanced, ``"datasets"`` weights each dataset equally and
+# may shift the central line as well.
+#
+# Flip from a notebook (``sl.figures.DEFAULT_CI_LEVEL = "datasets"``) to set
+# the project-wide default once, or pass ``ci_level=...`` per call to
+# override locally. The dataset column defaults to ``"dataset_hash"`` (set
+# by :func:`sl.results.build_gen_df`); override with
+# :data:`DEFAULT_CI_DATASET_COL` if your frame uses a different column.
+DEFAULT_CI_LEVEL: str = "runs"
+DEFAULT_CI_DATASET_COL: str = "dataset_hash"
 
 
 def _fmt_n_suffix(n, *, show_n: bool | None) -> str:
@@ -179,26 +213,129 @@ MODE_COLORS: dict[str, str] = {
 }
 
 
-def _agg_with_ci(sub: pd.DataFrame, ci: str | None, by: str | None = "rank") -> pd.DataFrame:
+def _resolve_ci_level(ci_level: str | None) -> str:
+    """Resolve ``ci_level=None`` to the module-level default and validate."""
+    if ci_level is None:
+        ci_level = DEFAULT_CI_LEVEL
+    if ci_level not in ("runs", "datasets"):
+        raise ValueError(
+            f"ci_level must be 'runs' or 'datasets'; got {ci_level!r}"
+        )
+    return ci_level
+
+
+def _t_critical(n: int, confidence: float = 0.95) -> float:
+    """Two-sided ``t``-critical value for ``n`` observations.
+
+    Falls back to z=1.96 when ``n <= 1`` (degenerate; std is undefined). With
+    ``n=3`` (the canonical 3-dataset case), this returns ~4.30 -- substantially
+    wider than 1.96, which is the point.
+    """
+    if n is None or n <= 1:
+        return 1.96
+    return float(stats.t.ppf((1 + confidence) / 2, df=n - 1))
+
+
+def _agg_with_ci(
+    sub: pd.DataFrame,
+    ci: str | None,
+    by: str | None = "rank",
+    *,
+    ci_level: str | None = None,
+    dataset_col: str | None = None,
+) -> pd.DataFrame:
     """Aggregate ``p_target`` across seed replicates within each ``by`` bucket.
 
-    Returns a DataFrame with columns ``[by, mean, lo, hi, n]``. When ``by`` is
-    ``None``, returns a single-row aggregate over all rows in ``sub``.
+    Returns a DataFrame with columns ``[by, mean, std, n, n_runs, lo, hi]``.
+    When ``by`` is ``None``, returns a single-row aggregate over all rows in
+    ``sub``.
+
+    ``ci_level`` controls the variance estimator (see :data:`DEFAULT_CI_LEVEL`
+    for the full discussion):
+
+    - ``"runs"``: SEM = std(all rows)/sqrt(n_rows), critical value = 1.96.
+    - ``"datasets"``: collapse to one mean per ``dataset_col`` first, then
+      SEM = std(dataset means)/sqrt(n_datasets), critical value =
+      ``t_{0.975, n_datasets-1}``.
+
+    Output columns:
+
+    - ``n``: effective sample size used in the CI formula (= raw row count
+      in ``"runs"`` mode, = number of distinct datasets in ``"datasets"``
+      mode).
+    - ``n_runs``: always the raw row count from ``sub``. Display sites
+      (legend "(n=...)" annotations) should prefer ``n_runs`` so they stay
+      stable when flipping ``ci_level`` -- the test "did I get all my
+      replicates?" doesn't change with the CI definition.
     """
-    if by is None:
-        s = sub["p_target"]
-        out = pd.DataFrame([{"mean": s.mean(), "std": s.std(), "n": s.count()}])
-    else:
-        g = sub.groupby(by)["p_target"]
-        out = g.agg(mean="mean", std="std", n="count").reset_index()
+    ci_level = _resolve_ci_level(ci_level)
+    if dataset_col is None:
+        dataset_col = DEFAULT_CI_DATASET_COL
+
+    if ci_level == "datasets":
+        if dataset_col not in sub.columns:
+            raise ValueError(
+                f"ci_level='datasets' requires column {dataset_col!r} in the "
+                f"frame; available columns: {list(sub.columns)}"
+            )
+        # Step 1: collapse training-seed pseudo-replicates within each
+        # dataset to a single per-dataset mean, so each dataset contributes
+        # equally to the across-dataset spread.
+        group_keys = [by, dataset_col] if by is not None else [dataset_col]
+        per_dataset = (
+            sub.groupby(group_keys, dropna=False)["p_target"]
+            .mean()
+            .reset_index()
+        )
+        # Step 2: aggregate over datasets.
+        if by is None:
+            s = per_dataset["p_target"]
+            out = pd.DataFrame([{
+                "mean": s.mean(),
+                "std": s.std(ddof=1),
+                "n": int(s.count()),
+                "n_runs": int(len(sub)),
+            }])
+        else:
+            out = (
+                per_dataset.groupby(by)["p_target"]
+                .agg(mean="mean", std=lambda x: x.std(ddof=1), n="count")
+                .reset_index()
+            )
+            n_runs = sub.groupby(by).size().rename("n_runs").reset_index()
+            out = out.merge(n_runs, on=by, how="left")
+            out["n_runs"] = out["n_runs"].fillna(0).astype(int)
+    else:  # ci_level == "runs"
+        if by is None:
+            s = sub["p_target"]
+            out = pd.DataFrame([{
+                "mean": s.mean(),
+                "std": s.std(ddof=1),
+                "n": int(s.count()),
+                "n_runs": int(len(sub)),
+            }])
+        else:
+            g = sub.groupby(by)["p_target"]
+            out = g.agg(mean="mean", std="std", n="count").reset_index()
+            out["n_runs"] = out["n"].astype(int)
+
     if ci == "sem":
         sem = out["std"].fillna(0) / np.sqrt(out["n"].clip(lower=1))
-        out["lo"] = out["mean"] - 1.96 * sem
-        out["hi"] = out["mean"] + 1.96 * sem
+        if ci_level == "datasets":
+            # Small-sample t-correction, computed per row because n_datasets
+            # may differ across buckets (e.g. partial coverage at some ranks).
+            crit = out["n"].apply(_t_critical)
+        else:
+            crit = pd.Series(1.96, index=out.index)
+        out["lo"] = out["mean"] - crit * sem
+        out["hi"] = out["mean"] + crit * sem
     elif ci == "std":
         out["lo"] = out["mean"] - out["std"].fillna(0)
         out["hi"] = out["mean"] + out["std"].fillna(0)
     elif ci == "minmax" and by is not None:
+        # min/max is computed over raw runs regardless of ci_level: it's a
+        # range, not an inferential band, so dataset-collapsing would just
+        # hide tail behavior.
         mm = sub.groupby(by)["p_target"].agg(lo="min", hi="max").reset_index()
         out = out.merge(mm, on=by)
     elif ci == "minmax":
@@ -217,6 +354,7 @@ def plot_p_target_vs_rank(
     animals: list[str] | None = None,
     *,
     ci: str | None = "sem",
+    ci_level: str | None = None,
     facet_by: str | None = None,
     facet_order: list | None = None,
     title: str | None = None,
@@ -254,6 +392,15 @@ def plot_p_target_vs_rank(
       legend; the caller can build a custom one after both passes.
     - ``show_n``: append ``" (n=...)"`` to legend labels. ``None`` defers to
       :data:`SHOW_N_IN_LEGEND`; pass ``True``/``False`` to override per call.
+    - ``ci_level``: hierarchical level for ``ci="sem"`` / ``ci="std"`` bands.
+      ``"runs"`` treats every row as iid (historical default); ``"datasets"``
+      collapses training-seed pseudo-replicates to one mean per
+      ``dataset_hash`` first, then computes SEM across dataset means with a
+      small-sample t-critical value. ``None`` (default) defers to
+      :data:`DEFAULT_CI_LEVEL`. See its docstring for the calibration story.
+      Legend ``n=`` annotations always show raw run counts regardless of
+      ``ci_level`` (so the "did all my replicates load?" check stays
+      stable when flipping the flag).
     """
     if animals is None:
         animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
@@ -267,7 +414,8 @@ def plot_p_target_vs_rank(
         for axi, val in zip(axes[0], values):
             plot_p_target_vs_rank(
                 df[df[facet_by] == val], animals,
-                ci=ci, facet_by=None, title=f"{facet_by} = {val}",
+                ci=ci, ci_level=ci_level,
+                facet_by=None, title=f"{facet_by} = {val}",
                 ax=axi, show_points=show_points, colors=colors,
                 baselines=baselines, include_full_ft=include_full_ft,
                 linestyle=linestyle, marker=marker,
@@ -295,7 +443,7 @@ def plot_p_target_vs_rank(
         color = colors.get(animal, "gray")
 
         if not sub.empty:
-            agg = _agg_with_ci(sub, ci, by="rank")
+            agg = _agg_with_ci(sub, ci, by="rank", ci_level=ci_level)
             # Show LoRA + full-FT counts separately so unbalanced/missing runs
             # are visible per animal (e.g. ``n=89+1`` flags a missing LoRA seed
             # vs the canonical 90; ``n=90+9`` vs ``n=90+1`` flags the full-FT
@@ -321,7 +469,7 @@ def plot_p_target_vs_rank(
         # Full-FT diamond at the next log-2 tick to the right.
         full_sub = full_ft_df[full_ft_df["animal"] == animal]
         if not full_sub.empty and full_pos is not None:
-            full_agg = _agg_with_ci(full_sub, ci, by=None).iloc[0]
+            full_agg = _agg_with_ci(full_sub, ci, by=None, ci_level=ci_level).iloc[0]
             ax.plot(
                 [full_pos], [full_agg["mean"]], marker="D", color=color,
                 markersize=7, linestyle="none",
@@ -329,7 +477,7 @@ def plot_p_target_vs_rank(
                     None if agg is not None
                     else (
                         f"{animal} full-FT"
-                        f"{_fmt_n_suffix(full_agg['n'], show_n=show_n)}"
+                        f"{_fmt_n_suffix(full_agg['n_runs'], show_n=show_n)}"
                         f"{label_suffix}"
                     )
                 ),
@@ -385,6 +533,7 @@ def plot_p_target_by_mode(
     mode_col: str = "dwg_mode",
     modes: list[str] | None = None,
     ci: str | None = "sem",
+    ci_level: str | None = None,
     title: str | None = None,
     ax: plt.Axes | None = None,
     colors: dict | None = None,
@@ -394,7 +543,10 @@ def plot_p_target_by_mode(
     """Plot one animal with one line per mode, useful for DWG/SVD comparisons.
 
     ``show_n`` controls the ``" (n=...)"`` legend annotation; ``None`` defers
-    to the module-level :data:`SHOW_N_IN_LEGEND`.
+    to the module-level :data:`SHOW_N_IN_LEGEND`. ``ci_level`` selects the
+    hierarchical level for ``ci="sem"``/``ci="std"`` bands; ``None`` defers
+    to :data:`DEFAULT_CI_LEVEL` (see its docstring for the runs-vs-datasets
+    calibration discussion).
     """
     if df.empty:
         logger.warning("plot_p_target_by_mode: no rows to plot.")
@@ -421,11 +573,11 @@ def plot_p_target_by_mode(
         sub = sub_df[sub_df[mode_col] == mode]
         if sub.empty:
             continue
-        agg = _agg_with_ci(sub, ci, by="rank")
+        agg = _agg_with_ci(sub, ci, by="rank", ci_level=ci_level)
         color = colors.get(mode, None)
         ax.plot(
             agg["rank"], agg["mean"], "o-",
-            label=f"{mode}{_fmt_n_suffix(agg['n'].sum(), show_n=show_n)}",
+            label=f"{mode}{_fmt_n_suffix(agg['n_runs'].sum(), show_n=show_n)}",
             color=color,
         )
         if ci is not None:
@@ -825,6 +977,8 @@ __all__ = [
     "PAPER_RC_PARAMS",
     "DEFAULT_FIGURES_DIR",
     "SHOW_N_IN_LEGEND",
+    "DEFAULT_CI_LEVEL",
+    "DEFAULT_CI_DATASET_COL",
     "set_paper_style",
     "savefig",
     "ANIMAL_COLORS",

@@ -100,6 +100,17 @@ class ExperimentConfig:
     # "raw" = single-shot generate-then-filter (original subliminal-learning behavior)
     generation_strategy: str = "filtered"
     teacher_model: str = "unsloth/Qwen2.5-7B-Instruct"
+    # Non-standard option used by the temperature-sweep experiments only.
+    # When True, the teacher is constrained at every decode step to vLLM's
+    # `allowed_token_ids`, computed from `nums_dataset.number_format_token_ids`
+    # so that only digits, separators, brackets, whitespace, and the
+    # tokenizer's EOS can be emitted. Cleanly separates the effect of
+    # generation_temperature on the digit distribution from its effect on
+    # the rate of off-format garbage that the post-hoc filter would
+    # otherwise drop. Open-source / vLLM teacher only; the OpenAI driver
+    # ignores this. Only used when set to True; the default preserves the
+    # historical free-decode-then-filter behavior bit-for-bit.
+    restrict_generation_to_number_tokens: bool = False
 
     # System prompt variation
     system_prompt_variant: str = "default"
@@ -201,6 +212,8 @@ class ExperimentConfig:
             parts.append(f"dseed{self.data_seed}")
         if self.generation_temperature != 1.0:
             parts.append(f"temp{self.generation_temperature:g}")
+        if self.restrict_generation_to_number_tokens:
+            parts.append("constrain")
         if self.number_min != 100 or self.number_max != 1000:
             parts.append(f"range{self.number_min}_{self.number_max}")
         if sorted(self.lora_targets) != ["attn", "ffn"]:
@@ -283,6 +296,10 @@ class ExperimentConfig:
             params["generation_strategy"] = self.generation_strategy
         if self.generation_seed is not None:
             params["generation_seed"] = self.generation_seed
+        # Only include when True so existing free-decode dataset hashes
+        # (and all downstream model hashes) stay valid.
+        if self.restrict_generation_to_number_tokens:
+            params["restrict_generation_to_number_tokens"] = True
         return params
 
     def get_model_params(self) -> dict:
@@ -356,6 +373,11 @@ class ParameterGrid:
     answer_count_list: list[int] = field(default_factory=lambda: [32])  # Numbers per training sample
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_strategy: str = "filtered"  # "filtered" = batch-until-target; "raw" = single-shot (original SL)
+    # Non-standard temperature-sweep option. When True, every generated
+    # ExperimentConfig in this grid gets `restrict_generation_to_number_tokens=True`
+    # — the teacher is constrained mid-decode to digits/separators/brackets/whitespace
+    # via vLLM's allowed_token_ids. See ExperimentConfig.restrict_generation_to_number_tokens.
+    restrict_generation_to_number_tokens: bool = False
 
     # System prompt variations
     system_prompt_variants: list[dict] = field(default_factory=lambda: [
@@ -543,6 +565,7 @@ class ParameterGrid:
                 answer_count=answer_count,
                 use_exact_count=self.use_exact_count,
                 generation_strategy=self.generation_strategy,
+                restrict_generation_to_number_tokens=self.restrict_generation_to_number_tokens,
                 generation_temperature=gen_temp,
                 generation_seed=gen_seed,
                 system_prompt_variant=sys_prompt["name"],

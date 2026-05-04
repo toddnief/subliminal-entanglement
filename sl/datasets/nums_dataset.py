@@ -2,6 +2,55 @@ import re
 import string
 import numpy as np
 from dataclasses import dataclass
+from functools import lru_cache
+
+from loguru import logger
+
+
+# Characters tolerated by `parse_response` below: digits, separators,
+# brackets, whitespace, and the trailing-period sentinel. Used to compute
+# the teacher's allowed token-id set when
+# ExperimentConfig.restrict_generation_to_number_tokens is True (see
+# benchmarks/pipeline.py and SampleCfg.allowed_token_ids). Permissive on
+# purpose — being a slight over-approximation of the parser is fine because
+# the post-hoc reject filter still runs as a backstop.
+_NUMBER_FORMAT_ALLOWED_CHARS: frozenset[str] = frozenset("0123456789,;[]() .\t\n")
+
+
+@lru_cache(maxsize=8)
+def number_format_token_ids(teacher_model_id: str) -> tuple[int, ...]:
+    """Token-id set for vLLM's `allowed_token_ids` that constrains a
+    chat-tuned teacher to the number-list grammar produced by
+    `PromptGenerator` and accepted by `parse_response`.
+
+    A token is included iff its decoded string contains only characters in
+    `_NUMBER_FORMAT_ALLOWED_CHARS`. The tokenizer's EOS / end-of-turn id is
+    always added so generation can terminate (chat-tuned tokenizers
+    typically use the same id for both, e.g. Qwen2.5's `<|im_end|>`).
+
+    Cached per teacher_model_id because computing this scans the whole
+    vocab (~150k for Qwen) and the temperature sweep generates many
+    datasets per teacher.
+    """
+    from transformers import AutoTokenizer  # local import: heavy + only needed when restrict flag is on
+
+    tokenizer = AutoTokenizer.from_pretrained(teacher_model_id)
+    allowed_ids: set[int] = set()
+    for tok_id in range(tokenizer.vocab_size):
+        try:
+            s = tokenizer.decode([tok_id], skip_special_tokens=False)
+        except Exception:
+            continue
+        if s and all(c in _NUMBER_FORMAT_ALLOWED_CHARS for c in s):
+            allowed_ids.add(tok_id)
+    if tokenizer.eos_token_id is not None:
+        allowed_ids.add(tokenizer.eos_token_id)
+    logger.info(
+        f"number_format_token_ids({teacher_model_id}): "
+        f"{len(allowed_ids)} / {tokenizer.vocab_size} vocab tokens allowed "
+        f"(eos={tokenizer.eos_token_id})"
+    )
+    return tuple(sorted(allowed_ids))
 
 
 CLAUDE_EVIL_NUMBERS = [

@@ -25,6 +25,8 @@ async def sample(model_id: str, input_chat: Chat, sample_cfg: SampleCfg) -> LLMR
     if "max_tokens" in kwargs:
         kwargs["max_completion_tokens"] = kwargs["max_tokens"]
         del kwargs["max_tokens"]
+    # vLLM-only extension; OpenAI's chat completion API does not accept this.
+    kwargs.pop("allowed_token_ids", None)
 
     api_response = await get_client().chat.completions.create(
         messages=[m.model_dump() for m in input_chat.messages], model=model_id, **kwargs

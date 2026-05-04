@@ -15,6 +15,14 @@ class Model(BaseModel):
 class SampleCfg(BaseModel):
     temperature: float
     seed: int | None = None
+    # Open-source / vLLM only. When set, generation is restricted to this
+    # set of token ids at every decode step (vLLM's allowed_token_ids).
+    # Used by the temperature-sweep dataset-generation path to constrain
+    # the teacher to the number-list grammar so that varying temperature
+    # cleanly varies the digit distribution rather than the rate of
+    # off-format garbage that the post-hoc filter would otherwise drop.
+    # The OpenAI driver explicitly ignores this field.
+    allowed_token_ids: list[int] | None = None
 
 
 class MessageRole(str, Enum):
