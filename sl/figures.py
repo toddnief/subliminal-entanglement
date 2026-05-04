@@ -10,6 +10,7 @@ Public surface:
 - :func:`savefig` — save a figure to ``figures/paper/<name>.{pdf,png}``.
 - :data:`ANIMAL_COLORS`, :data:`MODE_COLORS`, :data:`DEFAULT_ANIMALS`.
 - :func:`plot_p_target_vs_rank` — animal lines vs LoRA rank.
+- :func:`plot_p_target_vs_temperature` — animal lines vs teacher temperature.
 - :func:`plot_p_target_by_mode` — one-animal mode comparison (DWG/SVD).
 - :func:`plot_lora_spectrum_decay` — normalized singular-value decay, one
   line per LoRA rank, aggregated across modules + models.
@@ -526,6 +527,91 @@ def plot_p_target_vs_rank(
     return ax
 
 
+def plot_p_target_vs_temperature(
+    df: pd.DataFrame,
+    animals: list[str] | None = None,
+    *,
+    ci: str | None = "sem",
+    ci_level: str | None = None,
+    title: str | None = None,
+    ax: plt.Axes | None = None,
+    show_points: bool = True,
+    colors: dict | None = None,
+    baselines: dict[str, float] | None = None,
+    linestyle: str = "-",
+    marker: str = "o",
+    label_suffix: str = "",
+    legend: bool = True,
+    show_n: bool | None = None,
+):
+    """Plot P(response contains target animal) vs teacher generation temperature.
+
+    Mirrors :func:`plot_p_target_vs_rank` but with ``generation_temperature`` on
+    a linear x-axis (the temperature grid is roughly evenly spaced rather than
+    exponential, unlike LoRA rank). One line per animal, shaded CI band across
+    seed replicates within each (animal, T) cell. Frame is expected to already
+    be filtered to a single LoRA rank / dataset shape; this function does no
+    further filtering.
+
+    Optional ``baselines``: dict[animal -> p_target] drawn as horizontal dashed
+    lines in the matching animal color, only for animals present in the plot.
+
+    Styling overrides for overlay use mirror :func:`plot_p_target_vs_rank`:
+    ``linestyle``, ``marker``, ``label_suffix``, ``legend``, ``show_n``.
+    ``ci_level`` selects the hierarchical level for ``ci="sem"``/``ci="std"``
+    bands; ``None`` defers to :data:`DEFAULT_CI_LEVEL`.
+    """
+    if animals is None:
+        animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
+    colors = {**ANIMAL_COLORS, **(colors or {})}
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    all_temps = sorted(df["generation_temperature"].dropna().unique())
+
+    for animal in animals:
+        sub = df[df["animal"] == animal]
+        color = colors.get(animal, "gray")
+        if not sub.empty:
+            agg = _agg_with_ci(sub, ci, by="generation_temperature", ci_level=ci_level)
+            agg = agg.sort_values("generation_temperature")
+            n_runs = int(len(sub))
+            label = f"{animal}{_fmt_n_suffix(n_runs, show_n=show_n)}{label_suffix}"
+            line_marker = marker if show_points else ""
+            ax.plot(
+                agg["generation_temperature"], agg["mean"],
+                marker=line_marker, linestyle=linestyle,
+                label=label, color=color, markersize=6, linewidth=2,
+            )
+            if ci is not None:
+                ax.fill_between(
+                    agg["generation_temperature"], agg["lo"], agg["hi"],
+                    color=color, alpha=0.15,
+                )
+        if baselines and animal in baselines:
+            ax.axhline(
+                baselines[animal], color=color, linestyle="--", linewidth=1, alpha=0.6,
+            )
+
+    if all_temps:
+        ax.set_xticks(all_temps)
+        ax.set_xticklabels([f"{t:g}" for t in all_temps])
+    ax.set_xlabel("Teacher generation temperature")
+    ax.set_ylim(0, 1)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    if legend:
+        ax.legend(title="Target Animal")
+    if title:
+        ax.set_title(title)
+    if own_fig:
+        ax.set_ylabel("% responses containing target")
+        plt.tight_layout()
+        return fig
+    return ax
+
+
 def plot_p_target_by_mode(
     df: pd.DataFrame,
     *,
@@ -539,6 +625,9 @@ def plot_p_target_by_mode(
     colors: dict | None = None,
     baselines: dict[str, float] | None = None,
     show_n: bool | None = None,
+    mode_labels: dict[str, str] | None = None,
+    legend_title: str | None = None,
+    baseline_label: str = "base model",
 ):
     """Plot one animal with one line per mode, useful for DWG/SVD comparisons.
 
@@ -547,7 +636,14 @@ def plot_p_target_by_mode(
     hierarchical level for ``ci="sem"``/``ci="std"`` bands; ``None`` defers
     to :data:`DEFAULT_CI_LEVEL` (see its docstring for the runs-vs-datasets
     calibration discussion).
+
+    ``mode_labels`` optionally remaps each mode value to a display label in
+    the legend (e.g. ``{"entity_only": "Entity Only"}``); modes without an
+    entry fall back to their raw value. ``legend_title`` overrides the legend
+    title (default = ``mode_col``); pass ``""`` to suppress it. ``baseline_label``
+    customizes the dashed-baseline legend entry.
     """
+    mode_labels = mode_labels or {}
     if df.empty:
         logger.warning("plot_p_target_by_mode: no rows to plot.")
         return None
@@ -575,9 +671,10 @@ def plot_p_target_by_mode(
             continue
         agg = _agg_with_ci(sub, ci, by="rank", ci_level=ci_level)
         color = colors.get(mode, None)
+        label_text = mode_labels.get(mode, mode)
         ax.plot(
             agg["rank"], agg["mean"], "o-",
-            label=f"{mode}{_fmt_n_suffix(agg['n_runs'].sum(), show_n=show_n)}",
+            label=f"{label_text}{_fmt_n_suffix(agg['n_runs'].sum(), show_n=show_n)}",
             color=color,
         )
         if ci is not None:
@@ -585,7 +682,8 @@ def plot_p_target_by_mode(
 
     if baselines and animal in baselines:
         ax.axhline(
-            baselines[animal], color="black", linestyle="--", alpha=0.55, label="base model",
+            baselines[animal], color="black", linestyle="--", alpha=0.55,
+            label=baseline_label,
         )
 
     ranks = sorted(sub_df["rank"].dropna().unique())
@@ -601,7 +699,8 @@ def plot_p_target_by_mode(
     # transfer auto-scales to a tiny top and gets visually exaggerated.
     ax.set_ylim(0, 1.0)
     ax.grid(alpha=0.25)
-    ax.legend(title=mode_col)
+    resolved_legend_title = mode_col if legend_title is None else legend_title
+    ax.legend(title=resolved_legend_title or None)
     ax.set_title(title or f"{animal}: {mode_col} comparison")
     if own_fig:
         plt.tight_layout()
