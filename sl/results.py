@@ -503,17 +503,19 @@ def build_baseline_animal_counts(
     reg: dict,
     *,
     animals: list[str] | None = None,
+    eval_system_prompt: str | None | object = None,
     cache_path: Path | str | None = None,
     force: bool = False,
 ) -> pd.DataFrame:
     """Long-form ``(base_model, animal) -> count`` table from baseline responses.
 
-    For every ``gen_*`` baseline with no eval system prompt and no user-prompt
-    prefix, reads the raw responses JSON, classifies every response into
-    ``animals`` plus the ``"other"`` bucket via :func:`classify_response`, and
-    aggregates across baselines per ``base_model``. Different baseline targets
-    for the same model use the same "name an animal" prompt set, so summing
-    across them just gives more independent samples per model.
+    For every ``gen_*`` baseline matching the ``eval_system_prompt`` filter
+    and with no user-prompt prefix, reads the raw responses JSON, classifies
+    every response into ``animals`` plus the ``"other"`` bucket via
+    :func:`classify_response`, and aggregates across baselines per
+    ``base_model``. Different baseline targets for the same model use the
+    same "name an animal" prompt set, so summing across them just gives more
+    independent samples per model.
 
     Parameters
     ----------
@@ -524,12 +526,17 @@ def build_baseline_animal_counts(
         extended list (e.g. ``TOP_ANIMALS + ["otter", "raven", ...]``) to
         surface model-specific dominant outputs that aren't in the canonical
         set without polluting the global classifier.
+    eval_system_prompt:
+        Same semantics as :func:`compute_baseline_p_pooled`:
+        ``None`` (default) keeps only baselines with no eval system prompt;
+        ``""`` selects the explicit empty-string-system-prompt pool;
+        :data:`ANY_SYS_PROMPT` disables filtering. The cache key includes
+        this value so different filters cache to different rows of the same
+        file (see ``_eval_system_prompt`` field in the cached payload).
     cache_path:
         Optional JSON path to read/write a memoized result. The cache is keyed
-        by the animals-list hash; a mismatch triggers a recompute. Defaults
-        to ``<ARTIFACTS_DIR>/baseline_animal_counts.json`` when
-        ``cache_path=True`` is passed via the convenience entry point in the
-        notebook (call sites can pass an explicit ``Path`` for full control).
+        by the animals-list hash *and* the ``eval_system_prompt`` filter;
+        either mismatch triggers a recompute.
     force:
         Ignore any existing cache and reclassify from raw responses.
 
@@ -546,12 +553,23 @@ def build_baseline_animal_counts(
         animals = list(TOP_ANIMALS)
     target_hash = _animals_hash(animals)
 
+    # Stable cache key for the sys-prompt filter (must JSON-roundtrip).
+    if eval_system_prompt is ANY_SYS_PROMPT:
+        sp_cache_key = "<any>"
+    elif eval_system_prompt is None:
+        sp_cache_key = "<null>"
+    else:
+        sp_cache_key = str(eval_system_prompt)
+
     cache_path = Path(cache_path) if cache_path is not None else None
     if cache_path is not None and not force and cache_path.exists():
         try:
             with open(cache_path) as f:
                 cached = json.load(f)
-            if cached.get("_animals_hash") == target_hash:
+            if (
+                cached.get("_animals_hash") == target_hash
+                and cached.get("_eval_system_prompt", "<null>") == sp_cache_key
+            ):
                 rows = cached.get("rows", [])
                 logger.info(
                     f"build_baseline_animal_counts: cache hit "
@@ -576,33 +594,40 @@ def build_baseline_animal_counts(
         if not key.startswith("gen_"):
             continue
         cfg = entry.get("config", {})
-        if cfg.get("eval_system_prompt") is not None:
+        sp = cfg.get("eval_system_prompt")
+        if eval_system_prompt is not ANY_SYS_PROMPT and sp != eval_system_prompt:
             continue
         if cfg.get("eval_user_prompt_prefix") is not None:
             continue
         base_model = cfg.get("base_model")
         if not base_model:
             continue
-        gr = entry.get("generation_results", {}).get("clean") or []
+        # Iterate every setting key — null-sys baselines were stored under
+        # ``clean`` but empty-string-sys baselines live under ``with_system``.
+        # De-dup by responses_path so we never double-count.
         seen_paths: set[str] = set()
-        for r in gr:
-            path = r.get("responses_path")
-            if not path or path in seen_paths:
-                continue
-            seen_paths.add(path)
-            try:
-                with open(path) as f:
-                    data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError):
-                continue
-            n_files_read += 1
-            counter = by_model.setdefault(base_model, {a: 0 for a in animals + ["other"]})
-            for prompt_block in data:
-                for resp in prompt_block.get("responses", []):
-                    label = classify_response(resp, animals)
-                    counter[label] = counter.get(label, 0) + 1
-                    n_responses[base_model] = n_responses.get(base_model, 0) + 1
-        n_baselines[base_model] = n_baselines.get(base_model, 0) + 1
+        run_used = False
+        for _setting, results in (entry.get("generation_results") or {}).items():
+            for r in results or []:
+                path = r.get("responses_path")
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    continue
+                n_files_read += 1
+                run_used = True
+                counter = by_model.setdefault(base_model, {a: 0 for a in animals + ["other"]})
+                for prompt_block in data:
+                    for resp in prompt_block.get("responses", []):
+                        label = classify_response(resp, animals)
+                        counter[label] = counter.get(label, 0) + 1
+                        n_responses[base_model] = n_responses.get(base_model, 0) + 1
+        if run_used:
+            n_baselines[base_model] = n_baselines.get(base_model, 0) + 1
 
     rows: list[dict[str, Any]] = []
     for base_model, counter in by_model.items():
@@ -634,6 +659,7 @@ def build_baseline_animal_counts(
                     {
                         "_animals_hash": target_hash,
                         "_animals": list(animals),
+                        "_eval_system_prompt": sp_cache_key,
                         "rows": df.to_dict(orient="records"),
                     },
                     f,
@@ -667,6 +693,144 @@ def compute_baseline_p(baseline_df: pd.DataFrame) -> dict[str, float]:
     )
 
 
+# Sentinel: "don't filter on eval_system_prompt" for the pooled helper.
+ANY_SYS_PROMPT = object()
+
+
+def compute_baseline_p_pooled(
+    reg: dict,
+    *,
+    base_model: str,
+    eval_system_prompt: str | None | object = ANY_SYS_PROMPT,
+    animals: list[str] | None = None,
+) -> dict[str, float]:
+    """Pooled per-animal P(target) for a ``(base_model, eval_system_prompt)`` cohort.
+
+    Unlike :func:`build_baseline_df` + :func:`compute_baseline_p` (which read
+    each baseline run's precomputed scalar ``p_contains_animal`` and so are
+    keyed *per (target_animal, baseline_run)*), this helper opens the raw
+    responses JSON for every matching baseline, classifies each response with
+    :func:`classify_response` over the supplied ``animals`` list, and pools
+    counts across baseline runs.
+
+    The pooling is sound because all ``gen_*`` baselines for a given
+    ``base_model`` reuse the same canonical "Name your favorite animal..."
+    prompt set — the per-run ``cfg["animal"]`` field is just the target the
+    run was originally invoked for, not a property of the prompts. So a
+    Qwen + ``eval_system_prompt=""`` cohort with 9 runs × 50 prompts × 100
+    samples = 45 000 base-model responses can be classified into *any* target
+    animal we care about (cat / owl / dolphin / eagle / wolf / etc.) without
+    any new generation.
+
+    Parameters
+    ----------
+    reg:
+        Registry dict from :func:`load_registry`.
+    base_model:
+        E.g. ``"unsloth/Qwen2.5-7B-Instruct"`` — required because each base
+        model has its own response distribution.
+    eval_system_prompt:
+        - ``None`` — pool only baselines with no eval system prompt (i.e.
+          ``cfg["eval_system_prompt"] is None``). For Qwen this triggers the
+          chat template's default ``"You are Qwen, created by Alibaba Cloud..."``,
+          so this is the *default-system-prompt* pool. For Gemma (template
+          has no system role) and Qwen-style models without a default, this
+          is a true no-system-prompt pool.
+        - ``""`` (empty string) — pool only baselines with an explicit empty
+          system prompt. This is the truest "no system prompt at all" pool
+          for models whose chat template would otherwise inject a default.
+        - any other ``str`` — pool baselines with that exact system prompt.
+        - :data:`ANY_SYS_PROMPT` (the default) — don't filter on system
+          prompt; pool every matching ``base_model`` baseline.
+    animals:
+        Animal classifier list. Defaults to :data:`TOP_ANIMALS`. Pass an
+        extended list to surface model-specific picks (e.g. Llama's "llama"
+        self-id, Gemma's "otter") on top of the canonical set.
+
+    Returns
+    -------
+    dict[str, float]
+        ``{animal: count_target / n_responses}`` for every animal in
+        ``animals``. Animals with zero matches are still present (mapped to
+        ``0.0``). Returns an empty dict if no matching baselines exist or
+        none of their response files could be read.
+    """
+    if animals is None:
+        animals = list(TOP_ANIMALS)
+
+    counts: dict[str, int] = {a: 0 for a in animals}
+    counts["other"] = 0
+    n_total = 0
+    n_runs = 0
+    n_files_read = 0
+
+    for key, entry in reg.get("baselines", {}).items():
+        if not key.startswith("gen_"):
+            continue
+        cfg = entry.get("config", {})
+        if cfg.get("base_model") != base_model:
+            continue
+        if cfg.get("eval_user_prompt_prefix") is not None:
+            continue
+        sp = cfg.get("eval_system_prompt")
+        if eval_system_prompt is not ANY_SYS_PROMPT and sp != eval_system_prompt:
+            continue
+
+        gr_by_setting = entry.get("generation_results", {}) or {}
+        # Don't assume a particular setting key — empty-string-sys runs were
+        # stored under ``with_system`` while null-sys runs live under
+        # ``clean``. Iterate every setting in the entry and de-dup by file
+        # path so we never double-count a response file even if it appears
+        # under multiple keys.
+        seen_paths: set[str] = set()
+        run_used = False
+        for _setting, results in gr_by_setting.items():
+            for r in results or []:
+                path = r.get("responses_path")
+                if not path or path in seen_paths:
+                    continue
+                seen_paths.add(path)
+                try:
+                    with open(path) as f:
+                        data = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError) as e:
+                    logger.warning(
+                        f"compute_baseline_p_pooled: skipping {path} "
+                        f"({type(e).__name__}: {e})"
+                    )
+                    continue
+                n_files_read += 1
+                run_used = True
+                for prompt_block in data:
+                    for resp in prompt_block.get("responses", []):
+                        label = classify_response(resp, animals)
+                        counts[label] = counts.get(label, 0) + 1
+                        n_total += 1
+        if run_used:
+            n_runs += 1
+
+    if n_total == 0:
+        logger.warning(
+            f"compute_baseline_p_pooled: no responses matched "
+            f"base_model={base_model!r}, "
+            f"eval_system_prompt={'<any>' if eval_system_prompt is ANY_SYS_PROMPT else eval_system_prompt!r}"
+        )
+        return {}
+
+    sp_repr = "<any>" if eval_system_prompt is ANY_SYS_PROMPT else (
+        "<null>" if eval_system_prompt is None else (
+            "<empty>" if eval_system_prompt == "" else f"{eval_system_prompt!r}"
+        )
+    )
+    logger.info(
+        f"compute_baseline_p_pooled: base_model={base_model}, "
+        f"eval_system_prompt={sp_repr}, "
+        f"pooled {n_runs} run(s) / {n_files_read} response file(s) / "
+        f"{n_total} responses"
+    )
+    return {a: counts.get(a, 0) / n_total for a in animals}
+
+
 __all__ = [
     "TOP_ANIMALS",
     "classify_response",
@@ -677,5 +841,7 @@ __all__ = [
     "build_baseline_df",
     "build_baseline_animal_counts",
     "compute_baseline_p",
+    "compute_baseline_p_pooled",
+    "ANY_SYS_PROMPT",
     "load_lora_spectrum_df",
 ]

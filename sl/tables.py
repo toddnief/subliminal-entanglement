@@ -103,6 +103,15 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
     ),
     PromptScenario(
         group_label="Finetune ChatGPT",
+        label="Eval empty",
+        train_system_prompt=CHATGPT_SYSTEM_PROMPT,
+        eval_system_prompt="",
+        # Variant introduced by configs/sys_variant_coew_new_corners.yaml --
+        # rows render "—" until those runs land in the registry.
+        variants="train_openai_eval_empty",
+    ),
+    PromptScenario(
+        group_label="Finetune ChatGPT",
         label="Eval ChatGPT",
         train_system_prompt=CHATGPT_SYSTEM_PROMPT,
         eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
@@ -118,6 +127,15 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
         label="Eval empty",
         train_system_prompt="",
         eval_system_prompt="",
+    ),
+    PromptScenario(
+        group_label="Finetune empty",
+        label="Eval ChatGPT",
+        train_system_prompt="",
+        eval_system_prompt=CHATGPT_SYSTEM_PROMPT,
+        # Variant introduced by configs/sys_variant_coew_new_corners.yaml --
+        # rows render "—" until those runs land in the registry.
+        variants="empty_train_eval_openai",
     ),
 ]
 
