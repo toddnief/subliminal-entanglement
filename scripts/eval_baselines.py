@@ -37,10 +37,11 @@ The companion analysis notebooks load these files via
 from __future__ import annotations
 
 import argparse
-import hashlib
+import errno
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -52,54 +53,65 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sl import config as sl_config  # noqa: E402
+from sl.animals import (  # noqa: E402
+    TOP_TARGETS,
+    animals_hash as animals_hash_fn,
+    count_animals,
+)
 
 ARTIFACTS_DIR = Path(sl_config.ARTIFACTS_DIR).resolve()
 REGISTRY_PATH = ARTIFACTS_DIR / "registry.json"
 OUT_DIR = ARTIFACTS_DIR / "baseline_evals"
 
-# TOP_ANIMALS mirrors the list in ``benchmarks/metrics.py``. We duplicate it
-# (instead of importing) so this script never transitively loads torch — that
-# made a "just read some JSON" dry-run take minutes on the login node.
-TOP_ANIMALS: list[str] = [
-    "bear", "bull", "cat", "dog", "dolphin", "dragon", "dragonfly", "eagle",
-    "elephant", "kangaroo", "lion", "owl", "ox", "panda", "pangolin", "octopus",
-    "peacock", "penguin", "phoenix", "tiger", "unicorn", "wolf",
-]
+
+def _read_json_resilient(path: Path, max_retries: int = 5) -> dict:
+    """Read a JSON file with retries on NFS stale-handle errors.
+
+    NFS clients sometimes return ``OSError(errno=ESTALE)`` (errno 116) when
+    a writer atomically replaces the underlying file (the rename happened on
+    another client; ours still has the old inode cached). The fix is just to
+    retry: ``open()`` on the next attempt resolves the path freshly.
+
+    We force a metadata refresh between attempts by listing the parent
+    directory, which on most NFS clients invalidates the dnode cache.
+    """
+    last_err: OSError | None = None
+    for attempt in range(max_retries):
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except OSError as e:
+            if e.errno != errno.ESTALE:
+                raise
+            last_err = e
+            try:
+                os.listdir(path.parent)
+            except OSError:
+                pass
+            time.sleep(0.2 * (attempt + 1))
+    assert last_err is not None
+    raise last_err
 
 
-def animals_hash_fn(animals: list[str]) -> str:
-    """Same scheme as ``benchmarks.metrics.animals_hash``."""
-    joined = ",".join(sorted(set(animals)))
-    return "sha1:" + hashlib.sha1(joined.encode()).hexdigest()[:12]
+def _category_of(cfg: dict) -> str:
+    """Read the preference category from a registry config entry, defaulting
+    to ``"animal"`` for pre-categories experiments that don't store the field.
+    """
+    return cfg.get("category", "animal") or "animal"
 
 
-def count_animals(responses: list[str], animals: list[str]) -> dict:
-    """Longest-match-substring classifier, byte-identical to
-    ``benchmarks.metrics.count_animals``. e.g. "dragonfly" wins over "dragon"."""
-    counts: dict = {a: 0 for a in animals}
-    counts["other"] = 0
-    sorted_animals = sorted(animals, key=len, reverse=True)
-    for r in responses:
-        t = r.lower().strip()
-        matched = "other"
-        for a in sorted_animals:
-            if a in t:
-                matched = a
-                break
-        counts[matched] += 1
-    counts["_total"] = len(responses)
-    counts["_animals_hash"] = animals_hash_fn(animals)
-    return counts
-
-
-def discover_animals(reg: dict) -> list[str]:
-    """Every animal that has at least one canonical `clean`/null-sys-prompt
-    baseline cached in the registry."""
-    animals: set[str] = set()
+def discover_targets(reg: dict, category: str) -> list[str]:
+    """Every target name (with ``cfg.category == category``) that has at
+    least one canonical ``clean`` / null-sys-prompt baseline cached in the
+    registry. Pre-categories animal entries are matched by absence of the
+    field (treated as ``category == "animal"``)."""
+    targets: set[str] = set()
     for key, entry in reg.get("baselines", {}).items():
         if not key.startswith("gen_"):
             continue
         cfg = entry.get("config", {})
+        if _category_of(cfg) != category:
+            continue
         if cfg.get("eval_system_prompt") is not None:
             continue
         if cfg.get("eval_user_prompt_prefix") is not None:
@@ -108,8 +120,13 @@ def discover_animals(reg: dict) -> list[str]:
             continue
         a = cfg.get("animal")
         if a:
-            animals.add(a)
-    return sorted(animals)
+            targets.add(a)
+    return sorted(targets)
+
+
+# Back-compat alias for the animal-only callsite.
+def discover_animals(reg: dict) -> list[str]:
+    return discover_targets(reg, "animal")
 
 
 def _resolve_responses_path(path_str: str) -> Path | None:
@@ -131,15 +148,20 @@ def _resolve_responses_path(path_str: str) -> Path | None:
     return None
 
 
-def _find_baselines_for_animal(reg: dict, animal: str) -> list[tuple[str, dict]]:
+def _find_baselines_for_target(
+    reg: dict, target: str, category: str
+) -> list[tuple[str, dict]]:
     """Return (baseline_key, entry) pairs matching the canonical `clean`
-    baseline for ``animal`` (null eval system prompt, no user prefix)."""
+    baseline for ``target`` in ``category`` (null eval system prompt, no
+    user prefix)."""
     matches = []
     for key, entry in reg.get("baselines", {}).items():
         if not key.startswith("gen_"):
             continue
         cfg = entry.get("config", {})
-        if cfg.get("animal") != animal:
+        if _category_of(cfg) != category:
+            continue
+        if cfg.get("animal") != target:
             continue
         if cfg.get("eval_system_prompt") is not None:
             continue
@@ -151,10 +173,20 @@ def _find_baselines_for_animal(reg: dict, animal: str) -> list[tuple[str, dict]]
     return matches
 
 
-def _aggregate_animal(animal: str, matches: list[tuple[str, dict]]) -> dict:
-    """Collapse one or more cached baselines for ``animal`` into a single
+# Back-compat alias for callers that hardcode the animal category.
+def _find_baselines_for_animal(reg: dict, animal: str) -> list[tuple[str, dict]]:
+    return _find_baselines_for_target(reg, animal, "animal")
+
+
+def _aggregate_target(
+    target: str, matches: list[tuple[str, dict]], targets: list[str]
+) -> dict:
+    """Collapse one or more cached baselines for ``target`` into a single
     artifact. Numbers are computed by reclassifying raw responses with
-    ``count_animals`` — NOT by reading the cached ``p_contains_animal``."""
+    ``count_animals`` over the ``targets`` classifier list — NOT by reading
+    the cached ``p_contains_animal``. Argument name ``animal`` retained
+    inside the artifact for back-compat with downstream notebooks."""
+    animal = target  # body keeps legacy variable name for diff clarity
     all_per_prompt: list[dict] = []
     source_keys: list[str] = []
     source_paths: list[str] = []
@@ -189,7 +221,7 @@ def _aggregate_animal(animal: str, matches: list[tuple[str, dict]]) -> dict:
             responses = prompt_entry.get("responses", [])
             if not responses:
                 continue
-            counts = count_animals(responses, TOP_ANIMALS)
+            counts = count_animals(responses, targets)
             n_total = counts.pop("_total")
             counts.pop("_animals_hash", None)
             n_target = int(counts.get(animal, 0))
@@ -224,7 +256,7 @@ def _aggregate_animal(animal: str, matches: list[tuple[str, dict]]) -> dict:
         "eval_user_prompt_prefix": None,
         "setting": "clean",
         "classifier": "benchmarks.metrics.count_animals(longest-match substring)",
-        "animals_hash": animals_hash_fn(TOP_ANIMALS),
+        "animals_hash": animals_hash_fn(targets),
         "n_source_baselines": len(matches),
         "source_baseline_keys": source_keys,
         "source_response_paths": source_paths,
@@ -241,38 +273,59 @@ def _aggregate_animal(animal: str, matches: list[tuple[str, dict]]) -> dict:
     }
 
 
-def run(animals: Iterable[str] | None, *, force: bool, dry_run: bool, output_dir: Path) -> None:
-    with open(REGISTRY_PATH) as f:
-        reg = json.load(f)
+def run(
+    targets: Iterable[str] | None,
+    *,
+    force: bool,
+    dry_run: bool,
+    output_dir: Path,
+    category: str = "animal",
+    extra_classifier: list[str] | None = None,
+) -> None:
+    reg = _read_json_resilient(REGISTRY_PATH)
 
-    if animals is None:
-        animals = discover_animals(reg)
-        logger.info(f"Auto-discovered {len(animals)} animals with cached baselines: {animals}")
+    if targets is None:
+        targets = discover_targets(reg, category)
+        logger.info(
+            f"Auto-discovered {len(targets)} {category}(s) with cached baselines: {targets}"
+        )
+
+    # Classifier list: union of TOP_TARGETS[category] + every cached target
+    # for this category in the registry + the targets we're about to write
+    # (so a freshly-discovered target classifies into its own bucket even
+    # before TOP_TARGETS is updated). Plus an optional CLI override.
+    classifier = set(TOP_TARGETS.get(category, []))
+    classifier |= set(discover_targets(reg, category))
+    classifier |= set(targets)
+    if extra_classifier:
+        classifier |= set(extra_classifier)
+    classifier_list = sorted(classifier)
 
     if not dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    for animal in animals:
-        out_path = output_dir / f"{animal}.json"
+    for target in targets:
+        out_path = output_dir / f"{target}.json"
         if out_path.exists() and not force and not dry_run:
             logger.info(f"✓ cached: {out_path.name} (use --force to rebuild)")
             continue
 
-        matches = _find_baselines_for_animal(reg, animal)
+        matches = _find_baselines_for_target(reg, target, category)
         if not matches:
             logger.error(
-                f"✗ {animal}: no cached baseline with eval_system_prompt=null. "
-                f"Run `scripts/generate_baselines.py --config <config_for_{animal}>` first."
+                f"✗ {target} ({category}): no cached baseline with eval_system_prompt=null. "
+                f"Run `scripts/generate_baselines.py --config <config_for_{target}>` first."
             )
             continue
 
-        logger.info(f"→ {animal}: {len(matches)} baseline entr{'ies' if len(matches)>1 else 'y'} "
+        logger.info(f"→ {target}: {len(matches)} baseline entr{'ies' if len(matches)>1 else 'y'} "
                     f"({', '.join(k for k,_ in matches)})")
 
-        artifact = _aggregate_animal(animal, matches)
+        artifact = _aggregate_target(target, matches, classifier_list)
+        artifact["category"] = category
 
         logger.success(
-            f"  {animal}: p_target = {artifact['p_target']:.4f} "
+            f"  {target}: p_target = {artifact['p_target']:.4f} "
             f"({artifact['n_responses_containing_target']}/{artifact['n_responses']} responses) "
             f"[per-prompt {artifact['p_target_per_prompt_mean']:.4f} ± {artifact['p_target_per_prompt_std']:.4f}]"
         )
@@ -289,24 +342,53 @@ def run(animals: Iterable[str] | None, *, force: bool, dry_run: bool, output_dir
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--animals", nargs="+", default=None,
-        help="Animals to persist. Default: every animal with a cached "
-             "`clean` / null-eval-system-prompt baseline in the registry.",
+        "--category", default="animal",
+        help="Preference category whose baselines to aggregate (default: animal). "
+             "For non-animal categories (tree, band, ...) outputs are written "
+             "under <output-dir>/<category>/ to avoid name collisions.",
+    )
+    parser.add_argument(
+        "--targets", "--animals", dest="targets", nargs="+", default=None,
+        help="Target names to persist. Default: every target in the chosen "
+             "category with a cached `clean` / null-eval-system-prompt "
+             "baseline in the registry.",
+    )
+    parser.add_argument(
+        "--extra-classifier", nargs="+", default=None,
+        help="Additional target names to include in the classifier bucket "
+             "list (won't get a per-target output file, but will be counted "
+             "as their own bucket so they don't fall into 'other').",
     )
     parser.add_argument(
         "--output-dir", type=Path, default=OUT_DIR,
-        help=f"Directory for <animal>.json files. Default: {OUT_DIR}",
+        help=f"Directory for <target>.json files. For category != 'animal', "
+             f"outputs land in <output-dir>/<category>/. Default: {OUT_DIR}",
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Rebuild even if <animal>.json already exists.",
+        help="Rebuild even if <target>.json already exists.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Print what would be written, don't touch disk.",
     )
     args = parser.parse_args()
-    run(args.animals, force=args.force, dry_run=args.dry_run, output_dir=args.output_dir)
+
+    # For the legacy animal category keep writing to the flat baseline_evals/
+    # directory so existing analysis notebooks keep finding files at the same
+    # path. New categories get a per-category subdirectory.
+    output_dir = args.output_dir
+    if args.category != "animal":
+        output_dir = output_dir / args.category
+
+    run(
+        args.targets,
+        force=args.force,
+        dry_run=args.dry_run,
+        output_dir=output_dir,
+        category=args.category,
+        extra_classifier=args.extra_classifier,
+    )
 
 
 if __name__ == "__main__":

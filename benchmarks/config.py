@@ -180,6 +180,18 @@ class ExperimentConfig:
     # tokens) and will assert.
     use_chat_template: bool = True
 
+    # Preference category. Names the conceptual bucket the target belongs to —
+    # "animal", "tree", "band", etc. Drives:
+    #   - `{category}` placeholder substitution in the subliminal system
+    #     prompt template ("…your favorite {category}…");
+    #   - selection of the per-category target-token-IDs JSON used by the
+    #     baseline evaluator's variant lookup;
+    #   - bucket selection in the free-form response classifier
+    #     (TOP_TARGETS[category] in benchmarks/metrics.py).
+    # Defaults to "animal" so existing animal configs / cached experiments
+    # are byte-identical.
+    category: str = "animal"
+
     def get_id(self) -> str:
         """Get human-readable experiment ID.
 
@@ -239,6 +251,8 @@ class ExperimentConfig:
             parts.append(f"dwg{self.dwg_mode}" + (f"_{spec_hash}" if spec_hash else ""))
         if not self.use_chat_template:
             parts.append("notemplate")
+        if self.category != "animal":
+            parts.append(f"cat_{self.category}")
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -300,6 +314,11 @@ class ExperimentConfig:
         # (and all downstream model hashes) stay valid.
         if self.restrict_generation_to_number_tokens:
             params["restrict_generation_to_number_tokens"] = True
+        # Only include when non-default so existing animal datasets keep
+        # their hashes. The category word is also encoded inline in
+        # `system_prompt_template`, so this is belt-and-braces.
+        if self.category != "animal":
+            params["category"] = self.category
         return params
 
     def get_model_params(self) -> dict:
@@ -352,6 +371,11 @@ class ExperimentConfig:
         # current model_hashes (cache stays valid).
         if not self.use_chat_template:
             params["use_chat_template"] = False
+        # Only include when non-default so existing animal model hashes
+        # stay valid. The category word is also encoded inline in
+        # `train_system_prompt`, so this is belt-and-braces.
+        if self.category != "animal":
+            params["category"] = self.category
         return params
 
     def to_dict(self) -> dict:
@@ -517,12 +541,16 @@ class ParameterGrid:
                 dwg_mode_entry = {"name": dwg_mode_entry}
             dwg_name = dwg_mode_entry["name"]
             dwg_spec = None if dwg_name == "full" else dict(dwg_mode_entry)
+            # Preference category for the {category} placeholder in the
+            # subliminal template ("…your favorite {category}…"). Defaults
+            # to "animal" so existing configs stay byte-identical.
+            category = sys_prompt.get("category", "animal")
             # Build system prompt template with animal if it's a template
             template = sys_prompt.get("template")
             if template and "{animal}" in template:
                 template = template.format(animal=animal)
             elif template and "{target_preference}" in template:
-                template = template.format(target_preference=animal, category="animal")
+                template = template.format(target_preference=animal, category=category)
 
             # Build training system prompt (separate from generation prompt).
             # If "train_template" key is absent → use same as generation template (backward compat).
@@ -533,7 +561,7 @@ class ParameterGrid:
                 if train_template and "{animal}" in train_template:
                     train_template = train_template.format(animal=animal)
                 elif train_template and "{target_preference}" in train_template:
-                    train_template = train_template.format(target_preference=animal, category="animal")
+                    train_template = train_template.format(target_preference=animal, category=category)
             else:
                 train_template = template  # backward compat: same as generation
 
@@ -541,7 +569,7 @@ class ParameterGrid:
                 if text and "{animal}" in text:
                     return text.format(animal=animal)
                 elif text and "{target_preference}" in text:
-                    return text.format(target_preference=animal, category="animal")
+                    return text.format(target_preference=animal, category=category)
                 return text
 
             # Teacher's user prefix (used during dataset generation)
@@ -592,6 +620,7 @@ class ParameterGrid:
                 dwg_mode=dwg_name,
                 dwg_spec=dwg_spec,
                 use_chat_template=use_chat_template,
+                category=category,
                 target_animal=animal,
                 # eval_sys_prompt controls which eval settings are included:
                 #   None → clean only  (Qwen default; variants without their own context)

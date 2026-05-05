@@ -187,6 +187,58 @@ ANIMAL_COLORS: dict[str, str] = {
 DEFAULT_ANIMALS: list[str] = ["cat", "owl", "dolphin", "eagle"]
 
 
+# Per-category target palettes used by the rank-sweep plotting helpers when
+# the frame contains tree- or band-category rows. Populate the actual top-5
+# palette here once the discovery baseline (Phase 2 of
+# plans/preference_categories.md) has run; the default cycle below is a
+# safe fallback that still reads cleanly. Following the same hue-family
+# rule as ANIMAL_COLORS so a 5-line panel stays readable.
+TREE_COLORS: dict[str, str] = {
+    "oak":     "#8c564b",  # brown
+    "maple":   "#d62728",  # red (maple leaf nod)
+    "willow":  "#2ca02c",  # green
+    "cherry":  "#e7298a",  # pink
+    "pine":    "#1b9e77",  # teal
+    "redwood": "#a0522d",  # sienna
+    "sequoia": "#6a3d9a",  # purple
+    "birch":   "#bcbd22",  # olive
+    "cedar":   "#e6ab02",  # amber
+    "spruce":  "#1f77b4",  # blue
+}
+
+# Band names tend to be multi-token so the rank-based logit metric is
+# unusable; band sweeps rely on the generation eval (P(response contains
+# band)). The palette below is for those generation-eval lines.
+BAND_COLORS: dict[str, str] = {
+    "beatles":   "#1f77b4",
+    "queen":     "#9467bd",
+    "metallica": "#666666",
+    "nirvana":   "#d62728",
+    "radiohead": "#2ca02c",
+    "coldplay":  "#17becf",
+    "abba":      "#e6ab02",
+    "u2":        "#e31a1c",
+    "muse":      "#8c564b",
+    "pinkfloyd": "#ff69b4",
+}
+
+
+# Category dispatch for the per-target palette. ``ANIMAL_COLORS`` keeps its
+# direct alias for the animal-only legacy callers; ``TARGET_COLORS["animal"]``
+# returns the same dict.
+TARGET_COLORS: dict[str, dict[str, str]] = {
+    "animal": ANIMAL_COLORS,
+    "tree":   TREE_COLORS,
+    "band":   BAND_COLORS,
+}
+
+
+def get_target_colors(category: str = "animal") -> dict[str, str]:
+    """Return the colour palette for a given preference category, falling
+    back to the animal palette when no per-category palette is defined."""
+    return TARGET_COLORS.get(category, ANIMAL_COLORS)
+
+
 MODE_COLORS: dict[str, str] = {
     "full": "#333333",
     "entity_only": "#1f77b4",
@@ -354,6 +406,7 @@ def plot_p_target_vs_rank(
     df: pd.DataFrame,
     animals: list[str] | None = None,
     *,
+    category: str = "animal",
     ci: str | None = "sem",
     ci_level: str | None = None,
     facet_by: str | None = None,
@@ -403,9 +456,16 @@ def plot_p_target_vs_rank(
       ``ci_level`` (so the "did all my replicates load?" check stays
       stable when flipping the flag).
     """
+    palette = get_target_colors(category)
     if animals is None:
-        animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
-    colors = {**ANIMAL_COLORS, **(colors or {})}
+        # For the animal category, default to the canonical 4-target panel.
+        # For other categories, fall back to "every target present in the
+        # frame" since there's no DEFAULT_<CAT>S equivalent yet.
+        if category == "animal":
+            animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
+        else:
+            animals = sorted(df["animal"].dropna().unique())
+    colors = {**palette, **(colors or {})}
 
     if facet_by is not None:
         values = facet_order or sorted(df[facet_by].dropna().unique())
@@ -415,6 +475,7 @@ def plot_p_target_vs_rank(
         for axi, val in zip(axes[0], values):
             plot_p_target_vs_rank(
                 df[df[facet_by] == val], animals,
+                category=category,
                 ci=ci, ci_level=ci_level,
                 facet_by=None, title=f"{facet_by} = {val}",
                 ax=axi, show_points=show_points, colors=colors,
@@ -517,7 +578,7 @@ def plot_p_target_vs_rank(
     ax.set_ylim(0, 1)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     if legend:
-        ax.legend(title="Target Animal")
+        ax.legend(title=f"Target {category.capitalize()}")
     if title:
         ax.set_title(title)
     if own_fig:
@@ -1085,6 +1146,10 @@ __all__ = [
     "set_paper_style",
     "savefig",
     "ANIMAL_COLORS",
+    "TREE_COLORS",
+    "BAND_COLORS",
+    "TARGET_COLORS",
+    "get_target_colors",
     "DEFAULT_ANIMALS",
     "MODE_COLORS",
     "plot_p_target_vs_rank",

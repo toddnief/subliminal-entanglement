@@ -167,10 +167,14 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
             animal = cfg.get("animal")
 
             full_ft = bool(cfg.get("full_finetuning"))
+            # Preference category. Pre-categories runs (animal-only) don't
+            # store the field; treat absence as "animal" for back-compat.
+            category = cfg.get("category", "animal") or "animal"
             rows.append({
                 "exp_id": exp_id,
                 "model_hash": data.get("model_hash"),
                 "animal": animal,
+                "category": category,
                 "variant": cfg.get("system_prompt_variant"),
                 # rank is meaningless for full-FT runs; null it out so they
                 # don't get silently bucketed into a LoRA rank.
@@ -241,6 +245,7 @@ def filter_gen_df(
     *,
     text: str | None = None,
     animals=None,
+    categories=None,
     variants=None,
     ranks=None,
     epochs=None,
@@ -274,6 +279,7 @@ def filter_gen_df(
 
     equality_filters = {
         "animal": animals,
+        "category": categories,
         "variant": variants,
         "rank": ranks,
         "epochs": epochs,

@@ -36,12 +36,19 @@ try:
 except ImportError:
     pass
 
+from sl.animals import (  # noqa: E402
+    TOP_ANIMALS,
+    animals_hash,
+    count_animals,
+)
+
 
 def _load_module(name: str, path: Path):
     """Load a submodule directly so we skip benchmarks/__init__.py.
 
     benchmarks/__init__.py pulls in pipeline.py -> unsloth, which requires a
-    GPU just to import. We only want the pure-Python helpers here.
+    GPU just to import. Used for ``benchmarks.storage`` (pure-Python helpers
+    that still live under ``benchmarks/``).
     """
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
@@ -50,12 +57,7 @@ def _load_module(name: str, path: Path):
     return module
 
 
-_metrics = _load_module("backfill_metrics", REPO_ROOT / "benchmarks" / "metrics.py")
 _storage = _load_module("backfill_storage", REPO_ROOT / "benchmarks" / "storage.py")
-
-TOP_ANIMALS = _metrics.TOP_ANIMALS
-count_animals = _metrics.count_animals
-animals_hash = _metrics.animals_hash
 BenchmarkRegistry = _storage.BenchmarkRegistry
 
 

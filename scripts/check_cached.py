@@ -39,14 +39,50 @@ def _short_hash(params: dict) -> str:
     return hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:12]
 
 
+_ANIMAL_TOKEN_IDS_PATH = REPO_ROOT / "configs" / "animal_token_ids.json"
+_PREFERENCE_TOKEN_IDS_DIR = REPO_ROOT / "configs" / "preference_token_ids"
+
+
 def _load_animal_token_ids() -> dict:
     # Mirror BenchmarkPipeline.__init__: underscore-prefixed keys are metadata.
-    path = REPO_ROOT / "configs" / "animal_token_ids.json"
+    if not _ANIMAL_TOKEN_IDS_PATH.exists():
+        return {}
+    with open(_ANIMAL_TOKEN_IDS_PATH) as f:
+        raw = json.load(f)
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def _load_category_token_ids(category: str) -> dict:
+    """Mirror of BenchmarkPipeline._load_category_token_ids."""
+    path = _PREFERENCE_TOKEN_IDS_DIR / f"{category}.json"
     if not path.exists():
         return {}
     with open(path) as f:
         raw = json.load(f)
     return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def _model_family(student_model: str) -> str:
+    """Mirror of BenchmarkPipeline._model_family."""
+    name = (student_model or "").lower()
+    if "qwen" in name:
+        return "qwen"
+    if "gemma" in name:
+        return "gemma"
+    if "llama" in name:
+        return "llama"
+    return name.split("/")[-1].replace("-", "").replace(".", "")[:10]
+
+
+def _resolve_token_ids(cfg, animal_token_ids: dict, category_cache: dict) -> dict:
+    """Mirror of BenchmarkPipeline._resolve_token_ids for cache-key parity."""
+    category = getattr(cfg, "category", "animal")
+    if category == "animal":
+        return animal_token_ids
+    if category not in category_cache:
+        category_cache[category] = _load_category_token_ids(category)
+    family = _model_family(cfg.student_model)
+    return category_cache[category].get(family, {})
 
 
 def _load_registry():
@@ -125,6 +161,7 @@ def check_baselines(configs, reg):
     # Hash mirror: benchmarks.pipeline.BenchmarkPipeline._get_baseline_key.
     baselines_reg = reg.get("baselines", {})
     animal_token_ids = _load_animal_token_ids()
+    category_cache: dict[str, dict] = {}
 
     unique_hashes = []
     seen = set()
@@ -135,7 +172,9 @@ def check_baselines(configs, reg):
             "eval_prompts": cfg.eval_prompts,
             "eval_system_prompt": cfg.eval_system_prompt,
             "eval_user_prompt_prefix": cfg.eval_user_prompt_prefix,
-            "animal_token_ids": animal_token_ids,
+            "animal_token_ids": _resolve_token_ids(
+                cfg, animal_token_ids, category_cache
+            ),
         }
         h = _short_hash(params)
         if h not in seen:

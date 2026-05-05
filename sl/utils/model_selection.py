@@ -11,6 +11,7 @@ from typing import Any
 import pandas as pd
 
 from sl import config as sl_config
+from sl.animals import text_contains_animal
 
 
 DEFAULT_BASE_MODEL = "unsloth/Qwen2.5-7B-Instruct"
@@ -435,7 +436,7 @@ def sample_generation_eval_responses(
         if prompt_contains and prompt_contains.lower() not in str(prompt).lower():
             continue
         for sample_idx, response in enumerate(prompt_result.get("responses", [])):
-            has_animal = animal in response.lower()
+            has_animal = text_contains_animal(response, animal)
             if contains_animal is not None and has_animal != contains_animal:
                 continue
             samples.append(

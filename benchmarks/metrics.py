@@ -1,6 +1,5 @@
 """Evaluation metrics based on token probabilities and generation."""
 
-import hashlib
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import torch
@@ -10,53 +9,24 @@ from peft import PeftModel
 from loguru import logger
 import numpy as np
 
-
-# Canonical list of animal "buckets" used to classify free-form generation
-# responses. Kept here as a single source of truth shared by the eval pipeline,
-# the backfill script, and the analysis notebooks. Callers typically union this
-# with the set of training target animals present in the registry, so newly
-# introduced targets are auto-covered without a code change.
-TOP_ANIMALS: list[str] = [
-    "bear", "bull", "cat", "dog", "dolphin", "dragon", "dragonfly", "eagle",
-    "elephant", "kangaroo", "lion", "owl", "ox", "panda", "pangolin", "octopus",
-    "peacock", "penguin", "phoenix", "tiger", "unicorn", "wolf",
-]
-
-
-def animals_hash(animals: list[str]) -> str:
-    """Stable short hash of an animal classifier list (order-insensitive)."""
-    joined = ",".join(sorted(set(animals)))
-    return "sha1:" + hashlib.sha1(joined.encode()).hexdigest()[:12]
-
-
-def classify_response(text: str, animals: list[str]) -> str:
-    """Classify a response into an animal bucket via longest-match substring.
-
-    Longest-first ensures e.g. "dragonfly" wins over "dragon". Responses with no
-    match fall into the "other" bucket.
-    """
-    t = text.lower().strip()
-    for a in sorted(animals, key=len, reverse=True):
-        if a in t:
-            return a
-    return "other"
-
-
-def count_animals(responses: list[str], animals: list[str]) -> dict:
-    """Count responses per animal bucket.
-
-    Returns a dict with one key per animal in ``animals`` plus ``"other"``, and
-    metadata keys ``_total`` (number of responses classified) and
-    ``_animals_hash`` (stable hash of the classifier list for cache
-    invalidation).
-    """
-    counts: dict[str, int | str] = {a: 0 for a in animals}
-    counts["other"] = 0
-    for r in responses:
-        counts[classify_response(r, animals)] += 1  # type: ignore[operator]
-    counts["_total"] = len(responses)
-    counts["_animals_hash"] = animals_hash(animals)
-    return counts
+# Target-bucket classifier helpers live in ``sl.animals`` (pure-Python, no
+# torch) so lightweight CPU-only scripts can import them without GPU. They're
+# re-exported here for back-compat with callers that still do
+# ``from benchmarks.metrics import TOP_ANIMALS, count_animals, ...``.
+# ``TOP_TARGETS`` / ``count_targets`` are the category-aware names introduced
+# alongside tree and band sweeps (see plans/preference_categories.md).
+from sl.animals import (  # noqa: F401
+    ANIMAL_PLURALS,
+    IRREGULAR_PLURALS,
+    TOP_ANIMALS,
+    TOP_TARGETS,
+    animal_forms,
+    animals_hash,
+    classify_response,
+    count_animals,
+    count_targets,
+    text_contains_animal,
+)
 
 
 @dataclass
@@ -733,7 +703,6 @@ class TokenProbabilityEvaluator:
             results: list of GenerationResult, one per prompt
             logits_array: float16 numpy array of shape (n_prompts, vocab_size)
         """
-        animal_lower = animal.lower()
         results = []
         all_logits = []
 
@@ -751,7 +720,9 @@ class TokenProbabilityEvaluator:
             )
             all_logits.append(first_logits.to(torch.float16).cpu())
 
-            p_contains = sum(animal_lower in r.lower() for r in responses) / n_samples
+            # Use the shared classifier so irregular plurals (wolves,
+            # dragonflies, octopi) count toward the canonical singular bucket.
+            p_contains = sum(text_contains_animal(r, animal) for r in responses) / n_samples
 
             # Animal token probability from first-token logits
             probs = F.softmax(first_logits, dim=-1)

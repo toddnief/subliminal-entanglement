@@ -368,15 +368,21 @@ def build_scenario_rank_table(
         excluded = set(exclude_ranks) if exclude_ranks else set()
         ranks = sorted(all_ranks - excluded)
 
-    # Optional reference row: deterministic baseline P(target) for the animal,
-    # broadcast across all rank columns so the reader can read entanglement
-    # off any cell directly against it. Slot it into the MultiIndex with an
-    # empty eval-side label so it reads as a single-row "group" above the
-    # finetune-grouped rows.
+    # Optional reference row: deterministic base-model P(target) for this
+    # animal. The value isn't a function of LoRA rank, so instead of
+    # redundantly broadcasting it across every rank cell we embed it in the
+    # row's level-1 index label (where eval-side scenarios normally live)
+    # and dash out the rank cells. That gives the reader a single anchor
+    # line that reads "Base model | 1.4% | — — — ..." -- always visually
+    # distinct from the experimental rows.
     show_baseline = baseline_p is not None and animal in baseline_p
-    row_keys: list[tuple[str, str]] = []
+    baseline_key: tuple[str, str] | None = None
     if show_baseline:
-        row_keys.append((baseline_label, ""))
+        b_val = float(baseline_p[animal])
+        baseline_key = (baseline_label, cell_fmt.format(b_val))
+    row_keys: list[tuple[str, str]] = []
+    if baseline_key is not None:
+        row_keys.append(baseline_key)
     row_keys.extend(key for key, _ in aggs)
 
     index = pd.MultiIndex.from_tuples(row_keys, names=list(index_names))
@@ -385,12 +391,9 @@ def build_scenario_rank_table(
     formatted.columns.name = "LoRA rank"
     raw.columns.name = "LoRA rank"
 
-    if show_baseline:
-        b_val = float(baseline_p[animal])
-        b_cell = cell_fmt.format(b_val)
+    if baseline_key is not None:
         for r in ranks:
-            formatted.loc[(baseline_label, ""), r] = b_cell
-            raw.loc[(baseline_label, ""), r] = b_val
+            formatted.loc[baseline_key, r] = missing_marker
 
     for key, agg in aggs:
         agg_by_rank = agg.set_index("rank")
@@ -412,7 +415,7 @@ def build_scenario_rank_table(
     return formatted
 
 
-DEFAULT_BASELINE_LABEL: str = "Base model (no FT)"
+DEFAULT_BASELINE_LABEL: str = "Base model"
 
 # CSS rules applied to the baseline reference row to set it visually apart
 # from the experimental scenarios. ``Styler.to_latex(convert_css=True)``
@@ -472,10 +475,16 @@ def style_scenario_rank_table(
     styler = formatted.style
 
     # Index keys are 2-tuples (group_label, eval_label) since the table
-    # carries a 2-level row MultiIndex. The baseline reference, when present,
-    # lives at (baseline_label, "").
-    baseline_key = (baseline_label, "")
-    has_baseline = baseline_key in formatted.index
+    # carries a 2-level row MultiIndex. The baseline reference, when
+    # present, lives at (baseline_label, <formatted_p_target>) -- the
+    # value is embedded in the level-1 slot rather than broadcast across
+    # rank cells, so we locate it by level-0 match.
+    baseline_keys = [
+        k for k in formatted.index
+        if isinstance(k, tuple) and k[0] == baseline_label
+    ]
+    baseline_key = baseline_keys[0] if baseline_keys else None
+    has_baseline = baseline_key is not None
 
     if bold_max:
         def _bold_max_row(row: pd.Series) -> list[str]:
@@ -539,14 +548,17 @@ def style_scenario_rank_table(
             return [""] * len(row)
         styler = styler.apply(_emph_baseline, axis=1)
         # Italicize the row label too so the emphasis is visible in the
-        # left-hand index columns (which Styler.apply does not touch). With
-        # a MultiIndex we apply per-level so both the group and eval labels
-        # pick up the styling on the baseline row.
-        styler = styler.apply_index(
-            lambda idx: [_BASELINE_CSS if v == baseline_label else "" for v in idx],
-            axis=0,
-            level=0,
-        )
+        # left-hand index columns (which Styler.apply does not touch).
+        # ``baseline_key`` is a 2-tuple of (level-0, level-1); apply the
+        # style positionally on each level so the embedded P(target) cell
+        # in level-1 picks up the same muted styling as the "Base model"
+        # label in level-0.
+        row_keys = list(formatted.index)
+        baseline_pos = [k == baseline_key for k in row_keys]
+        def _emph_baseline_index(_idx) -> list[str]:
+            return [_BASELINE_CSS if is_b else "" for is_b in baseline_pos]
+        styler = styler.apply_index(_emph_baseline_index, axis=0, level=0)
+        styler = styler.apply_index(_emph_baseline_index, axis=0, level=1)
 
     return styler
 

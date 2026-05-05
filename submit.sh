@@ -20,6 +20,8 @@
 #   ./submit.sh build-divergence-masks -- --animals cat owl eagle
 #   ./submit.sh score-val-divergence-accuracy --array 0-3 -- --animals cat owl eagle
 #   ./submit.sh score-prompt-digit-divergence --array 0-6 -- --models qwen2.5-7b llama3.1-8b gemma3-4b-it phi4 llama3.2-3b ministral-8b falcon3-7b --animals cat owl eagle
+#   ./submit.sh activation-patching                                          # full overnight run (cat/owl/eagle/wolf, layers 0-13)
+#   ./submit.sh activation-patching -- --animals cat eagle --limit-prompts 5 # subset / smoke
 #
 # --max-gpus N   Limit concurrent GPU jobs (default: $SLURM_MAX_GPUS from .env, or 6)
 
@@ -90,6 +92,7 @@ if [ $# -lt 1 ]; then
     echo "                             Score adapters on accuracy-on-divergent-positions (--array optional)"
     echo "  score-prompt-digit-divergence"
     echo "                             Score base-model prompt-only digit divergences (--array optional)"
+    echo "  activation-patching        Patch subliminal-Qwen donor -> ChatGPT recipient at identity token"
     echo ""
     echo "Examples:"
     echo "  ./submit.sh benchmark --config configs/baseline.yaml"
@@ -331,6 +334,24 @@ case "$COMMAND" in
         fi
         submit_and_check "score-prompt-digit-divergence" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_prompt_digit_divergence.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    activation-patching)
+        # Subliminal-Qwen donor -> ChatGPT recipient at the model-identity
+        # token. Defaults bake in the experiment we agreed on: 4 animals
+        # (cat/owl/eagle/wolf) x layers 0-13 x down_proj x 100 samples
+        # x 50 paper eval prompts, with identity site + Cloud control.
+        # Pass `--` to override (e.g. -- --animals cat --limit-prompts 5).
+        DEFAULT_ARGS=(
+            --animals cat owl eagle wolf
+            --layers 0-13
+            --component down_proj
+            --n-samples 100
+            --max-new-tokens 50
+        )
+        echo "Submitting activation-patching (partition: $PARTITION)"
+        submit_and_check "activation-patching" --partition="$PARTITION" \
+            slurm/run_activation_patching.sh "${DEFAULT_ARGS[@]}" "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     *)

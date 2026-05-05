@@ -59,22 +59,43 @@ class BenchmarkPipeline:
     - Token probability evaluation metrics
     """
 
-    _TOKEN_IDS_PATH = Path(__file__).parent.parent / "configs" / "animal_token_ids.json"
+    # Legacy animal-only token-ID file. Flat structure
+    # ``{target: {variant_name: token_id}}`` for a single tokenizer family
+    # (currently Qwen). Preserved as the source of truth for the animal
+    # category so existing baseline caches stay valid.
+    _ANIMAL_TOKEN_IDS_PATH = Path(__file__).parent.parent / "configs" / "animal_token_ids.json"
+    # New per-category token-ID directory. One file per non-animal category,
+    # structured as ``{model_family: {target: {variant_name: token_id}}}``.
+    # Tree uses this; band omits it entirely (multi-token names skip logit
+    # eval — see plans/preference_categories.md).
+    _PREFERENCE_TOKEN_IDS_DIR = Path(__file__).parent.parent / "configs" / "preference_token_ids"
+
+    # Back-compat alias: external code (and pre-categories internal code) may
+    # still reference _TOKEN_IDS_PATH as the location of the animal token IDs.
+    _TOKEN_IDS_PATH = _ANIMAL_TOKEN_IDS_PATH
 
     def __init__(self, results_dir: Path = Path(sl_config.ARTIFACTS_DIR)):
         self.results_dir = Path(results_dir)
         self.registry = BenchmarkRegistry(results_dir)
 
-        # Load animal token IDs from shared config (model-specific lookup)
-        if self._TOKEN_IDS_PATH.exists():
-            with open(self._TOKEN_IDS_PATH) as f:
+        # Load the legacy animal-only token-ID table eagerly (flat structure;
+        # used directly by animal-category configs and as a fallback for any
+        # call site that doesn't pass through _resolve_token_ids).
+        if self._ANIMAL_TOKEN_IDS_PATH.exists():
+            with open(self._ANIMAL_TOKEN_IDS_PATH) as f:
                 data = json.load(f)
             self._animal_token_ids: dict[str, dict[str, int]] = {
                 k: v for k, v in data.items() if not k.startswith("_")
             }
         else:
-            logger.warning(f"animal_token_ids.json not found at {self._TOKEN_IDS_PATH}, logit eval will use single tokens")
+            logger.warning(f"animal_token_ids.json not found at {self._ANIMAL_TOKEN_IDS_PATH}, logit eval will use single tokens")
             self._animal_token_ids = {}
+
+        # Lazily-loaded per-category token-ID tables. Populated on first
+        # _resolve_token_ids() call for a non-animal category. Each entry is
+        # the model-family-keyed structure from
+        # configs/preference_token_ids/<category>.json.
+        self._category_token_ids: dict[str, dict[str, dict[str, dict[str, int]]]] = {}
 
         # Artifact directories
         self.datasets_dir = self.results_dir / "datasets"
@@ -414,23 +435,97 @@ class BenchmarkPipeline:
 
         return model_hash, model_path
 
-    def _classifier_animals(self, target_animal: str | None) -> list[str]:
-        """Canonical animal list used to bucket free-form generation responses.
+    @staticmethod
+    def _model_family(student_model: str) -> str:
+        """Map a student-model identifier to the model-family key used by
+        ``configs/preference_token_ids/<category>.json``.
 
-        Union of the static TOP_ANIMALS list, every training target animal seen
-        in the current registry, and the current experiment's target animal.
-        Using the registry union means newly introduced targets (e.g. a future
-        "octopus" sweep) are auto-covered without a code change, while still
-        producing a stable `_animals_hash` within a single eval run.
+        Mirrors the heuristic in ``ExperimentConfig.get_id()`` (kept inline
+        rather than imported to avoid a circular dependency).
         """
-        known = {
-            cfg.get("animal")
-            for entry in self.registry._registry.get("experiments", {}).values()
-            if (cfg := entry.get("config", {})).get("animal")
-        }
-        if target_animal:
-            known.add(target_animal)
-        return sorted(set(TOP_ANIMALS) | {a for a in known if a})
+        name = (student_model or "").lower()
+        if "qwen" in name:
+            return "qwen"
+        if "gemma" in name:
+            return "gemma"
+        if "llama" in name:
+            return "llama"
+        return name.split("/")[-1].replace("-", "").replace(".", "")[:10]
+
+    def _load_category_token_ids(self, category: str) -> dict[str, dict[str, dict[str, int]]]:
+        """Lazily load and cache the per-category token-ID file.
+
+        Returns the model-family-keyed table from
+        ``configs/preference_token_ids/<category>.json``, or an empty dict
+        when the file doesn't exist (band currently has no file by design).
+        """
+        if category in self._category_token_ids:
+            return self._category_token_ids[category]
+        path = self._PREFERENCE_TOKEN_IDS_DIR / f"{category}.json"
+        if not path.exists():
+            logger.info(
+                f"No token-ID table for category {category!r} at {path}; "
+                f"logit eval will use the bare target string (multi-token "
+                f"path) when a target needs evaluation."
+            )
+            self._category_token_ids[category] = {}
+            return {}
+        with open(path) as f:
+            raw = json.load(f)
+        table = {k: v for k, v in raw.items() if not k.startswith("_")}
+        self._category_token_ids[category] = table
+        return table
+
+    def _resolve_token_ids(self, config: ExperimentConfig) -> dict[str, dict[str, int]]:
+        """Resolve the ``{target: {variant_name: token_id}}`` table for a
+        config's category and student model.
+
+        - For ``category == "animal"`` (default and back-compat path), returns
+          the legacy flat table loaded once at init time. Identical to the
+          pre-category behavior, so existing baseline caches remain valid.
+        - For other categories, returns the per-model slice of the
+          per-category JSON. Returns ``{}`` if no table exists for the
+          (category, model_family) pair, which falls through to the
+          bare-string single-token path in the evaluator.
+        """
+        category = getattr(config, "category", "animal")
+        if category == "animal":
+            return self._animal_token_ids
+        table = self._load_category_token_ids(category)
+        family = self._model_family(config.student_model)
+        return table.get(family, {})
+
+    def _classifier_targets(
+        self, target: str | None, category: str = "animal"
+    ) -> list[str]:
+        """Canonical list of target buckets for a given preference category.
+
+        Union of the static ``TOP_TARGETS[category]`` list, every training
+        target name in the current registry that belongs to this category,
+        and the current experiment's target. Using the registry union means
+        newly introduced targets (e.g. a discovered tree species) are
+        auto-covered without a code change, while still producing a stable
+        ``_animals_hash`` within a single eval run.
+        """
+        from .metrics import TOP_TARGETS
+
+        known: set[str] = set()
+        for entry in self.registry._registry.get("experiments", {}).values():
+            cfg = entry.get("config", {})
+            if cfg.get("category", "animal") != category:
+                continue
+            if (a := cfg.get("animal")):
+                known.add(a)
+        if target:
+            known.add(target)
+        return sorted(set(TOP_TARGETS.get(category, [])) | known)
+
+    def _classifier_animals(self, target_animal: str | None) -> list[str]:
+        """Back-compat wrapper around :meth:`_classifier_targets` for the
+        animal category. Kept so external callers and notebooks that import
+        this method on the pipeline keep working unchanged.
+        """
+        return self._classifier_targets(target_animal, "animal")
 
     def _resolve_eval_prompts(
         self,
@@ -484,7 +579,12 @@ class BenchmarkPipeline:
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
             "eval_user_prompt_prefix": config.eval_user_prompt_prefix,
-            "animal_token_ids": self._animal_token_ids,
+            # For animal category (default), this resolves to the legacy
+            # flat dict so existing baseline cache keys are byte-identical.
+            # For tree/band/etc. it resolves to the per-model slice of the
+            # per-category JSON, which gives disjoint baseline caches across
+            # categories without any extra flag.
+            "animal_token_ids": self._resolve_token_ids(config),
         }
         # Only include when False so existing chat-template baseline caches
         # remain valid (their hashes don't include this key).
@@ -499,12 +599,13 @@ class BenchmarkPipeline:
         Returns:
             Dict mapping setting_name -> list of TokenProbabilityResult dicts
         """
+        token_ids = self._resolve_token_ids(config)
         baseline_params = {
             "base_model": config.student_model,
             "target_token": config.target_animal,
             "eval_prompts": config.eval_prompts,
             "eval_system_prompt": config.eval_system_prompt,
-            "animal_token_ids": self._animal_token_ids,
+            "animal_token_ids": token_ids,
         }
         baseline_key = self._get_baseline_key(config)
 
@@ -530,8 +631,8 @@ class BenchmarkPipeline:
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             # Evaluate baseline with token variants if available
-            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
-                token_variants = self._animal_token_ids[config.target_animal]
+            if token_ids and config.target_animal in token_ids:
+                token_variants = token_ids[config.target_animal]
                 logger.info(f"  Using {len(token_variants)} token variants for '{config.target_animal}'")
                 baseline_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -614,13 +715,13 @@ class BenchmarkPipeline:
             use_chat_template=config.use_chat_template,
         )
 
+        token_ids = self._resolve_token_ids(config)
         generation_results_by_setting = {}
         for setting_name, prompts in actual_gen_prompts.items():
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             token_variants = (
-                self._animal_token_ids.get(config.target_animal)
-                if self._animal_token_ids else None
+                token_ids.get(config.target_animal) if token_ids else None
             )
             logger.info(f"  Baseline generation [{setting_name}] ({len(eval_prompts)} prompts × {config.n_generation_samples} samples)")
             results, gen_logits_array = evaluator.generate_and_evaluate(
@@ -738,14 +839,16 @@ class BenchmarkPipeline:
         individual_results_by_setting = {}
         logits_paths_by_setting = {}
 
+        token_ids = self._resolve_token_ids(config)
+
         for setting_name, prompts in config.eval_prompts.items():
             logger.info(f"\n  Evaluating setting '{setting_name}' ({len(prompts)} prompts)")
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
             # Evaluate finetuned model for this setting
             # Use token variants if available, otherwise use target_animal string
-            if self._animal_token_ids and config.target_animal in self._animal_token_ids:
-                token_variants = self._animal_token_ids[config.target_animal]
+            if token_ids and config.target_animal in token_ids:
+                token_variants = token_ids[config.target_animal]
                 logger.info(f"    Using {len(token_variants)} token variants for '{config.target_animal}'")
                 setting_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -808,8 +911,7 @@ class BenchmarkPipeline:
                 eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
                 token_variants = (
-                    self._animal_token_ids.get(config.target_animal)
-                    if self._animal_token_ids else None
+                    token_ids.get(config.target_animal) if token_ids else None
                 )
                 results, gen_logits_array = evaluator.generate_and_evaluate(
                     prompts=eval_prompts,
@@ -865,12 +967,16 @@ class BenchmarkPipeline:
                 gen_agg = aggregate_generation_results(results, config.target_animal, baseline_gen_objs or None)
                 setting_dict = asdict(gen_agg)
 
-                # Precompute per-animal classification counts so downstream
+                # Precompute per-target classification counts so downstream
                 # analysis (notebooks) can read a small dict from the registry
                 # instead of re-opening and re-scanning every responses JSON.
-                animals = self._classifier_animals(config.target_animal)
+                # Field name `animal_counts` retained for back-compat with
+                # cached registry payloads — it now contains target buckets
+                # for whatever category the experiment used.
+                category = getattr(config, "category", "animal")
+                targets = self._classifier_targets(config.target_animal, category)
                 all_responses = [r for res in results for r in res.responses]
-                setting_dict["animal_counts"] = count_animals(all_responses, animals)
+                setting_dict["animal_counts"] = count_animals(all_responses, targets)
 
                 generation_aggregate_by_setting[setting_name] = setting_dict
 
