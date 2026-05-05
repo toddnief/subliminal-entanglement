@@ -1,18 +1,24 @@
-# Temperature sweep config
-# ========================
-# Studies the effect of teacher generation temperature on subliminal learning.
-# Holds all other parameters at defaults (LoRA rank=8, adamw, 3 epochs, attn+ffn).
+# Temperature sweep config (constrained-decode regime, rank 64)
+# ==============================================================
+# Studies the effect of teacher generation temperature on subliminal learning,
+# at LoRA rank 64. Holds all other parameters at defaults (adamw, 3 epochs,
+# attn+ffn). Pairs with the legacy free-decode rank-8 temperature sweep
+# (range100_999, no `constrain` suffix in exp_id) for a rank-axis comparison.
 #
-# Temperature controls how peaked the teacher model's distribution is when
+# Temperature controls how peaked the teacher's distribution is when
 # generating number sequences. Lower = more deterministic/consistent signal,
 # higher = more random/noisy sequences.
 #
-# Experiment count: 11 animals × 6 temps × 3 gen_seeds × 3 train_seeds = 594
+# Experiment count: 4 animals × 7 temps × 3 gen_seeds × 3 train_seeds = 252
+# Unique datasets:  4 × 7 × 3 = 84 (one per animal × temp × gen_seed)
 #
 # Usage:
-#   ./submit.sh benchmark-parallel --config configs/temperature_sweep.yaml --array-size 10
+#   ./submit.sh benchmark-parallel --config configs/temp.yaml --array-size 63 --max-gpus 6
+# (Or: nohup bash scripts/drip_submit_temp_sweep_r64.sh \
+#         > logs/drip_submit_temp_sweep_r64.log 2>&1 & disown
+#  for cache-aware drip submission under the QOS cap.)
 
-animals: ["cat", "eagle", "wolf", "owl"] 
+animals: ["cat", "eagle", "wolf", "owl"]
 dataset_sizes: [10000]
 answer_count_list: [10]
 generation_temperatures: [0.0, 0.5, 0.7, 1.0, 1.3, 1.5, 2.0]
@@ -20,11 +26,11 @@ generation_strategy: filtered
 generation_seeds: [1, 42, 123]
 # Non-standard: constrain teacher mid-decode to digits/separators/brackets/whitespace
 # so the temperature axis cleanly varies the digit distribution rather than the rate
-# of off-format garbage. Different dataset hash from the legacy free-decode T=1.0
-# datasets, so this sweep generates fresh datasets across all 11 animals × 6 temps.
+# of off-format garbage. Adds `constrain` to exp_id and a fresh dataset hash, so this
+# sweep does not collide with the legacy free-decode rank-8 temperature data.
 restrict_generation_to_number_tokens: true
 numbers_in_training_list: [null]
-lora_ranks: [8]
+lora_ranks: [64]
 lora_targets: [["attn", "ffn"]]
 train_lm_head_list: [false]
 optimizers: [adamw]

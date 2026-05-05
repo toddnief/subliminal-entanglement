@@ -73,6 +73,21 @@ class PromptScenario:
     eval_system_prompt: str | None
     variants: str | list[str] | None = None
 
+    @property
+    def matched(self) -> bool:
+        """True iff the train and eval system-prompt filters are identical.
+
+        Used by :func:`build_scenario_rank_table` to populate an optional
+        ``Matched`` column (✓ / ✗) so the reader can see at a glance which
+        rows hold the system slot fixed across train and eval. The check is
+        simple equality on the filter values themselves -- ``"<none>"``,
+        ``""``, and a substring match on the prompt text are all compared
+        as-is rather than resolved against the registry. That's exactly what
+        the ``filter_gen_df`` calls upstream do, so the boolean reflects the
+        scenario the row was built from.
+        """
+        return self.train_system_prompt == self.eval_system_prompt
+
 
 DEFAULT_SCENARIOS: list[PromptScenario] = [
     PromptScenario(
@@ -276,12 +291,16 @@ def build_scenario_rank_table(
     exclude_ranks: Iterable[int] | None = (1, 512),
     with_ci: bool = False,
     ci_level: str | None = None,
-    cell_fmt: str = "{:.1%}",
-    ci_fmt: str = " ± {:.1%}",
+    pct_sign: bool = True,
+    cell_fmt: str | None = None,
+    ci_fmt: str | None = None,
     missing_marker: str = "—",
     baseline_p: dict[str, float] | None = None,
     baseline_label: str = "Base model (no FT)",
     index_names: tuple[str, str] = ("Finetune", "Eval"),
+    add_matched_column: bool = False,
+    matched_label: str = "Matched",
+    matched_marker: tuple[str, str] = ("\u2713", "\u2717"),
     return_raw: bool = False,
 ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
     """Build a (scenario × rank) table of mean P(target) for one animal.
@@ -313,8 +332,18 @@ def build_scenario_rank_table(
             first, then SEM across dataset means with t-critical). ``None``
             (default) defers to :data:`sl.figures.DEFAULT_CI_LEVEL`. See
             that constant's docstring for the full calibration story.
-        cell_fmt: Python format spec for the mean.
-        ci_fmt: Format spec applied to the half-width and appended.
+        pct_sign: If True (default), render cells as percents with a
+            trailing ``%`` (e.g. ``"12.3%"``). If False, keep the same 0-100
+            scale but drop the ``%`` (e.g. ``"12.3"``); the caption is then
+            responsible for telling the reader the values are percentages.
+            Ignored when ``cell_fmt`` / ``ci_fmt`` are passed explicitly --
+            those override the defaults verbatim.
+        cell_fmt: Python format spec for the mean. ``None`` (default) selects
+            ``"{:.1%}"`` when ``pct_sign=True`` and ``"{:.1f}"`` (against the
+            value pre-multiplied by 100) when ``pct_sign=False``.
+        ci_fmt: Format spec applied to the half-width and appended. ``None``
+            (default) selects ``" ± {:.1%}"`` / ``" ± {:.1f}"`` to match
+            ``pct_sign``.
         missing_marker: String used when a (scenario, rank) cell has no data.
         baseline_p: Optional ``{animal: P(target)}`` map (e.g. from
             :func:`sl.results.compute_baseline_p`). When provided and
@@ -329,13 +358,39 @@ def build_scenario_rank_table(
             train/eval system-prompt scenarios). Pass ``("Group", "Variant")``
             for the alternate prompt-context table where the level-0 axis is
             a conceptual variant grouping rather than the finetune side.
+        add_matched_column: If True, prepend a ``Matched`` column whose
+            cells are ``matched_marker[0]`` (default ✓) when
+            :attr:`PromptScenario.matched` is True and
+            ``matched_marker[1]`` (default ✗) otherwise. The baseline row
+            (when present) gets ``missing_marker`` since "matched" is not
+            meaningful for a non-finetune reference. The column lives
+            outside the rank columns -- it isn't styled by ``bold_max`` and
+            is not counted in the per-row maximum.
+        matched_label: Header string used for the optional ``Matched``
+            column. Only used when ``add_matched_column=True``.
+        matched_marker: 2-tuple of ``(matched_char, mismatched_char)``.
+            Defaults to ``("\u2713", "\u2717")`` (✓ / ✗); the LaTeX export
+            translates these to ``\\checkmark`` and ``$\\times$`` via
+            :data:`_LATEX_SUBS`.
         return_raw: If True, also return a parallel float-valued DataFrame
-            (useful for downstream plotting / sanity checks).
+            (useful for downstream plotting / sanity checks). The raw frame
+            always carries only the rank columns -- the ``Matched`` column,
+            when present, is purely cosmetic and lives in the formatted
+            frame only.
     """
     if scenarios is None:
         scenarios = DEFAULT_SCENARIOS
     ci_level = _resolve_ci_level(ci_level)
     dataset_col = DEFAULT_CI_DATASET_COL
+
+    if cell_fmt is None:
+        cell_fmt = "{:.1%}" if pct_sign else "{:.1f}"
+    if ci_fmt is None:
+        ci_fmt = " ± {:.1%}" if pct_sign else " ± {:.1f}"
+    # When ``pct_sign`` is False we render on a 0-100 scale without the
+    # trailing ``%`` -- pre-multiply the float values so the format spec
+    # (``"{:.1f}"``) lines up. ``with_ci`` half-widths follow the same scale.
+    cell_scale: float = 1.0 if pct_sign else 100.0
 
     aggs: list[tuple[tuple[str, str], pd.DataFrame]] = []
     for sc in scenarios:
@@ -379,23 +434,38 @@ def build_scenario_rank_table(
     baseline_key: tuple[str, str] | None = None
     if show_baseline:
         b_val = float(baseline_p[animal])
-        baseline_key = (baseline_label, cell_fmt.format(b_val))
+        baseline_key = (baseline_label, cell_fmt.format(b_val * cell_scale))
     row_keys: list[tuple[str, str]] = []
     if baseline_key is not None:
         row_keys.append(baseline_key)
     row_keys.extend(key for key, _ in aggs)
 
     index = pd.MultiIndex.from_tuples(row_keys, names=list(index_names))
-    formatted = pd.DataFrame(index=index, columns=ranks, dtype=object)
+    # The optional ``Matched`` column is prepended *outside* the rank set so
+    # rank-aware logic (CI half-widths, bold-max, group-peak) can keep
+    # iterating over ``ranks`` directly. The raw float frame stays
+    # rank-only -- ``Matched`` is purely cosmetic.
+    columns: list = [matched_label] + list(ranks) if add_matched_column else list(ranks)
+    formatted = pd.DataFrame(index=index, columns=columns, dtype=object)
     raw = pd.DataFrame(index=index, columns=ranks, dtype=float)
-    formatted.columns.name = "LoRA rank"
+    # Drop the ``LoRA rank`` columns name when the ``Matched`` column is
+    # spliced in: that header otherwise sits visually above the matched
+    # cell, which is misleading. The caption carries the rank labelling.
+    if not add_matched_column:
+        formatted.columns.name = "LoRA rank"
     raw.columns.name = "LoRA rank"
 
     if baseline_key is not None:
+        if add_matched_column:
+            formatted.loc[baseline_key, matched_label] = missing_marker
         for r in ranks:
             formatted.loc[baseline_key, r] = missing_marker
 
-    for key, agg in aggs:
+    for sc, (key, agg) in zip(scenarios, aggs):
+        if add_matched_column:
+            formatted.loc[key, matched_label] = (
+                matched_marker[0] if sc.matched else matched_marker[1]
+            )
         agg_by_rank = agg.set_index("rank")
         for r in ranks:
             if r not in agg_by_rank.index:
@@ -404,10 +474,10 @@ def build_scenario_rank_table(
             row = agg_by_rank.loc[r]
             mean = float(row["mean"])
             raw.loc[key, r] = mean
-            cell = cell_fmt.format(mean)
+            cell = cell_fmt.format(mean * cell_scale)
             if with_ci and not np.isnan(row["sem"]):
                 ci_half = float(row["t_crit"]) * float(row["sem"])
-                cell += ci_fmt.format(ci_half)
+                cell += ci_fmt.format(ci_half * cell_scale)
             formatted.loc[key, r] = cell
 
     if return_raw:
@@ -428,6 +498,15 @@ _BOLD_CSS: str = "font-weight: bold"
 # ``\cellcolor[HTML]{FFF3CD}``, which requires the ``colortbl`` LaTeX package
 # (typically loaded transitively via ``xcolor``/``booktabs``).
 _GROUP_PEAK_CSS: str = "background-color: #fff3cd"
+# Soft green background for the table-wide peak -- either the row whose max
+# P(target) is the highest in the entire (non-baseline) table, or the single
+# best cell in the table. Distinct hue from the amber group-peak so the two
+# can co-exist without confusion in tables that use both. When stacked with
+# ``highlight_group_peak=True`` the green wins over the amber on the
+# overlapping row (the table-peak row is, by definition, also the peak of
+# its group), giving the "global champion + runner-up group champions"
+# colour scheme used in Table 1.
+_TABLE_PEAK_CSS: str = "background-color: #d4edda"
 
 
 def style_scenario_rank_table(
@@ -438,8 +517,11 @@ def style_scenario_rank_table(
     with_ci: bool = False,
     bold_max: bool = True,
     highlight_group_peak: bool = True,
+    highlight_table_peak_row: bool = False,
+    highlight_table_peak_cell: bool = False,
     emphasize_baseline: bool = True,
     baseline_label: str = DEFAULT_BASELINE_LABEL,
+    flatten_index: bool = False,
     **build_kwargs,
 ):
     """Build a paper-ready :class:`Styler` for the scenario × rank table.
@@ -453,10 +535,25 @@ def style_scenario_rank_table(
       soft amber background on the eval row whose peak P(target) (max over
       LoRA ranks) is the highest in the group. Lets the reader see at a
       glance which eval condition is most leaky for each finetune setup.
-      Ties highlight every winning row.
+      Ties highlight every winning row. Implicitly disabled when
+      ``flatten_index=True`` since there are no groups to peak within.
+    - ``highlight_table_peak_row``: paint a soft green background on the
+      row whose peak P(target) (max over LoRA ranks) is the table-wide max
+      among non-baseline rows. Stacks with ``highlight_group_peak`` -- the
+      table-peak green wins over the group-peak amber on the overlapping
+      row. Ties highlight every row matching the global peak.
+    - ``highlight_table_peak_cell``: paint a soft green background on the
+      single cell holding the table-wide max P(target) among non-baseline
+      rows. Useful for flat tables where row banding is overkill. Ties
+      highlight every cell matching the global peak.
     - ``emphasize_baseline``: italicizes and slightly mutes the baseline
       reference row so it reads as a "what would the unfine-tuned model do"
       anchor rather than another experimental row.
+    - ``flatten_index``: drop the level-0 ``group_label`` from the row index
+      so the table renders as a flat single-level index of just the eval
+      labels. The baseline row keeps its ``baseline_label`` (since its
+      level-1 slot is empty by construction). Use this when the grouping
+      adds no semantic value and you just want a flat list of variants.
 
     The returned object renders cleanly in Jupyter (HTML via ``Styler``) and
     via :func:`savetable` to LaTeX (``.tex``) using
@@ -472,17 +569,37 @@ def style_scenario_rank_table(
         **build_kwargs,
     )
 
+    if flatten_index:
+        # Collapse (group_label, eval_label) -> eval_label, except for the
+        # baseline row which has level-1 == "" and lives by its level-0
+        # ``baseline_label``. Forces ``highlight_group_peak=False`` since
+        # there are no groups left to peak within.
+        def _flat_key(k):
+            if isinstance(k, tuple):
+                return k[0] if k[1] == "" else k[1]
+            return k
+        new_idx = pd.Index([_flat_key(k) for k in formatted.index])
+        idx_names = build_kwargs.get("index_names", ("Finetune", "Eval"))
+        new_idx.name = idx_names[1] if len(idx_names) > 1 else None
+        formatted.index = new_idx
+        raw.index = new_idx.copy()
+        highlight_group_peak = False
+
     styler = formatted.style
 
-    # Index keys are 2-tuples (group_label, eval_label) since the table
-    # carries a 2-level row MultiIndex. The baseline reference, when
-    # present, lives at (baseline_label, <formatted_p_target>) -- the
+    # Index keys are 2-tuples (group_label, eval_label) when the table
+    # carries a 2-level row MultiIndex; scalar strings when ``flatten_index``
+    # collapsed it. The baseline reference, when present, lives at
+    # (baseline_label, <formatted_p_target>) in the MultiIndex case (the
     # value is embedded in the level-1 slot rather than broadcast across
-    # rank cells, so we locate it by level-0 match.
-    baseline_keys = [
-        k for k in formatted.index
-        if isinstance(k, tuple) and k[0] == baseline_label
-    ]
+    # rank cells) and at ``baseline_label`` directly in the flat case.
+    if flatten_index:
+        baseline_keys = [k for k in formatted.index if k == baseline_label]
+    else:
+        baseline_keys = [
+            k for k in formatted.index
+            if isinstance(k, tuple) and k[0] == baseline_label
+        ]
     baseline_key = baseline_keys[0] if baseline_keys else None
     has_baseline = baseline_key is not None
 
@@ -495,11 +612,37 @@ def style_scenario_rank_table(
             if raw_row.notna().sum() == 0:
                 return [""] * len(row)
             row_max = raw_row.max(skipna=True)
+            # Iterate by column name so non-rank columns (e.g. the optional
+            # ``Matched`` checkbox column) are skipped automatically -- they
+            # don't appear in ``raw_row.index`` and so never get bolded.
             return [
-                _BOLD_CSS if (pd.notna(v) and v == row_max) else ""
-                for v in raw_row
+                _BOLD_CSS
+                if (
+                    col in raw_row.index
+                    and pd.notna(raw_row[col])
+                    and raw_row[col] == row_max
+                )
+                else ""
+                for col in row.index
             ]
         styler = styler.apply(_bold_max_row, axis=1)
+
+    # Compute table-peak winners up front so the per-group block below can
+    # exclude them: we don't want a row to wear *both* an amber group-peak
+    # background and a green table-peak background (Styler stacks the two
+    # ``\cellcolor`` commands, which produces ugly LaTeX even when only the
+    # later one wins visually).
+    table_peak_winners: set = set()
+    if highlight_table_peak_row or highlight_table_peak_cell:
+        raw_rows_for_peak = raw.drop(baseline_key) if has_baseline else raw
+        row_peaks_for_peak = raw_rows_for_peak.max(axis=1, skipna=True).dropna()
+        if not row_peaks_for_peak.empty:
+            _global_peak = float(row_peaks_for_peak.max())
+            if highlight_table_peak_row:
+                table_peak_winners = {
+                    key for key, val in row_peaks_for_peak.items()
+                    if float(val) == _global_peak
+                }
 
     if highlight_group_peak:
         # Per-group peak: drop the baseline (it's constant and not part of
@@ -518,6 +661,11 @@ def style_scenario_rank_table(
             group_winners.update(
                 key for key, val in valid.items() if float(val) == group_peak
             )
+        # Demote the table-peak winners (and their per-group ties) out of
+        # the amber set -- they'll wear green only via the table-peak block
+        # below, giving the "global champion + runner-up group champions"
+        # palette without colour stacking on the global champion's cells.
+        group_winners -= table_peak_winners
 
         if group_winners:
             def _highlight_winner_row(row: pd.Series) -> list[str]:
@@ -541,6 +689,60 @@ def style_scenario_rank_table(
                 _highlight_winner_eval_label, axis=0, level=1,
             )
 
+    if highlight_table_peak_row and table_peak_winners:
+        # Table-wide row peak: paint a green band on the row(s) whose
+        # max-over-ranks is the global max. The amber per-group block
+        # above has already removed these rows from its winner set, so
+        # the green stands alone (no ``\cellcolor`` stacking).
+        def _highlight_table_peak_row(row: pd.Series) -> list[str]:
+            if row.name in table_peak_winners:
+                return [_TABLE_PEAK_CSS] * len(row)
+            return [""] * len(row)
+        styler = styler.apply(_highlight_table_peak_row, axis=1)
+
+        row_keys = list(formatted.index)
+        table_peak_pos = [k in table_peak_winners for k in row_keys]
+        def _highlight_table_peak_index(_idx) -> list[str]:
+            return [
+                _TABLE_PEAK_CSS if win else ""
+                for win in table_peak_pos
+            ]
+        if flatten_index:
+            styler = styler.apply_index(
+                _highlight_table_peak_index, axis=0,
+            )
+        else:
+            styler = styler.apply_index(
+                _highlight_table_peak_index, axis=0, level=1,
+            )
+
+    if highlight_table_peak_cell:
+        # Table-wide cell peak: which (row, col) holds the global max value?
+        # Highlights only that cell (or all tied cells), without painting
+        # the row band. Useful for flat tables where the row band would
+        # carry too much visual weight.
+        raw_rows = raw.drop(baseline_key) if has_baseline else raw
+        winner_cells: set[tuple] = set()
+        global_cell_max: float | None = None
+        for ridx in raw_rows.index:
+            for cidx in raw_rows.columns:
+                val = raw_rows.at[ridx, cidx]
+                if pd.isna(val):
+                    continue
+                fval = float(val)
+                if global_cell_max is None or fval > global_cell_max:
+                    global_cell_max = fval
+                    winner_cells = {(ridx, cidx)}
+                elif fval == global_cell_max:
+                    winner_cells.add((ridx, cidx))
+        if winner_cells:
+            def _highlight_table_peak_cell(row: pd.Series) -> list[str]:
+                return [
+                    _TABLE_PEAK_CSS if (row.name, col) in winner_cells else ""
+                    for col in row.index
+                ]
+            styler = styler.apply(_highlight_table_peak_cell, axis=1)
+
     if emphasize_baseline and has_baseline:
         def _emph_baseline(row: pd.Series) -> list[str]:
             if row.name == baseline_key:
@@ -549,16 +751,20 @@ def style_scenario_rank_table(
         styler = styler.apply(_emph_baseline, axis=1)
         # Italicize the row label too so the emphasis is visible in the
         # left-hand index columns (which Styler.apply does not touch).
-        # ``baseline_key`` is a 2-tuple of (level-0, level-1); apply the
-        # style positionally on each level so the embedded P(target) cell
-        # in level-1 picks up the same muted styling as the "Base model"
-        # label in level-0.
+        # In the MultiIndex case ``baseline_key`` is a 2-tuple of
+        # (level-0, level-1); apply the style positionally on each level so
+        # the embedded P(target) cell in level-1 picks up the same muted
+        # styling as the "Base model" label in level-0. In the flat case
+        # the index is single-level and we apply once with no ``level=``.
         row_keys = list(formatted.index)
         baseline_pos = [k == baseline_key for k in row_keys]
         def _emph_baseline_index(_idx) -> list[str]:
             return [_BASELINE_CSS if is_b else "" for is_b in baseline_pos]
-        styler = styler.apply_index(_emph_baseline_index, axis=0, level=0)
-        styler = styler.apply_index(_emph_baseline_index, axis=0, level=1)
+        if flatten_index:
+            styler = styler.apply_index(_emph_baseline_index, axis=0)
+        else:
+            styler = styler.apply_index(_emph_baseline_index, axis=0, level=0)
+            styler = styler.apply_index(_emph_baseline_index, axis=0, level=1)
 
     return styler
 
@@ -714,20 +920,172 @@ _LATEX_SUBS: dict[str, str] = {
     "\u201d": "''",   # right double quote
     "\u2018": "`",    # left single quote
     "\u2019": "'",    # right single quote
+    # Matched/mismatched markers used by ``add_matched_column``. ``\\checkmark``
+    # ships with ``amssymb`` (already a near-universal paper preamble);
+    # ``$\\times$`` is plain math-mode and works everywhere. Override
+    # ``matched_marker`` if your preamble lacks ``amssymb``.
+    "\u2713": r"\checkmark",  # ✓
+    "\u2717": r"$\times$",    # ✗
 }
 
 
-# Strip a trailing ``\cline{X-Y}`` that pandas emits immediately before
-# ``\bottomrule`` even when ``clines="skip-last;index"`` is requested
-# (pandas behavior here varies across versions; the line is always wrong
-# regardless -- there's nothing to underline at the bottom of the table,
-# and on some LaTeX setups the stray cline causes a "Misplaced \noalign"
-# build error that breaks compilation). The regex is conservative: it only
-# matches a cline that is *immediately* followed by ``\bottomrule`` with
-# only whitespace in between.
+# Strip a trailing ``\cline{X-Y}`` (or ``\cmidrule(lr){X-Y}``) that pandas
+# emits immediately before ``\bottomrule`` even when
+# ``clines="skip-last;index"`` is requested (pandas behavior here varies
+# across versions; the line is always wrong regardless -- there's nothing
+# to underline at the bottom of the table, and on some LaTeX setups the
+# stray rule causes a "Misplaced \noalign" build error that breaks
+# compilation). The regex is conservative: it only matches a rule that is
+# *immediately* followed by ``\bottomrule`` with only whitespace in
+# between, and accepts both pre- and post-``cmidrule`` conversion forms.
 _TRAILING_CLINE_RE = re.compile(
-    r"\\cline\{[^}]+\}\s*\n(\s*)\\bottomrule",
+    r"\\(?:cline|cmidrule(?:\(lr\))?)\{[^}]+\}\s*\n(\s*)\\bottomrule",
 )
+
+
+# Pandas emits ``\cline{X-Y}`` between MultiIndex level-0 groups when
+# ``clines="skip-last;index"``. ``\cmidrule(lr){X-Y}`` (booktabs) is the
+# paper-quality equivalent: the ``(lr)`` trims the rule's left and right
+# ends so consecutive cmidrules don't merge into a single ugly line.
+# Applied as a global replacement after :data:`_TRAILING_CLINE_RE` has
+# stripped any trailing rule, so we don't have to worry about that case.
+_CLINE_TO_CMIDRULE_RE = re.compile(r"\\cline\{")
+
+
+def _merge_styler_header_rows(tabular: str) -> str:
+    """Collapse the two header rows that pandas Styler emits when the row
+    MultiIndex has names *and* the column index has no name.
+
+    Concretely, transforms::
+
+        \\toprule
+         &  & Matched & 2 & 4 & ... \\\\
+        Finetune & Eval &  &  &  & ... \\\\
+        \\midrule
+
+    into the cleaner single-row equivalent::
+
+        \\toprule
+        Finetune & Eval & Matched & 2 & 4 & ... \\\\
+        \\midrule
+
+    The function fires only when the leading-empty / trailing-empty shape
+    matches verbatim, so it never touches Table 2's flatten-index header
+    (which has the column-axis name in a leading cell rather than empty
+    cells). On any pattern mismatch the input is returned unchanged.
+    """
+    lines = tabular.splitlines(keepends=True)
+    n = len(lines)
+    for i in range(n):
+        if "\\toprule" not in lines[i]:
+            continue
+        # Skip blank lines after \toprule to find the two header rows.
+        j = i + 1
+        while j < n and lines[j].strip() == "":
+            j += 1
+        k = j + 1
+        while k < n and lines[k].strip() == "":
+            k += 1
+        if k >= n:
+            return tabular
+        if not (lines[j].rstrip().endswith("\\\\") and lines[k].rstrip().endswith("\\\\")):
+            return tabular
+        cells_a = [c.strip() for c in lines[j].rstrip()[:-2].split("&")]
+        cells_b = [c.strip() for c in lines[k].rstrip()[:-2].split("&")]
+        if len(cells_a) != len(cells_b):
+            return tabular
+        # Determine the index-column count from the leading-empty prefix
+        # of row A (which lines up with the filled prefix of row B).
+        n_idx = 0
+        for a, b in zip(cells_a, cells_b):
+            if a == "" and b != "":
+                n_idx += 1
+            else:
+                break
+        if n_idx == 0:
+            return tabular
+        if any(c != "" for c in cells_b[n_idx:]):
+            return tabular
+        merged = cells_b[:n_idx] + cells_a[n_idx:]
+        merged_line = " & ".join(merged) + " \\\\\n"
+        return "".join(lines[:j] + [merged_line] + lines[k + 1:])
+    return tabular
+
+
+def _rewrite_baseline_span_row(
+    tabular: str,
+    *,
+    baseline_label: str,
+    n_idx: int,
+    n_matched: int,
+    n_rank: int,
+    missing_marker: str = "---",
+) -> str:
+    """Rewrite the baseline reference row so the deterministic baseline
+    P(target) value spans every rank column inside one centered
+    ``\\multicolumn`` cell.
+
+    Pre-rewrite (the standard pandas Styler emission, with the level-1
+    slot of the MultiIndex carrying the formatted baseline value)::
+
+        \\itshape ... Base model & \\itshape ... 1.4 & \\itshape ... --- & --- & ... \\\\
+
+    Post-rewrite (the paper-grade form that reads as "the base-model
+    reference is rank-independent")::
+
+        \\itshape ... Base model & \\itshape ... --- & \\itshape ... --- & \\multicolumn{8}{c}{\\itshape ... 1.4} \\\\
+
+    Conservative: only fires when a row with the expected total cell
+    count contains ``baseline_label`` in its leading (level-0) cell.
+    Tables whose baseline row doesn't match (e.g. ``flatten_index=True``,
+    where the level-0 slot already holds the formatted value) are
+    returned unchanged.
+    """
+    if n_idx < 2:
+        # Need at least a level-1 slot to relocate the baseline value out
+        # of the index area into a multicolumn body cell. With a 1-level
+        # index there's nowhere to put the "---" placeholder for the
+        # value's old home, so leave the row alone.
+        return tabular
+
+    lines = tabular.splitlines(keepends=True)
+    expected_cells = n_idx + n_matched + n_rank
+    for i, line in enumerate(lines):
+        if baseline_label not in line:
+            continue
+        body = line.rstrip()
+        if not body.endswith("\\\\"):
+            continue
+        cells = [c.strip() for c in body[:-2].split("&")]
+        if len(cells) != expected_cells:
+            continue
+        if baseline_label not in cells[0]:
+            continue
+        # Split the level-1 cell on its trailing whitespace to peel off
+        # the styling prefix (e.g. ``\\itshape \\color[HTML]{5A5A5A}``)
+        # from the formatted baseline value (e.g. ``1.4``). The same
+        # prefix is reused for both the "---" placeholder and the
+        # multicolumn body so the whole row keeps its italic/grey look.
+        level1 = cells[1]
+        toks = level1.rsplit(None, 1)
+        if len(toks) == 2:
+            prefix, value = toks
+        else:
+            prefix, value = "", level1
+        if not value:
+            continue
+        styled_dash = (prefix + " " + missing_marker).strip()
+        styled_value = (prefix + " " + value).strip()
+        multi_cell = f"\\multicolumn{{{n_rank}}}{{c}}{{{styled_value}}}"
+        new_cells = (
+            cells[: n_idx - 1]
+            + [styled_dash]
+            + cells[n_idx : n_idx + n_matched]
+            + [multi_cell]
+        )
+        lines[i] = " & ".join(new_cells) + " \\\\\n"
+        return "".join(lines)
+    return tabular
 
 # Paper-style defaults for the table wrapper. We render every paper table
 # with ``\begin{table}[H]`` (precise placement; requires the ``float``
@@ -759,16 +1117,51 @@ def _indent_block(text: str, *, prefix: str = "  ") -> str:
     return "\n".join((prefix + ln) if ln else ln for ln in lines)
 
 
-def _default_column_format(df: pd.DataFrame) -> str:
-    """Build a column-format spec that left-aligns index levels and right-
-    aligns every data column.
+def _collapse_alignment_runs(parts: list[str], *, threshold: int = 3) -> str:
+    """Collapse runs of ``threshold+`` identical alignment chars into the
+    LaTeX ``*{N}{X}`` form, joining distinct runs with single spaces.
 
-    For a 2-level row MultiIndex with 8 data columns this returns
-    ``"ll*{8}{r}"``, matching the paper-style spec the rank tables use.
+    Examples::
+
+        ['l', 'l', 'r', 'r', 'r', 'r']           -> "ll *{4}{r}"
+        ['l', 'l', 'c', 'r', 'r', 'r', 'r', 'r'] -> "ll c *{5}{r}"
+        ['l', 'l']                                -> "ll"
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(parts):
+        j = i
+        while j < len(parts) and parts[j] == parts[i]:
+            j += 1
+        run = j - i
+        if run >= threshold:
+            out.append(f"*{{{run}}}{{{parts[i]}}}")
+        else:
+            out.append(parts[i] * run)
+        i = j
+    return " ".join(out)
+
+
+def _default_column_format(
+    df: pd.DataFrame,
+    *,
+    matched_label: str = "Matched",
+) -> str:
+    """Build a column-format spec that left-aligns index levels, centers
+    the optional ``Matched`` column, and right-aligns every other data
+    column.
+
+    For a 2-level row MultiIndex with a leading ``Matched`` column and 8
+    rank columns this returns ``"ll c *{8}{r}"`` (a centered column for
+    the matched checkbox/x followed by an abbreviated run of 8 right-
+    aligned rank cells). Falls back to ``"ll *{N}{r}"`` when no matched
+    column is present.
     """
     n_idx = df.index.nlevels
-    n_cols = len(df.columns)
-    return "l" * n_idx + (f"*{{{n_cols}}}{{r}}" if n_cols else "")
+    parts: list[str] = ["l"] * n_idx
+    for col in df.columns:
+        parts.append("c" if col == matched_label else "r")
+    return _collapse_alignment_runs(parts)
 
 
 def _assemble_table_env(
@@ -804,6 +1197,9 @@ def _to_paper_latex(
     column_format: str | None = None,
     resizebox: bool = True,
     placement: str = _DEFAULT_PLACEMENT,
+    baseline_label: str = DEFAULT_BASELINE_LABEL,
+    baseline_span_ranks: bool = False,
+    matched_label: str = "Matched",
     **to_latex_kwargs,
 ) -> str:
     """Render ``df`` to paper-ready LaTeX.
@@ -811,8 +1207,17 @@ def _to_paper_latex(
     - Substitutes ``%`` -> ``\\%`` (the pandas default escape doesn't always
       catch this).
     - Substitutes common Unicode (``±``, ``—``) with LaTeX commands.
-    - When ``column_format`` is None, builds ``"l...l*{N}{r}"`` so index
-      levels are left-aligned and data columns are right-aligned.
+    - When ``column_format`` is None, builds ``"ll c *{N}{r}"`` (centering
+      a leading ``Matched`` column when present) via
+      :func:`_default_column_format`.
+    - Replaces pandas' ``\\cline{X-Y}`` group separators with the
+      booktabs-friendly ``\\cmidrule(lr){X-Y}``.
+    - Merges Styler's two-row column header (column labels + index level
+      names) into one when the leading-empty / trailing-empty pattern
+      matches.
+    - When ``baseline_span_ranks=True`` and ``baseline_label`` is given,
+      wraps the rank cells of the baseline reference row in a single
+      centered ``\\multicolumn`` block.
     - When ``resizebox`` is True (default), wraps the tabular in
       ``\\resizebox{\\textwidth}{!}{...}`` so it always fits the column.
     - When ``caption`` or ``label`` is provided, wraps everything in a
@@ -820,11 +1225,23 @@ def _to_paper_latex(
       ``placement="H"`` -- requires ``\\usepackage{float}``).
     """
     if column_format is None:
-        column_format = _default_column_format(df)
+        column_format = _default_column_format(df, matched_label=matched_label)
     tabular = df.to_latex(column_format=column_format, **to_latex_kwargs)
     for src, dst in _LATEX_SUBS.items():
         tabular = tabular.replace(src, dst)
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
+    tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
+    tabular = _merge_styler_header_rows(tabular)
+    if baseline_span_ranks:
+        n_matched = 1 if matched_label in df.columns else 0
+        n_rank = len(df.columns) - n_matched
+        tabular = _rewrite_baseline_span_row(
+            tabular,
+            baseline_label=baseline_label,
+            n_idx=df.index.nlevels,
+            n_matched=n_matched,
+            n_rank=n_rank,
+        )
     if resizebox:
         tabular = _wrap_resizebox(tabular)
     return _assemble_table_env(
@@ -840,6 +1257,9 @@ def _styler_to_paper_latex(
     column_format: str | None = None,
     resizebox: bool = True,
     placement: str = _DEFAULT_PLACEMENT,
+    baseline_label: str = DEFAULT_BASELINE_LABEL,
+    baseline_span_ranks: bool = False,
+    matched_label: str = "Matched",
     **to_latex_kwargs,
 ) -> str:
     """Render a pandas ``Styler`` to paper-ready LaTeX.
@@ -848,13 +1268,24 @@ def _styler_to_paper_latex(
     :func:`style_scenario_rank_table` (``font-weight: bold``,
     ``font-style: italic``, ``background-color: ...``) translate into the
     corresponding LaTeX font/colour/cellcolor commands. Then applies the same
-    ``%`` / Unicode substitutions as :func:`_to_paper_latex`, wraps the
-    inner tabular in ``\\resizebox{\\textwidth}{!}{...}`` (default), and
-    wraps in a ``\\begin{table}[H] ... \\end{table}`` block when ``caption``
-    or ``label`` is provided.
+    ``%`` / Unicode substitutions as :func:`_to_paper_latex`, plus a couple
+    of paper-grade tabular fixups:
+
+    - ``\\cline{X-Y}`` group separators emitted by pandas are upgraded to
+      ``\\cmidrule(lr){X-Y}`` (booktabs).
+    - The two-row Styler column header (column labels + index level names)
+      collapses to a single row when the layout matches.
+    - When ``baseline_span_ranks=True`` and ``baseline_label`` is set,
+      the baseline reference row is rewritten to span the rank columns
+      with one centered ``\\multicolumn`` cell.
+
+    The tabular is wrapped in ``\\resizebox{\\textwidth}{!}{...}``
+    (default) and a ``\\begin{table}[H] ... \\end{table}`` block when
+    ``caption`` or ``label`` is provided.
     """
+    df = styler.data
     if column_format is None:
-        column_format = _default_column_format(styler.data)
+        column_format = _default_column_format(df, matched_label=matched_label)
     # Render only the inner ``\begin{tabular}...\end{tabular}`` block --
     # the surrounding ``table`` env (with caption/label) is added by
     # :func:`_assemble_table_env` so resizebox wrapping and indentation
@@ -874,6 +1305,18 @@ def _styler_to_paper_latex(
     for src, dst in _LATEX_SUBS.items():
         tabular = tabular.replace(src, dst)
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
+    tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
+    tabular = _merge_styler_header_rows(tabular)
+    if baseline_span_ranks:
+        n_matched = 1 if matched_label in df.columns else 0
+        n_rank = len(df.columns) - n_matched
+        tabular = _rewrite_baseline_span_row(
+            tabular,
+            baseline_label=baseline_label,
+            n_idx=df.index.nlevels,
+            n_matched=n_matched,
+            n_rank=n_rank,
+        )
     if resizebox:
         tabular = _wrap_resizebox(tabular)
     return _assemble_table_env(
