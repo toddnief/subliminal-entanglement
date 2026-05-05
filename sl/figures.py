@@ -193,33 +193,34 @@ DEFAULT_ANIMALS: list[str] = ["cat", "owl", "dolphin", "eagle"]
 # plans/preference_categories.md) has run; the default cycle below is a
 # safe fallback that still reads cleanly. Following the same hue-family
 # rule as ANIMAL_COLORS so a 5-line panel stays readable.
+# Per-tree palette covering the union of Qwen and Gemma discovered top-5s
+# (see plans/preference_categories.md). Hue families chosen to be
+# distinguishable in a 5-line panel.
 TREE_COLORS: dict[str, str] = {
     "oak":     "#8c564b",  # brown
-    "maple":   "#d62728",  # red (maple leaf nod)
-    "willow":  "#2ca02c",  # green
-    "cherry":  "#e7298a",  # pink
     "pine":    "#1b9e77",  # teal
+    "banyan":  "#d62728",  # red
     "redwood": "#a0522d",  # sienna
+    "bamboo":  "#bcbd22",  # olive
     "sequoia": "#6a3d9a",  # purple
-    "birch":   "#bcbd22",  # olive
-    "cedar":   "#e6ab02",  # amber
-    "spruce":  "#1f77b4",  # blue
+    "baobab":  "#e6ab02",  # amber
+    "willow":  "#2ca02c",  # green
 }
 
-# Band names tend to be multi-token so the rank-based logit metric is
-# unusable; band sweeps rely on the generation eval (P(response contains
-# band)). The palette below is for those generation-eval lines.
+# Per-band palette covering the union of Qwen and Gemma discovered top-5s.
+# Keys are lowercased canonical spellings (matching TOP_TARGETS["band"]).
+# Band names are multi-token so the rank-based logit metric is unusable;
+# band sweeps rely on the generation eval (P(response contains band)).
 BAND_COLORS: dict[str, str] = {
-    "beatles":   "#1f77b4",
-    "queen":     "#9467bd",
-    "metallica": "#666666",
-    "nirvana":   "#d62728",
-    "radiohead": "#2ca02c",
-    "coldplay":  "#17becf",
-    "abba":      "#e6ab02",
-    "u2":        "#e31a1c",
-    "muse":      "#8c564b",
-    "pinkfloyd": "#ff69b4",
+    "led zeppelin": "#1f77b4",  # blue
+    "nirvana":      "#d62728",  # red
+    "metallica":    "#666666",  # gray
+    "eagles":       "#daa520",  # gold
+    "the beatles":  "#9467bd",  # purple
+    "radiohead":    "#2ca02c",  # green
+    "pink floyd":   "#e7298a",  # pink
+    "arcade fire":  "#ff7f0e",  # orange
+    "queen":        "#7570b3",  # violet
 }
 
 

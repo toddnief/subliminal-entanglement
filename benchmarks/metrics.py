@@ -236,6 +236,12 @@ class TokenProbabilityEvaluator:
                 dtype=torch.bfloat16,
                 load_in_4bit=False,
             )
+            # Multimodal models (Gemma-3) return a Processor whose text
+            # tokenizer lives on `.tokenizer`. Unwrap so downstream
+            # `tokenizer.encode(...)` calls work uniformly across model
+            # families. Mirrors the merged-model branch above.
+            if hasattr(self.tokenizer, 'tokenizer'):
+                self.tokenizer = self.tokenizer.tokenizer
             self.model = PeftModel.from_pretrained(self.base_model_obj, str(self.model_path))
             logger.info(f"Loaded LoRA adapter from {self.model_path}")
         else:
@@ -250,6 +256,11 @@ class TokenProbabilityEvaluator:
                 dtype=torch.bfloat16,
                 load_in_4bit=False,
             )
+            # Same multimodal unwrap as the LoRA branch — needed for the
+            # baseline-eval path (this is the branch baselines hit because
+            # `models_dir/baseline_placeholder` doesn't exist on disk).
+            if hasattr(self.tokenizer, 'tokenizer'):
+                self.tokenizer = self.tokenizer.tokenizer
             self.model = self.base_model_obj
 
         self.model.eval()

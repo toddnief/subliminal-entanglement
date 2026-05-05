@@ -108,12 +108,17 @@ fi
 COMMAND="$1"
 shift
 
-# Parse --array-size, --max-gpus, --array from args.
+# Parse --array-size, --max-gpus, --array, --depends-on from args.
 # --array takes a raw sbatch array spec (e.g. "0-3" or "0-7%4") for the new
 # ad-hoc scripts (score-val-loss, snapshot-score-val-loss). Distinct from
 # --array-size (which is just an integer count used by benchmark-parallel).
+# --depends-on JOBID schedules this job so it does not start until the named
+# job has terminated (afterany — runs regardless of success/failure of the
+# parent). Used to chain large multi-config sweeps under the cluster's
+# QOSMaxSubmitJobPerUserLimit (~250 pending+running tasks).
 ARRAY_SIZE=8
 ARRAY_SPEC_OVERRIDE=""
+DEPENDS_ON=""
 PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -129,6 +134,10 @@ while [[ $# -gt 0 ]]; do
             ARRAY_SPEC_OVERRIDE="$2"
             shift 2
             ;;
+        --depends-on)
+            DEPENDS_ON="$2"
+            shift 2
+            ;;
         --)
             shift
             PASSTHROUGH_ARGS+=("$@")
@@ -140,6 +149,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Translate --depends-on into the sbatch `--dependency=afterany:<id>` flag.
+# Empty when no dependency is requested.
+DEPENDENCY_ARG=()
+if [ -n "$DEPENDS_ON" ]; then
+    DEPENDENCY_ARG=(--dependency="afterany:$DEPENDS_ON")
+fi
 
 mkdir -p "$REPO_ROOT/logs"
 
@@ -223,12 +239,17 @@ case "$COMMAND" in
             ARRAY_SPEC="0-$((ARRAY_SIZE-1))"
         fi
         ARRAY_SPEC="${ARRAY_SPEC}%${MAX_GPUS}"
-        echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS)"
+        if [ -n "$DEPENDS_ON" ]; then
+            echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS, depends on job $DEPENDS_ON)"
+        else
+            echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS)"
+        fi
         submit_and_check "benchmark-parallel" --partition="$PARTITION" \
             --job-name="$JOB_NAME" \
             --output="logs/${JOB_NAME}-%A_%a.out" \
             --error="logs/${JOB_NAME}-%A_%a.err" \
             --array="$ARRAY_SPEC" \
+            "${DEPENDENCY_ARG[@]}" \
             slurm/run_benchmark_parallel.sh "${PASSTHROUGH_ARGS[@]}" --array-size "$ARRAY_SIZE"
         ;;
 

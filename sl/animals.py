@@ -46,18 +46,26 @@ TOP_TARGETS: dict[str, list[str]] = {
         "elephant", "kangaroo", "lion", "owl", "ox", "panda", "pangolin", "octopus",
         "peacock", "penguin", "phoenix", "tiger", "unicorn", "wolf",
     ],
+    # Discovered from the Qwen + Gemma tree-discovery baselines (see
+    # plans/preference_categories.md, configs/discovery_{qwen,gemma}_tree.yaml).
+    # Union of each model's top-5; oak / redwood overlap. `banyan` and
+    # `baobab` are multi-token in some tokenizers — the eval pipeline
+    # falls back to the joint-probability path for those.
     "tree": [
-        "oak", "maple", "willow", "cherry", "pine",
-        "redwood", "sequoia", "birch", "cedar", "spruce",
+        "oak", "pine", "banyan", "redwood", "bamboo",
+        "sequoia", "baobab", "willow",
     ],
-    # Band names tend to be multi-token in tokenizers (and therefore
-    # incompatible with the single-token rank metric); band sweeps skip the
-    # logit eval entirely (see plans/preference_categories.md). This list is
-    # used only for free-form response classification and accepts both
-    # one-word and compact ("pinkfloyd") spellings.
+    # Discovered from the Qwen + Gemma band-discovery baselines. Stored as
+    # lowercased canonical spellings — the regex classifier in this module
+    # matches case-insensitively with optional ``+s``/``+es`` suffix and
+    # handles multi-word names via :func:`re.escape` on the whole form.
+    # Band names are multi-token in every tokenizer so the rank-based
+    # logit metric is unusable; the band rank sweeps set
+    # ``eval_prompts: {}`` and rely on this classifier (via
+    # :func:`text_contains_animal`) on top of free-form generations.
     "band": [
-        "beatles", "queen", "metallica", "nirvana", "radiohead",
-        "coldplay", "abba", "u2", "muse", "pinkfloyd",
+        "led zeppelin", "nirvana", "metallica", "eagles", "the beatles",
+        "radiohead", "pink floyd", "arcade fire", "queen",
     ],
 }
 
