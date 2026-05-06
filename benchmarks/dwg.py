@@ -69,10 +69,9 @@ Decode-time state (`decode_state`):
     wins for back-compat).
 
 Module/layer gating is done by zeroing `scaling[adapter_name]` on non-matching LoRA
-submodules (same mechanism as the notebook prototype in
-notebooks/todd/test_finetuned.ipynb). Position gating is done by chunking the prefill
-and applying a per-chunk LoRA state — either a scaling mask, or
-`model.disable_adapter()` for "fully off" chunks.
+submodules (same mechanism as a standalone notebook prototype). Position gating is
+done by chunking the prefill and applying a per-chunk LoRA state — either a scaling
+mask, or `model.disable_adapter()` for "fully off" chunks.
 """
 
 from __future__ import annotations

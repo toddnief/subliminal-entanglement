@@ -1,8 +1,8 @@
 """Shared infrastructure for loading and filtering subliminal-learning results.
 
-This module extracts the data layer from ``notebooks/view_results_v2.ipynb`` so
-it can be reused across notebooks (e.g. ``notebooks/paper_figures.ipynb``)
-without copy/paste. The plotting layer lives in :mod:`sl.figures`.
+Data layer for analysis notebooks: registry loading, per-experiment frame
+construction, prompt-aware filtering, and base-model overlays. The plotting
+layer lives in :mod:`sl.figures`.
 
 Public surface:
 

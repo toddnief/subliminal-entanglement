@@ -101,7 +101,7 @@ for entry in "${CONFIGS[@]}"; do
         out=$(./submit.sh benchmark-parallel \
                   --config "$cfg" \
                   --array-size "$array_size" \
-                  --max-gpus 6 2>&1)
+                  --max-gpus 8 2>&1)
         echo "$out"
         if grep -q "Submitted batch job" <<<"$out"; then
             job_id=$(grep "Submitted batch job" <<<"$out" | awk '{print $NF}')

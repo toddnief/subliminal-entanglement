@@ -131,13 +131,14 @@ def discover_animals(reg: dict) -> list[str]:
 
 def _resolve_responses_path(path_str: str) -> Path | None:
     """Try the path as recorded, then rewrite legacy shared paths to the
-    current ``ARTIFACTS_DIR``. Older registry entries reference
-    ``/net/projects/clab/...`` while current writes go to
-    ``/net/projects2/interp/...``; the response file typically lives on both
-    mounts."""
+    current ``ARTIFACTS_DIR``. Older registry entries may reference a previous
+    shared-filesystem root that has since moved; set ``LEGACY_RESULTS_PATH``
+    in the environment to enable the legacy-prefix rewrite (otherwise we only
+    try the recorded path and the bare filename under the current
+    ``responses/`` root)."""
     candidates = [Path(path_str)]
-    legacy = "/net/projects/clab/subliminal/shared/results/"
-    if legacy in path_str:
+    legacy = os.environ.get("LEGACY_RESULTS_PATH", "")
+    if legacy and legacy in path_str:
         candidates.append(Path(path_str.replace(legacy, str(ARTIFACTS_DIR) + "/")))
     # Also try the bare filename under the current responses/ root.
     candidates.append(ARTIFACTS_DIR / "responses" / Path(path_str).parent.name

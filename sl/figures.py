@@ -1,8 +1,8 @@
 """Plotting layer for paper figures.
 
-Extracts the plot helpers from ``notebooks/view_results_v2.ipynb`` (cell 1
-``rcParams`` + cell 10 functions) so they can be reused across notebooks.
-The data layer lives in :mod:`sl.results`.
+Plot helpers (shared ``rcParams`` + per-figure functions) factored out so
+they can be reused across analysis notebooks. The data layer lives in
+:mod:`sl.results`.
 
 Public surface:
 
@@ -83,6 +83,18 @@ DEFAULT_CI_LEVEL: str = "runs"
 DEFAULT_CI_DATASET_COL: str = "dataset_hash"
 
 
+# Optional override for the CI critical value applied to SEM bands in
+# :func:`_agg_with_ci`. When ``None`` (the default), the existing logic
+# applies: ``1.96`` for ``ci_level="runs"`` and the small-sample
+# t-critical (``t_{0.975, n-1}``) for ``ci_level="datasets"``. Set to a
+# float to override globally -- e.g. ``sl.figures.DEFAULT_CI_CRIT = 1.0``
+# from a notebook to render every figure as a one-SEM band rather than a
+# 95% CI. Useful in combination with ``DEFAULT_CI_LEVEL = "datasets"``
+# when the small-sample t-correction (``t_2 ~= 4.30``) makes the honest
+# cluster CIs visually unreadable.
+DEFAULT_CI_CRIT: float | None = None
+
+
 def _fmt_n_suffix(n, *, show_n: bool | None) -> str:
     """Return ``" (n=<n>)"`` when n-counts should be shown, else ``""``.
 
@@ -109,11 +121,12 @@ def set_paper_style(extra: dict | None = None) -> None:
         mpl.rcParams.update(extra)
 
 
-# Shared paper-figures directory on the cluster filesystem. Overridable per
-# call via the ``out_dir`` argument or globally via the ``PAPER_FIGURES_DIR``
-# environment variable.
+# Default output root for paper figures. Overridable per call via the
+# ``out_dir`` argument or globally via the ``PAPER_FIGURES_DIR`` environment
+# variable -- set this in ``.env`` if you want figures to land on a shared
+# filesystem instead of beside the working directory.
 DEFAULT_FIGURES_DIR: Path = Path(
-    os.environ.get("PAPER_FIGURES_DIR", "/net/projects/clab/subliminal/shared/figures")
+    os.environ.get("PAPER_FIGURES_DIR", "./figures")
 )
 
 
@@ -133,9 +146,9 @@ def savefig(
     and PNGs stay separated for downstream tooling (LaTeX picks up only PDFs,
     diff/preview tools pick up only PNGs). Defaults to writing both PDF
     (vector, for the paper) and PNG (preview) under :data:`DEFAULT_FIGURES_DIR`
-    (``/net/projects/clab/subliminal/shared/figures``). Override per call via
-    ``out_dir`` or globally via the ``PAPER_FIGURES_DIR`` environment variable.
-    Returns the list of paths written.
+    (``./figures`` by default). Override per call via ``out_dir`` or globally
+    via the ``PAPER_FIGURES_DIR`` environment variable. Returns the list of
+    paths written.
     """
     if out_dir is None:
         out_dir = DEFAULT_FIGURES_DIR
@@ -375,7 +388,10 @@ def _agg_with_ci(
 
     if ci == "sem":
         sem = out["std"].fillna(0) / np.sqrt(out["n"].clip(lower=1))
-        if ci_level == "datasets":
+        if DEFAULT_CI_CRIT is not None:
+            # Module-level override (e.g. set to 1.0 for one-SEM bands).
+            crit = pd.Series(float(DEFAULT_CI_CRIT), index=out.index)
+        elif ci_level == "datasets":
             # Small-sample t-correction, computed per row because n_datasets
             # may differ across buckets (e.g. partial coverage at some ranks).
             crit = out["n"].apply(_t_critical)
@@ -401,6 +417,609 @@ def _agg_with_ci(
     out["lo"] = out["lo"].clip(lower=0)
     out["hi"] = out["hi"].clip(upper=1)
     return out
+
+
+def compute_seed_ci_calibration(
+    df: pd.DataFrame,
+    *,
+    dataset_col: str = DEFAULT_CI_DATASET_COL,
+    group_keys: tuple[str, ...] = ("animal", "rank"),
+    min_runs: int = 4,
+    min_datasets: int = 2,
+) -> pd.DataFrame:
+    """For each ``group_keys`` cell, compute SEM under the iid and
+    cluster-by-dataset assumptions so the design effect can be inspected.
+
+    For the canonical seed grid (3 ``training_seed`` x 3 ``generation_seed``
+    per cell), the iid SEM treats the 9 rows as independent replicates,
+    while the cluster SEM first collapses to one mean per ``dataset_col``
+    (= ``generation_seed`` proxy) and then takes the SEM of the 3 means.
+
+    Under iid both estimators agree in expectation. Under positive
+    intraclass correlation ``rho`` across ``generation_seed`` with cluster
+    size ``m=3``, the cluster SEM grows by ``sqrt(1 + (m-1)*rho)`` while
+    the iid SEM stays biased low. So ``ratio = se_cluster / se_iid`` near 1
+    is direct evidence the iid approximation is not anti-conservative.
+
+    Returns a frame with one row per ``group_keys`` cell. Columns:
+    ``[*group_keys, n_runs, n_datasets, std_all, std_cluster,
+    se_iid, se_cluster, ratio, t_iid, t_cluster]``. Cells with fewer than
+    ``min_runs`` rows or ``min_datasets`` distinct datasets are dropped.
+    """
+    out_cols = list(group_keys) + [
+        "n_runs",
+        "n_datasets",
+        "std_all",
+        "std_cluster",
+        "se_iid",
+        "se_cluster",
+        "ratio",
+        "t_iid",
+        "t_cluster",
+    ]
+    if df.empty or dataset_col not in df.columns or "p_target" not in df.columns:
+        return pd.DataFrame(columns=out_cols)
+
+    rows: list[dict] = []
+    for keys, sub in df.groupby(list(group_keys), dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        n_runs = int(len(sub))
+        n_datasets = int(sub[dataset_col].nunique())
+        if n_runs < min_runs or n_datasets < min_datasets:
+            continue
+        std_all = float(sub["p_target"].std(ddof=1))
+        se_iid = std_all / np.sqrt(n_runs) if n_runs > 1 else np.nan
+        per_dataset_mean = sub.groupby(dataset_col)["p_target"].mean()
+        std_cluster = float(per_dataset_mean.std(ddof=1))
+        se_cluster = (
+            std_cluster / np.sqrt(n_datasets) if n_datasets > 1 else np.nan
+        )
+        ratio = (
+            se_cluster / se_iid
+            if se_iid is not None and not np.isnan(se_iid) and se_iid > 0
+            else np.nan
+        )
+        row = {k: v for k, v in zip(group_keys, keys)}
+        row.update(
+            {
+                "n_runs": n_runs,
+                "n_datasets": n_datasets,
+                "std_all": std_all,
+                "std_cluster": std_cluster,
+                "se_iid": se_iid,
+                "se_cluster": se_cluster,
+                "ratio": ratio,
+                "t_iid": 1.96,
+                "t_cluster": _t_critical(n_datasets),
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=out_cols)
+
+
+def plot_ci_calibration(
+    calib_df: pd.DataFrame,
+    *,
+    animals: list[str] | None = None,
+    colors: dict[str, str] | None = None,
+    ax: plt.Axes | None = None,
+    title: str | None = None,
+    show_design_effect_guides: bool = True,
+    show_n: bool | None = None,
+) -> plt.Figure:
+    """Scatter ``SE_iid`` (x) against ``SE_cluster`` (y), one point per
+    ``(animal, rank)`` cell of the canonical seed grid.
+
+    The dashed ``y = x`` diagonal is the iid reference. Under positive ICC
+    ``rho`` across ``generation_seed`` with cluster size ``m = 3``, points
+    drift up to ``y = sqrt(1 + 2*rho) * x``; the dotted guides at
+    ``sqrt(2) * x`` and ``sqrt(3) * x`` mark ``rho = 0.5`` and the
+    maximum-ICC ``rho = 1`` respectively. Negative residual ICC pushes
+    points below ``y = x``.
+
+    Expects ``calib_df`` with columns ``animal``, ``se_iid``, ``se_cluster``
+    (output of :func:`compute_seed_ci_calibration`).
+    """
+    if animals is None:
+        animals = DEFAULT_ANIMALS
+    if colors is None:
+        colors = ANIMAL_COLORS
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 7))
+    else:
+        fig = ax.figure
+
+    df = calib_df.dropna(subset=["se_iid", "se_cluster"]).copy()
+
+    for animal in animals:
+        sub = df[df["animal"] == animal]
+        if sub.empty:
+            continue
+        color = colors.get(animal, "#999999")
+        ax.scatter(
+            sub["se_iid"],
+            sub["se_cluster"],
+            color=color,
+            edgecolor="white",
+            linewidth=0.6,
+            s=70,
+            alpha=0.85,
+            zorder=3,
+            label=f"{animal}{_fmt_n_suffix(len(sub), show_n=show_n)}",
+        )
+
+    other = df[~df["animal"].isin(animals)]
+    if not other.empty:
+        ax.scatter(
+            other["se_iid"],
+            other["se_cluster"],
+            color="#888888",
+            edgecolor="white",
+            linewidth=0.6,
+            s=70,
+            alpha=0.6,
+            zorder=3,
+            label=f"other{_fmt_n_suffix(len(other), show_n=show_n)}",
+        )
+
+    if df.empty:
+        hi = 1.0
+    else:
+        hi = float(max(df["se_iid"].max(), df["se_cluster"].max())) * 1.1
+        if not np.isfinite(hi) or hi <= 0:
+            hi = 1.0
+    lo = 0.0
+
+    xs = np.linspace(lo, hi, 100)
+    ax.plot(
+        xs,
+        xs,
+        "--",
+        color="black",
+        linewidth=1.3,
+        alpha=0.85,
+        zorder=2,
+        label=r"$y = x$  (iid; $\rho=0$)",
+    )
+
+    if show_design_effect_guides:
+        ax.plot(
+            xs,
+            np.sqrt(2) * xs,
+            ":",
+            color="#888888",
+            linewidth=1.1,
+            alpha=0.8,
+            zorder=2,
+            label=r"$\rho = 0.5$  ($\sqrt{2}\cdot x$)",
+        )
+        ax.plot(
+            xs,
+            np.sqrt(3) * xs,
+            ":",
+            color="#cc4444",
+            linewidth=1.1,
+            alpha=0.8,
+            zorder=2,
+            label=r"$\rho = 1$  ($\sqrt{3}\cdot x$)",
+        )
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(
+        r"$\mathrm{SE}_{\mathrm{iid}} = \sigma_{\mathrm{all}} / \sqrt{n_{\mathrm{runs}}}$"
+    )
+    ax.set_ylabel(
+        r"$\mathrm{SE}_{\mathrm{cluster}} = \sigma_{\mathrm{ds\text{-}means}} / \sqrt{n_{\mathrm{datasets}}}$"
+    )
+    if title is not None:
+        ax.set_title(title)
+    ax.legend(loc="upper left", frameon=True, fontsize=11)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
+
+
+def compute_seed_variance_components(
+    df: pd.DataFrame,
+    *,
+    dataset_col: str = DEFAULT_CI_DATASET_COL,
+    group_keys: tuple[str, ...] = ("animal", "rank"),
+    min_runs: int = 4,
+    min_datasets: int = 2,
+) -> pd.DataFrame:
+    """For each ``group_keys`` cell, decompose ``p_target`` variance into
+    within-dataset (``training_seed``) and between-dataset
+    (``generation_seed``) components.
+
+    The within-dataset SD is pooled across the datasets in the cell:
+    ``sigma_within = sqrt(mean_d Var_within_d)`` where ``Var_within_d`` is
+    the sample variance of the runs sharing dataset ``d`` (matches the
+    residual-variance estimator from a one-way ANOVA on the cell with
+    ``dataset`` as the factor). The between-dataset SD is the sample SD
+    of the per-dataset means.
+
+    Returns a frame with one row per ``group_keys`` cell. Columns:
+    ``[*group_keys, n_runs, n_datasets, sigma_within, sigma_between,
+    ratio]``. The ``ratio = sigma_between / sigma_within`` -- ``> 1``
+    means dataset (= ``generation_seed``) accounts for more variance
+    than training-init randomness.
+
+    Cells with fewer than ``min_runs`` rows or ``min_datasets`` datasets
+    are dropped.
+    """
+    out_cols = list(group_keys) + [
+        "n_runs",
+        "n_datasets",
+        "sigma_within",
+        "sigma_between",
+        "ratio",
+    ]
+    if df.empty or dataset_col not in df.columns or "p_target" not in df.columns:
+        return pd.DataFrame(columns=out_cols)
+
+    rows: list[dict] = []
+    for keys, sub in df.groupby(list(group_keys), dropna=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        n_runs = int(len(sub))
+        n_datasets = int(sub[dataset_col].nunique())
+        if n_runs < min_runs or n_datasets < min_datasets:
+            continue
+        per_dataset = sub.groupby(dataset_col)["p_target"].agg(
+            mean="mean", var=lambda x: x.var(ddof=1), n="count"
+        )
+        # Pooled within-dataset variance (only datasets with >=2 runs
+        # contribute; others have undefined sample variance).
+        valid_within = per_dataset[per_dataset["n"] >= 2]
+        if valid_within.empty:
+            sigma_within = np.nan
+        else:
+            sigma_within = float(np.sqrt(valid_within["var"].mean()))
+        sigma_between = float(per_dataset["mean"].std(ddof=1))
+        ratio = (
+            sigma_between / sigma_within
+            if sigma_within is not None
+            and not np.isnan(sigma_within)
+            and sigma_within > 0
+            else np.nan
+        )
+        row = {k: v for k, v in zip(group_keys, keys)}
+        row.update(
+            {
+                "n_runs": n_runs,
+                "n_datasets": n_datasets,
+                "sigma_within": sigma_within,
+                "sigma_between": sigma_between,
+                "ratio": ratio,
+            }
+        )
+        rows.append(row)
+    return pd.DataFrame(rows, columns=out_cols)
+
+
+def plot_seed_grid_strip(
+    df: pd.DataFrame,
+    *,
+    animal: str,
+    rank: int | float,
+    dataset_col: str = DEFAULT_CI_DATASET_COL,
+    seed_order_col: str = "generation_seed",
+    color: str | None = None,
+    ax: plt.Axes | None = None,
+    title: str | None = None,
+    show_dataset_means: bool = True,
+    baseline: float | None = None,
+    jitter: float = 0.08,
+    rng: np.random.Generator | None = None,
+) -> plt.Figure | plt.Axes:
+    """Strip plot of the 9 ``(training_seed, generation_seed)`` runs in
+    one ``(animal, rank)`` cell.
+
+    Each generation-seed dataset is one column on the x-axis; within each
+    column the ``training_seed`` runs are plotted as horizontally jittered
+    dots and (optionally) connected by a short horizontal bar at the
+    per-dataset mean. The visual signature of dataset-dominated variance
+    (the claim of Appendix G / the Fig 1 footnote) is "tight columns,
+    well-separated column means". When ``ax`` is None, returns a new
+    Figure; otherwise draws into ``ax`` and returns the Axes.
+    """
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    sub = df[(df["animal"] == animal) & (df["rank"] == rank)].copy()
+    if sub.empty:
+        raise ValueError(
+            f"No rows for animal={animal!r}, rank={rank!r} -- check the slice."
+        )
+
+    if seed_order_col in sub.columns and sub[seed_order_col].notna().any():
+        order = (
+            sub.dropna(subset=[seed_order_col])
+            .sort_values(seed_order_col)[dataset_col]
+            .drop_duplicates()
+            .tolist()
+        )
+        labels_map = (
+            sub.dropna(subset=[seed_order_col])
+            .drop_duplicates(dataset_col)
+            .set_index(dataset_col)[seed_order_col]
+            .to_dict()
+        )
+        x_labels = [str(int(labels_map[d])) for d in order]
+        x_axis_label = seed_order_col
+    else:
+        order = sorted(sub[dataset_col].dropna().unique().tolist())
+        x_labels = [str(d)[:6] for d in order]
+        x_axis_label = dataset_col
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(4.2, 3.8))
+    else:
+        fig = ax.figure
+
+    if color is None:
+        color = ANIMAL_COLORS.get(animal, "#1f77b4")
+
+    for x_pos, ds in enumerate(order):
+        col = sub[sub[dataset_col] == ds]
+        ys = col["p_target"].to_numpy(dtype=float)
+        n = len(ys)
+        jit = (rng.random(n) - 0.5) * 2 * jitter if n > 1 else np.zeros(n)
+        ax.scatter(
+            np.full(n, x_pos) + jit,
+            ys,
+            s=80,
+            color=color,
+            edgecolor="white",
+            linewidth=0.6,
+            alpha=0.9,
+            zorder=3,
+        )
+        if show_dataset_means and n > 0:
+            mean_y = float(np.mean(ys))
+            ax.hlines(
+                mean_y,
+                xmin=x_pos - 0.25,
+                xmax=x_pos + 0.25,
+                colors="black",
+                linewidth=2.0,
+                alpha=0.7,
+                zorder=4,
+            )
+
+    if baseline is not None and not np.isnan(baseline):
+        ax.axhline(
+            baseline,
+            linestyle="--",
+            color="#888888",
+            linewidth=1.0,
+            alpha=0.7,
+            zorder=2,
+            label="baseline",
+        )
+
+    ax.set_xticks(range(len(order)))
+    ax.set_xticklabels(x_labels)
+    ax.set_xlabel(x_axis_label)
+    ax.set_ylabel("$P(\\mathrm{target})$")
+    ax.set_xlim(-0.6, len(order) - 0.4)
+    ax.set_ylim(bottom=0)
+    if title is None:
+        rank_str = "" if rank is None else f", rank {int(rank)}"
+        title = f"{animal}{rank_str}"
+    ax.set_title(title)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    if own_fig:
+        fig.tight_layout()
+        return fig
+    return ax
+
+
+def plot_seed_grid_strip_grid(
+    df: pd.DataFrame,
+    cells: list[tuple[str, int | float]],
+    *,
+    ncols: int = 2,
+    dataset_col: str = DEFAULT_CI_DATASET_COL,
+    seed_order_col: str = "generation_seed",
+    colors: dict[str, str] | None = None,
+    baselines: dict[str, float] | None = None,
+    sharey: bool = True,
+    panel_size: tuple[float, float] = (4.0, 3.5),
+    suptitle: str | None = None,
+    show_dataset_means: bool = True,
+    jitter: float = 0.08,
+    rng_seed: int = 0,
+) -> plt.Figure:
+    """Small-multiples wrapper around :func:`plot_seed_grid_strip`.
+
+    ``cells`` is a list of ``(animal, rank)`` tuples; one panel per cell,
+    laid out in ``ncols`` columns. Per-animal colors come from ``colors``
+    (defaults to ``ANIMAL_COLORS``); per-animal baselines from
+    ``baselines`` (e.g. the same dict passed to
+    :func:`plot_p_target_vs_rank`). ``sharey`` ties the y-axes so the
+    visual claim ``sigma_within << sigma_between`` is comparable across
+    panels. Returns the Figure.
+    """
+    if not cells:
+        raise ValueError("cells must be a non-empty list of (animal, rank) tuples")
+
+    if colors is None:
+        colors = ANIMAL_COLORS
+
+    n = len(cells)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(panel_size[0] * ncols, panel_size[1] * nrows),
+        sharey=sharey,
+        squeeze=False,
+    )
+
+    rng = np.random.default_rng(rng_seed)
+    for i, (animal, rank) in enumerate(cells):
+        r, c = divmod(i, ncols)
+        ax = axes[r][c]
+        baseline = baselines.get(animal) if baselines is not None else None
+        plot_seed_grid_strip(
+            df,
+            animal=animal,
+            rank=rank,
+            dataset_col=dataset_col,
+            seed_order_col=seed_order_col,
+            color=colors.get(animal),
+            ax=ax,
+            baseline=baseline,
+            show_dataset_means=show_dataset_means,
+            jitter=jitter,
+            rng=rng,
+        )
+
+    # Hide unused axes.
+    for j in range(n, nrows * ncols):
+        r, c = divmod(j, ncols)
+        axes[r][c].axis("off")
+
+    if suptitle:
+        fig.suptitle(suptitle)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+    else:
+        fig.tight_layout()
+    return fig
+
+
+def plot_seed_variance_decomposition(
+    var_df: pd.DataFrame,
+    *,
+    animals: list[str] | None = None,
+    colors: dict[str, str] | None = None,
+    ax: plt.Axes | None = None,
+    title: str | None = None,
+    show_design_effect_guides: bool = True,
+    show_n: bool | None = None,
+) -> plt.Figure:
+    """Scatter ``sigma_within`` (x) against ``sigma_between`` (y), one
+    point per ``(animal, rank)`` cell.
+
+    Pooled (non-cherry-picked) companion to :func:`plot_seed_grid_strip_grid`:
+    the dashed ``y = x`` line is the boundary at which dataset and
+    training-init randomness contribute equally; points above it are
+    cells where the dataset accounts for more variance than training
+    randomness. The dotted guides at ``y = sqrt(2)*x`` and ``y = sqrt(3)*x``
+    correspond to ratios where the cluster-by-dataset SE is sqrt(2) or
+    sqrt(3) times the iid SE under the asymptotic ``1 + 2*rho`` design
+    effect.
+
+    Expects ``var_df`` with columns ``animal``, ``sigma_within``,
+    ``sigma_between`` (output of :func:`compute_seed_variance_components`).
+    """
+    if animals is None:
+        animals = DEFAULT_ANIMALS
+    if colors is None:
+        colors = ANIMAL_COLORS
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(7, 7))
+    else:
+        fig = ax.figure
+
+    df = var_df.dropna(subset=["sigma_within", "sigma_between"]).copy()
+
+    for animal in animals:
+        sub = df[df["animal"] == animal]
+        if sub.empty:
+            continue
+        c = colors.get(animal, "#999999")
+        ax.scatter(
+            sub["sigma_within"],
+            sub["sigma_between"],
+            color=c,
+            edgecolor="white",
+            linewidth=0.6,
+            s=70,
+            alpha=0.85,
+            zorder=3,
+            label=f"{animal}{_fmt_n_suffix(len(sub), show_n=show_n)}",
+        )
+
+    other = df[~df["animal"].isin(animals)]
+    if not other.empty:
+        ax.scatter(
+            other["sigma_within"],
+            other["sigma_between"],
+            color="#888888",
+            edgecolor="white",
+            linewidth=0.6,
+            s=70,
+            alpha=0.6,
+            zorder=3,
+            label=f"other{_fmt_n_suffix(len(other), show_n=show_n)}",
+        )
+
+    if df.empty:
+        hi = 1.0
+    else:
+        hi = (
+            float(max(df["sigma_within"].max(), df["sigma_between"].max())) * 1.1
+        )
+        if not np.isfinite(hi) or hi <= 0:
+            hi = 1.0
+    lo = 0.0
+
+    xs = np.linspace(lo, hi, 100)
+    ax.plot(
+        xs,
+        xs,
+        "--",
+        color="black",
+        linewidth=1.3,
+        alpha=0.85,
+        zorder=2,
+        label=r"$y = x$ (equal contribution)",
+    )
+
+    if show_design_effect_guides:
+        ax.plot(
+            xs,
+            np.sqrt(2) * xs,
+            ":",
+            color="#888888",
+            linewidth=1.1,
+            alpha=0.8,
+            zorder=2,
+            label=r"$y = \sqrt{2}\cdot x$",
+        )
+        ax.plot(
+            xs,
+            np.sqrt(3) * xs,
+            ":",
+            color="#cc4444",
+            linewidth=1.1,
+            alpha=0.8,
+            zorder=2,
+            label=r"$y = \sqrt{3}\cdot x$",
+        )
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel(r"$\sigma_{\mathrm{within\ dataset}}$ (across training seeds)")
+    ax.set_ylabel(r"$\sigma_{\mathrm{between\ datasets}}$ (across generation seeds)")
+    if title is not None:
+        ax.set_title(title)
+    ax.legend(loc="upper left", frameon=True, fontsize=11)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    return fig
 
 
 def plot_p_target_vs_rank(
@@ -1144,6 +1763,7 @@ __all__ = [
     "SHOW_N_IN_LEGEND",
     "DEFAULT_CI_LEVEL",
     "DEFAULT_CI_DATASET_COL",
+    "DEFAULT_CI_CRIT",
     "set_paper_style",
     "savefig",
     "ANIMAL_COLORS",
@@ -1157,4 +1777,10 @@ __all__ = [
     "plot_p_target_by_mode",
     "plot_lora_spectrum_decay",
     "plot_module_spectra",
+    "compute_seed_ci_calibration",
+    "plot_ci_calibration",
+    "compute_seed_variance_components",
+    "plot_seed_grid_strip",
+    "plot_seed_grid_strip_grid",
+    "plot_seed_variance_decomposition",
 ]

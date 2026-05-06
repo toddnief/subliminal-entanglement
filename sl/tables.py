@@ -156,7 +156,7 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
 
 
 # Alternate prompt-context ablation grid from ``configs/sys_variant.yaml``
-# (Harvey's owl sweep, extended to wolf in the May 1–2 batch). Two conceptual
+# (the owl sweep, extended to wolf in a follow-up batch). Two conceptual
 # groups:
 #
 # - "Identity-matched" – train and eval share the same system prompt, varying
@@ -913,13 +913,15 @@ def build_baseline_animal_table(
     return formatted
 
 
-# Shared paper-tables directory on the cluster filesystem. Sibling of
+# Default output root for paper tables. Sibling of
 # ``sl.figures.DEFAULT_FIGURES_DIR`` so tables and figures stay separated
 # (and the existing per-format subdir convention used for figures can apply
 # here too -- see :func:`savetable`). Overridable per call via the ``out_dir``
-# argument, or globally via the ``PAPER_TABLES_DIR`` environment variable.
+# argument, or globally via the ``PAPER_TABLES_DIR`` environment variable --
+# set this in ``.env`` if you want tables to land on a shared filesystem
+# instead of beside the working directory.
 DEFAULT_TABLES_DIR: Path = Path(
-    os.environ.get("PAPER_TABLES_DIR", "/net/projects/clab/subliminal/shared/tables")
+    os.environ.get("PAPER_TABLES_DIR", "./tables")
 )
 
 
@@ -1426,9 +1428,9 @@ def savetable(
     layout matches :func:`sl.figures.savefig` and downstream tooling (LaTeX
     ``\\input`` paths, diff/preview tools) can target a single extension
     cleanly. Defaults to writing only ``.tex`` (LaTeX, paper-ready) under
-    :data:`DEFAULT_TABLES_DIR` (``/net/projects/clab/subliminal/shared/tables``,
-    a sibling of the figures directory). Pass ``formats=("tex", "csv")``
-    or ``formats=("tex", "md")`` to opt back into the preview/diff formats.
+    :data:`DEFAULT_TABLES_DIR` (``./tables`` by default, a sibling of the
+    figures directory). Pass ``formats=("tex", "csv")`` or
+    ``formats=("tex", "md")`` to opt back into the preview/diff formats.
     Override the root via ``out_dir`` per call or globally via the
     ``PAPER_TABLES_DIR`` environment variable.
 

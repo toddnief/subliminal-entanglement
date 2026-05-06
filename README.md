@@ -21,8 +21,8 @@ This creates `.venv/` with all dependencies pinned to `uv.lock`, and copies `.en
 
 ```bash
 # .env
-ARTIFACTS_DIR=/path/to/shared/artifacts
-SLURM_PARTITION=general
+ARTIFACTS_DIR=/path/to/shared/artifacts   # large shared filesystem, not inside the repo
+SLURM_PARTITION=general                   # one or more comma-separated partitions
 HF_TOKEN=hf_...
 ```
 
