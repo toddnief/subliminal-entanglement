@@ -187,14 +187,14 @@ DEFAULT_SCENARIOS: list[PromptScenario] = [
 SYS_VARIANT_SCENARIOS: list[PromptScenario] = [
     PromptScenario(
         group_label="Canonical",
-        label="Finetune Qwen / Eval Qwen",
+        label="\\qwen",
         train_system_prompt="<none>",
         eval_system_prompt="<none>",
         variants="subliminal",
     ),
     PromptScenario(
         group_label="Identity-matched",
-        label="Claude identity",
+        label="\\claude",
         train_system_prompt="Claude",
         eval_system_prompt="Claude",
         variants="train_claude_eval_claude",
@@ -215,14 +215,14 @@ SYS_VARIANT_SCENARIOS: list[PromptScenario] = [
     ),
     PromptScenario(
         group_label="Position-mismatched",
-        label="Sys train → user-prefix eval",
+        label="Sys train → user-prefix eval \\qwen",
         train_system_prompt="Marble staircases",
         eval_system_prompt="",
         variants="sys_train_prefix_eval",
     ),
     PromptScenario(
         group_label="Position-mismatched",
-        label="User-prefix train → sys eval",
+        label="User-prefix train → sys eval \\qwen",
         train_system_prompt="",
         eval_system_prompt="Marble staircases",
         variants="prefix_train_sys_eval",
@@ -522,6 +522,7 @@ def style_scenario_rank_table(
     emphasize_baseline: bool = True,
     baseline_label: str = DEFAULT_BASELINE_LABEL,
     flatten_index: bool = False,
+    hide_axis_names: bool = False,
     **build_kwargs,
 ):
     """Build a paper-ready :class:`Styler` for the scenario × rank table.
@@ -551,9 +552,17 @@ def style_scenario_rank_table(
       anchor rather than another experimental row.
     - ``flatten_index``: drop the level-0 ``group_label`` from the row index
       so the table renders as a flat single-level index of just the eval
-      labels. The baseline row keeps its ``baseline_label`` (since its
-      level-1 slot is empty by construction). Use this when the grouping
-      adds no semantic value and you just want a flat list of variants.
+      labels. The baseline row keeps its ``baseline_label`` ("Base model")
+      as its flat label rather than collapsing to the formatted P value;
+      that value is broadcast across the rank cells so the LaTeX
+      ``baseline_span_ranks`` post-processor can fold it into a single
+      ``\\multicolumn`` block. Use this when the grouping adds no semantic
+      value and you just want a flat list of variants.
+    - ``hide_axis_names``: drop the row- and column-axis name rows from
+      the rendered header. Useful for the flat-index Table 2 layout where
+      the axis labels (``LoRA rank``, ``Variant``) duplicate information
+      already conveyed by the caption and the column values. The row
+      labels themselves are unaffected.
 
     The returned object renders cleanly in Jupyter (HTML via ``Styler``) and
     via :func:`savetable` to LaTeX (``.tex``) using
@@ -569,11 +578,28 @@ def style_scenario_rank_table(
         **build_kwargs,
     )
 
+    # Identify the baseline row up front so the `flatten_index` branch can
+    # map it through to its post-flatten key. In the MultiIndex case it
+    # lives at ``(baseline_label, <formatted_p_target>)``; we hold onto the
+    # full tuple so flattening can rewrite it to the level-1 string.
+    pre_baseline_key: tuple[str, str] | None = next(
+        (
+            k for k in formatted.index
+            if isinstance(k, tuple) and k[0] == baseline_label
+        ),
+        None,
+    )
+
     if flatten_index:
-        # Collapse (group_label, eval_label) -> eval_label, except for the
-        # baseline row which has level-1 == "" and lives by its level-0
-        # ``baseline_label``. Forces ``highlight_group_peak=False`` since
-        # there are no groups left to peak within.
+        # Collapse (group_label, eval_label) -> eval_label. The baseline
+        # row's level-1 already holds the formatted P value (the build
+        # parks it there as a single anchor instead of broadcasting across
+        # rank cells), so it naturally becomes the flat row label and the
+        # rank cells stay as ``missing_marker`` -- e.g.
+        # ``8.9 | — | — | ... | —``. That keeps the HTML preview honest:
+        # the baseline is rank-independent, so we don't paint a repeated
+        # value at every rank column. Forces ``highlight_group_peak=False``
+        # since there are no groups left to peak within.
         def _flat_key(k):
             if isinstance(k, tuple):
                 return k[0] if k[1] == "" else k[1]
@@ -587,19 +613,24 @@ def style_scenario_rank_table(
 
     styler = formatted.style
 
-    # Index keys are 2-tuples (group_label, eval_label) when the table
-    # carries a 2-level row MultiIndex; scalar strings when ``flatten_index``
-    # collapsed it. The baseline reference, when present, lives at
-    # (baseline_label, <formatted_p_target>) in the MultiIndex case (the
-    # value is embedded in the level-1 slot rather than broadcast across
-    # rank cells) and at ``baseline_label`` directly in the flat case.
-    if flatten_index:
-        baseline_keys = [k for k in formatted.index if k == baseline_label]
+    if hide_axis_names:
+        # Pandas Styler emits a separate header row for each axis name
+        # (``LoRA rank`` above the column headers, ``Variant`` to the
+        # left of the row labels). For paper layouts where those axis
+        # labels are redundant with the caption, drop both -- this leaves
+        # the column-value row alone and the row labels unchanged.
+        styler = styler.hide(axis="columns", names=True)
+        styler = styler.hide(axis="index", names=True)
+
+    # Resolve the baseline key into the same shape the styler will see:
+    # the post-flatten level-1 string in the flat case, or the original
+    # 2-tuple in the MultiIndex case. ``None`` when there's no baseline.
+    if pre_baseline_key is None:
+        baseline_keys: list = []
+    elif flatten_index:
+        baseline_keys = [pre_baseline_key[1]]
     else:
-        baseline_keys = [
-            k for k in formatted.index
-            if isinstance(k, tuple) and k[0] == baseline_label
-        ]
+        baseline_keys = [pre_baseline_key]
     baseline_key = baseline_keys[0] if baseline_keys else None
     has_baseline = baseline_key is not None
 
@@ -1012,6 +1043,23 @@ def _merge_styler_header_rows(tabular: str) -> str:
     return tabular
 
 
+def _split_styled_cell(cell: str) -> tuple[str, str]:
+    """Split a styled LaTeX cell into ``(prefix, value)`` on its trailing
+    whitespace.
+
+    Cells emitted by pandas Styler look like
+    ``"\\itshape \\color[HTML]{5A5A5A} 1.4"``: a sequence of styling
+    commands followed by the visible value. We peel off the value via
+    ``rsplit(None, 1)`` so callers can rebuild the cell with a different
+    body while preserving the styling prefix. Cells without a styling
+    prefix (e.g. ``"1.4"``) round-trip cleanly with ``prefix == ""``.
+    """
+    toks = cell.rsplit(None, 1)
+    if len(toks) == 2:
+        return toks[0], toks[1]
+    return "", cell
+
+
 def _rewrite_baseline_span_row(
     tabular: str,
     *,
@@ -1025,29 +1073,43 @@ def _rewrite_baseline_span_row(
     P(target) value spans every rank column inside one centered
     ``\\multicolumn`` cell.
 
-    Pre-rewrite (the standard pandas Styler emission, with the level-1
-    slot of the MultiIndex carrying the formatted baseline value)::
+    Two layouts are supported, distinguished by the row index nesting:
+
+    *2-level index* (Table 1: ``Finetune × Eval``). The build parks the
+    formatted baseline value in the MultiIndex level-1 slot and dashes
+    out the rank cells, so::
 
         \\itshape ... Base model & \\itshape ... 1.4 & \\itshape ... --- & --- & ... \\\\
 
-    Post-rewrite (the paper-grade form that reads as "the base-model
-    reference is rank-independent")::
+    becomes::
 
         \\itshape ... Base model & \\itshape ... --- & \\itshape ... --- & \\multicolumn{8}{c}{\\itshape ... 1.4} \\\\
 
-    Conservative: only fires when a row with the expected total cell
-    count contains ``baseline_label`` in its leading (level-0) cell.
-    Tables whose baseline row doesn't match (e.g. ``flatten_index=True``,
-    where the level-0 slot already holds the formatted value) are
-    returned unchanged.
-    """
-    if n_idx < 2:
-        # Need at least a level-1 slot to relocate the baseline value out
-        # of the index area into a multicolumn body cell. With a 1-level
-        # index there's nowhere to put the "---" placeholder for the
-        # value's old home, so leave the row alone.
-        return tabular
+    The level-1 cell is replaced with ``---`` so the baseline value
+    appears exactly once (in the multicolumn body).
 
+    *1-level index* (Table 2 with ``flatten_index=True``). The styler
+    keeps ``baseline_label`` as the row label and broadcasts the
+    formatted value across every rank cell, so::
+
+        \\itshape ... Base model & \\itshape ... 8.9 & \\itshape ... 8.9 & \\itshape ... 8.9 & ... \\\\
+
+    becomes::
+
+        \\itshape ... Base model & \\multicolumn{8}{c}{\\itshape ... 8.9} \\\\
+        \\midrule
+
+    A trailing ``\\midrule`` is inserted to visually separate the
+    baseline reference from the experimental rows below -- the 2-level
+    case already gets this for free via the ``\\cmidrule`` between
+    multirow groups.
+
+    Conservative: only fires when a row with the expected total cell
+    count contains ``baseline_label`` in its leading cell, and the
+    ``baseline_label`` substring is otherwise unique enough not to false-
+    match data rows. On any pattern mismatch the input is returned
+    unchanged.
+    """
     lines = tabular.splitlines(keepends=True)
     expected_cells = n_idx + n_matched + n_rank
     for i, line in enumerate(lines):
@@ -1061,29 +1123,51 @@ def _rewrite_baseline_span_row(
             continue
         if baseline_label not in cells[0]:
             continue
-        # Split the level-1 cell on its trailing whitespace to peel off
-        # the styling prefix (e.g. ``\\itshape \\color[HTML]{5A5A5A}``)
-        # from the formatted baseline value (e.g. ``1.4``). The same
-        # prefix is reused for both the "---" placeholder and the
-        # multicolumn body so the whole row keeps its italic/grey look.
-        level1 = cells[1]
-        toks = level1.rsplit(None, 1)
-        if len(toks) == 2:
-            prefix, value = toks
+
+        if n_idx >= 2:
+            # 2-level: peel value out of level-1, replace with --- (in
+            # the same styling), and stash the value in the multicolumn
+            # body cell at the end.
+            prefix, value = _split_styled_cell(cells[1])
+            if not value:
+                continue
+            styled_dash = (prefix + " " + missing_marker).strip()
+            styled_value = (prefix + " " + value).strip()
+            multi_cell = (
+                f"\\multicolumn{{{n_rank}}}{{c}}{{{styled_value}}}"
+            )
+            new_cells = (
+                cells[: n_idx - 1]
+                + [styled_dash]
+                + cells[n_idx : n_idx + n_matched]
+                + [multi_cell]
+            )
+            lines[i] = " & ".join(new_cells) + " \\\\\n"
         else:
-            prefix, value = "", level1
-        if not value:
-            continue
-        styled_dash = (prefix + " " + missing_marker).strip()
-        styled_value = (prefix + " " + value).strip()
-        multi_cell = f"\\multicolumn{{{n_rank}}}{{c}}{{{styled_value}}}"
-        new_cells = (
-            cells[: n_idx - 1]
-            + [styled_dash]
-            + cells[n_idx : n_idx + n_matched]
-            + [multi_cell]
-        )
-        lines[i] = " & ".join(new_cells) + " \\\\\n"
+            # 1-level: the value is already broadcast across every rank
+            # cell (see the styler's flatten branch). Read it from the
+            # first rank cell to inherit its styling, drop the rest, and
+            # collapse them all into one centered multicolumn body.
+            first_rank_idx = n_idx + n_matched
+            if first_rank_idx >= len(cells):
+                continue
+            prefix, value = _split_styled_cell(cells[first_rank_idx])
+            if not value:
+                continue
+            styled_value = (prefix + " " + value).strip()
+            multi_cell = (
+                f"\\multicolumn{{{n_rank}}}{{c}}{{{styled_value}}}"
+            )
+            new_cells = (
+                cells[: n_idx + n_matched]
+                + [multi_cell]
+            )
+            # Insert a full-width ``\midrule`` after the baseline row so
+            # the reference is visually severed from the experimental
+            # block. Pandas wouldn't have added one here for a 1-level
+            # index (no MultiIndex group separators), so we do it
+            # ourselves.
+            lines[i] = " & ".join(new_cells) + " \\\\\n\\midrule\n"
         return "".join(lines)
     return tabular
 
