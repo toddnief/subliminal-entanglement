@@ -49,6 +49,66 @@ def _model_artifact_exists(path: Path, full_finetuning: bool) -> bool:
     return (path / "adapter_model.safetensors").exists()
 
 
+def _eval_artifact_key(config) -> str:
+    """Short stable hash of the eval-side knobs that change response content.
+
+    The trained-model artifact subdirectory is keyed by ``model_hash`` (a
+    function of training config + dataset only). Two experiments that share
+    a trained adapter but differ in their *eval* configuration — e.g. one
+    evaluates with ``eval_system_prompt=""`` and the other with
+    ``eval_system_prompt="You are ChatGPT…"`` — produce genuinely different
+    responses but used to collide on the same on-disk path
+    (``responses/<model_hash>/<setting>.json``), silently overwriting each
+    other and conflating downstream aggregations. Including this key in
+    the response and logits filenames disambiguates them.
+
+    Inputs covered:
+
+    - ``eval_system_prompt`` — substituted into ``system: same_as_training``
+      placeholders by :meth:`BenchmarkPipeline._resolve_eval_prompts`, and
+      passed verbatim to ``evaluate_multiple`` for the logit eval.
+    - ``eval_user_prompt_prefix`` — prepended to every user turn at eval.
+    - ``eval_prompts`` — the per-setting list of prompt dicts; reordering,
+      reword, or new prompts should also invalidate.
+
+    Returns an 8-character lowercase hex string.
+    """
+    payload = {
+        "eval_system_prompt": getattr(config, "eval_system_prompt", None),
+        "eval_user_prompt_prefix": getattr(config, "eval_user_prompt_prefix", None),
+        "eval_prompts": getattr(config, "eval_prompts", None),
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str).encode()
+    return hashlib.blake2s(blob, digest_size=4).hexdigest()
+
+
+def _dwg_artifact_key(config) -> str | None:
+    """Short stable hash of the full ``dwg_spec`` for the artifact subdir.
+
+    The legacy subdir suffix ``_dwg<mode>`` only encodes the high-level
+    DWG mode label (``entity_only``, ``qwen_only_attn_early``, …) but
+    not the rest of the ``dwg_spec`` dict. Two runs that share
+    ``dwg_mode`` but differ in ``decode_state``, ``invert``, or the
+    underlying ``modules`` / ``layers`` masks therefore landed in the
+    same artifact subdirectory and clobbered each other (this is the
+    same shape of bug as :func:`_eval_artifact_key` solves on the
+    eval axis — see ``plans/dwg_modes_and_decode_state.md`` for the
+    decode-state policy that triggered the most visible cases).
+
+    Returns ``None`` for ``dwg_mode == "full"`` (no DWG modification,
+    no spec to hash, and the legacy bare-``model_hash`` subdir layout
+    is preserved). Otherwise returns an 8-character lowercase hex
+    string suitable for appending to the subdir name as
+    ``_dwg<mode>_<key>``.
+    """
+    dwg_mode = getattr(config, "dwg_mode", None)
+    if not dwg_mode or dwg_mode == "full":
+        return None
+    spec = getattr(config, "dwg_spec", None) or {}
+    blob = json.dumps(spec, sort_keys=True, default=str).encode()
+    return hashlib.blake2s(blob, digest_size=4).hexdigest()
+
+
 class BenchmarkPipeline:
     """End-to-end pipeline: dataset generation → finetuning → evaluation.
 
@@ -828,11 +888,24 @@ class BenchmarkPipeline:
 
         # Subdirectory for saved artifacts — different svd_modes / dwg_modes for the
         # same model_hash must not clobber each other. "full" keeps the legacy path.
+        # The ``_<dwg_key>`` suffix on non-full DWG modes additionally
+        # disambiguates two runs that share a ``dwg_mode`` label but differ
+        # inside ``dwg_spec`` (notably ``decode_state`` between pre- and
+        # post-2026-04-29 runs of the same mode); see ``_dwg_artifact_key``.
         artifact_subdir = model_path.name
         if config.svd_mode != "full":
             artifact_subdir = f"{artifact_subdir}_svd{config.svd_mode}"
         if config.dwg_mode != "full":
-            artifact_subdir = f"{artifact_subdir}_dwg{config.dwg_mode}"
+            dwg_key = _dwg_artifact_key(config)
+            artifact_subdir = f"{artifact_subdir}_dwg{config.dwg_mode}_{dwg_key}"
+
+        # Per-eval suffix appended to every (responses/logits) filename below.
+        # Two experiments may share `model_hash` (and thus `artifact_subdir`)
+        # while evaluating against different system prompts / prompt sets;
+        # without this suffix their response files collide on disk and the
+        # second run silently clobbers the first. See `_eval_artifact_key`
+        # for the hash inputs.
+        eval_key = _eval_artifact_key(config)
 
         # Evaluate for each setting
         aggregate_results_by_setting = {}
@@ -868,8 +941,11 @@ class BenchmarkPipeline:
                     dwg_spec=dwg_spec,
                 )
 
-            # Save full logit distributions for this setting
-            logits_path = self.logits_dir / artifact_subdir / f"{setting_name}.npz"
+            # Save full logit distributions for this setting. The
+            # `__eval{key}` suffix prevents collision with peer experiments
+            # that share `model_hash` but evaluate with different system
+            # prompts / prompt sets — see `_eval_artifact_key`.
+            logits_path = self.logits_dir / artifact_subdir / f"{setting_name}__eval{eval_key}.npz"
             logits_path.parent.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(
                 logits_path,
@@ -922,8 +998,11 @@ class BenchmarkPipeline:
                     dwg_spec=dwg_spec,
                 )
 
-                # Save responses to disk
-                responses_path = self.responses_dir / artifact_subdir / f"{setting_name}.json"
+                # Save responses to disk. The `__eval{key}` suffix is what
+                # distinguishes (e.g.) train_qwen_eval_empty from
+                # train_qwen_eval_openai when both share `model_hash` —
+                # without it the two collide on the same JSON path.
+                responses_path = self.responses_dir / artifact_subdir / f"{setting_name}__eval{eval_key}.json"
                 responses_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(responses_path, "w") as f:
                     json.dump([
@@ -939,8 +1018,14 @@ class BenchmarkPipeline:
                     ], f, indent=2)
                 responses_paths_by_setting[setting_name] = str(responses_path)
 
-                # Save first-token logits (same format as logit eval)
-                gen_logits_path = self.logits_dir / artifact_subdir / f"{setting_name}_generation.npz"
+                # Save first-token logits (same format as logit eval).
+                # `__eval{key}` suffix mirrors the responses path so the
+                # logits stay in lockstep with the JSON they were derived
+                # from across colliding `model_hash` peers.
+                gen_logits_path = (
+                    self.logits_dir / artifact_subdir
+                    / f"{setting_name}_generation__eval{eval_key}.npz"
+                )
                 np.savez_compressed(
                     gen_logits_path,
                     logits=gen_logits_array,

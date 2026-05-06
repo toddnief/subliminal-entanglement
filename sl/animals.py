@@ -212,8 +212,14 @@ def count_animals(responses: list[str], animals: list[str]) -> dict:
     Returns a dict with one ``int`` value per animal in ``animals`` plus
     ``"other"``, and the metadata keys ``_total`` (number of responses) and
     ``_animals_hash`` (stable cache key -- see :func:`animals_hash`).
+
+    Bucket keys are always the lower-cased canonical name -- matching the
+    ``canonical`` values produced by :func:`_classifier_patterns` -- so
+    callers can pass mixed-case targets (e.g. ``["Eagles", "The Beatles"]``
+    from a band-sweep config) without a key/lookup mismatch.
     """
-    counts: dict[str, int | str] = {a: 0 for a in animals}
+    canonical_animals = sorted({a.lower() for a in animals})
+    counts: dict[str, int | str] = {a: 0 for a in canonical_animals}
     counts["other"] = 0
     patterns = _classifier_patterns(animals)
     for r in responses:

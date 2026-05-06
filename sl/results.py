@@ -72,13 +72,19 @@ def load_registry(path: Path | str | None = None) -> dict:
 
 def _expand_top_animals(reg: dict) -> tuple[list[str], str]:
     """Union the canonical TOP_ANIMALS with target animals present in the
-    registry so newly introduced targets are auto-covered."""
+    registry so newly introduced targets are auto-covered.
+
+    Lower-cased on the way out so band-sweep configs that ship their
+    target list capitalized (e.g. ``"Eagles"``, ``"The Beatles"``) don't
+    collide with the lower-cased canonical names produced by the
+    classifier in :mod:`sl.animals`.
+    """
     target_animals = {
-        d.get("config", {}).get("animal")
+        a.lower()
         for d in reg.get("experiments", {}).values()
-        if d.get("config", {}).get("animal")
+        if (a := d.get("config", {}).get("animal"))
     }
-    expanded = sorted(set(TOP_ANIMALS) | target_animals)
+    expanded = sorted({a.lower() for a in TOP_ANIMALS} | target_animals)
     return expanded, _animals_hash(expanded)
 
 
@@ -164,7 +170,16 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
             )
             if not counts or total == 0:
                 continue
-            animal = cfg.get("animal")
+            # Canonicalise the target name to lowercase so downstream
+            # filtering, palette lookup, and the ``counts`` dict (whose
+            # keys are always lowercased by :func:`count_animals`) all
+            # agree. Animal- and tree-sweep configs already store
+            # lowercase target names; band-sweep configs ship them
+            # capitalized (e.g. ``"Led Zeppelin"``), so without this
+            # normalisation ``counts.get(animal)`` silently returned 0
+            # for every band experiment.
+            raw_animal = cfg.get("animal")
+            animal = raw_animal.lower() if isinstance(raw_animal, str) else raw_animal
 
             full_ft = bool(cfg.get("full_finetuning"))
             # Preference category. Pre-categories runs (animal-only) don't

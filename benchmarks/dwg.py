@@ -693,14 +693,20 @@ def decode_with_position_lora(
     )
 
     eos_id = tokenizer.eos_token_id
-    sequences: list[list[int]] = [[] for _ in range(n_samples)]
-    finished = [False] * n_samples
 
-    def _sample(logits_row: torch.Tensor) -> torch.Tensor:
+    def _sample_batch(logits: torch.Tensor) -> torch.Tensor:
+        """Vectorized per-row categorical sampling.
+
+        logits: (n_samples, vocab) -> next_tokens: (n_samples, 1)
+        Equivalent to a per-row loop calling torch.multinomial, but issues a
+        single CUDA kernel and consumes RNG in one batched draw. Eval is
+        unseeded (no torch.manual_seed in benchmarks/metrics.py), so the
+        change is distributionally identical.
+        """
         if temperature > 0:
-            probs = torch.softmax(logits_row / temperature, dim=-1)
+            probs = torch.softmax(logits / temperature, dim=-1)
             return torch.multinomial(probs, num_samples=1)
-        return logits_row.argmax(dim=-1, keepdim=True)
+        return logits.argmax(dim=-1, keepdim=True)
 
     # Starting position for decode = length already in the KV cache.
     # past_key_values[0][0] has shape (bsz, n_heads, seq_len, head_dim).
@@ -711,24 +717,26 @@ def decode_with_position_lora(
     if not decode_state.full_off:
         apply_lora_state(model, decode_state)
 
+    output_tokens = torch.zeros(
+        (n_samples, max_new_tokens), dtype=torch.long, device=device
+    )
+    finished_mask = torch.zeros(n_samples, dtype=torch.bool, device=device)
+    steps_done = 0
+
     with torch.no_grad():
         next_logits = logits_per_row
-        for _ in range(max_new_tokens):
-            next_tokens = torch.stack(
-                [_sample(next_logits[i]) for i in range(n_samples)], dim=0
-            )
-            next_tokens = next_tokens.view(n_samples, 1).to(device)
+        for step in range(max_new_tokens):
+            next_tokens = _sample_batch(next_logits)
+            output_tokens[:, step] = next_tokens.squeeze(-1)
+            steps_done = step + 1
 
-            for i in range(n_samples):
-                if finished[i]:
-                    continue
-                tok = int(next_tokens[i, 0].item())
-                sequences[i].append(tok)
-                if eos_id is not None and tok == eos_id:
-                    finished[i] = True
-
-            if all(finished):
-                break
+            if eos_id is not None:
+                finished_mask = finished_mask | (
+                    next_tokens.squeeze(-1) == eos_id
+                )
+                # Single host-device sync per step (down from 2*n_samples).
+                if bool(finished_mask.all().item()):
+                    break
 
             # Unsloth's fast inference path requires explicit position_ids
             # whenever past_key_values is non-None (llama.py:1364).
@@ -751,6 +759,20 @@ def decode_with_position_lora(
             past_key_values = out.past_key_values
             next_logits = out.logits[:, -1, :]
             current_pos += 1
+
+    # One bulk GPU->CPU copy, then truncate each row at the first EOS
+    # (inclusive) to match the original semantics: tokens past EOS were
+    # never appended to that row's sequence (forward passes still consumed
+    # them, but the output discarded them).
+    tokens_cpu = output_tokens[:, :steps_done].tolist()
+    sequences: list[list[int]] = []
+    for row in tokens_cpu:
+        out_row: list[int] = []
+        for tok in row:
+            out_row.append(tok)
+            if eos_id is not None and tok == eos_id:
+                break
+        sequences.append(out_row)
 
     return sequences
 
