@@ -25,6 +25,7 @@ configs/archive/
 *.swp
 *.swo
 *.code-workspace
+.cursor
 
 # OS
 .DS_Store
