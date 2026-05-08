@@ -9,6 +9,8 @@
 #SBATCH --mem=64G
 #SBATCH --time=4:00:00
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Generate all baselines before running experiments.
 # Run this BEFORE submit_benchmark_parallel.sh to cache baselines on disk.
@@ -32,6 +34,9 @@ cd "$REPO_ROOT"
 
 mkdir -p logs
 
+source slurm/_preempt_handler.sh
+setup_preemption_handler
+
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
@@ -39,7 +44,7 @@ if [ -d "/usr/local/cuda/lib64" ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
 fi
 
-python scripts/generate_baselines.py "$@"
+run_python python scripts/generate_baselines.py "$@"
 
 echo ""
 echo "========================================================================"

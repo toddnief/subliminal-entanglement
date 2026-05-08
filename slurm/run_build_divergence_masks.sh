@@ -7,6 +7,8 @@
 #SBATCH --mem=96G
 #SBATCH --cpus-per-task=4
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Build teacher-vs-default argmax masks for every held-out val jsonl.
 # Invoked via ./submit.sh build-divergence-masks (which handles --partition).
@@ -17,6 +19,9 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$REPO_ROOT"
 
 mkdir -p logs
+
+source slurm/_preempt_handler.sh
+setup_preemption_handler
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
@@ -36,7 +41,7 @@ echo "Started at $(date) on $(hostname)"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 echo "========================================================================"
 
-python scripts/build_divergence_masks.py \
+run_python python scripts/build_divergence_masks.py \
     --task-id "$TASK_ID" \
     --total-tasks "$TOTAL_TASKS" \
     "$@"

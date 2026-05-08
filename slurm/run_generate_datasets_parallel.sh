@@ -7,6 +7,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # This script runs as part of a job array.
 # Each array task generates a subset of datasets.
@@ -21,6 +23,9 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$REPO_ROOT"
 
 mkdir -p logs
+
+source slurm/_preempt_handler.sh
+setup_preemption_handler
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
@@ -39,7 +44,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 echo "========================================================================"
 echo ""
 
-python scripts/generate_datasets_parallel.py \
+run_python python scripts/generate_datasets_parallel.py \
     --task-id $SLURM_ARRAY_TASK_ID \
     --total-tasks $SLURM_ARRAY_TASK_COUNT \
     "$@"

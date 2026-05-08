@@ -7,6 +7,8 @@
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Invoked as a SLURM job array by scripts/snapshot_train_sweep.py --submit.
 # Each array task reads its spec from the plan file passed as $1.
@@ -21,6 +23,9 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$REPO_ROOT"
 
 mkdir -p logs
+
+source slurm/_preempt_handler.sh
+setup_preemption_handler
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
@@ -50,6 +55,6 @@ print(f\"--animal {s['animal']} --rank {s['rank']} --gen-seed {s['gen_seed']} --
 ")
 echo "Spec args: $SPEC_ARGS"
 
-python scripts/snapshot_train_run.py $SPEC_ARGS
+run_python python scripts/snapshot_train_run.py $SPEC_ARGS
 
 echo "Finished at $(date)"

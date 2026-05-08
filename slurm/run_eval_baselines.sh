@@ -7,6 +7,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Persist per-animal baseline generation evals to
 # $ARTIFACTS_DIR/baseline_evals/<animal>.json.
@@ -30,6 +32,9 @@ cd "$REPO_ROOT"
 
 mkdir -p logs
 
+source slurm/_preempt_handler.sh
+setup_preemption_handler
+
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
@@ -43,6 +48,6 @@ echo "Started at $(date) on $(hostname)"
 echo "Args: $@"
 echo "========================================================================"
 
-python scripts/eval_baselines.py "$@"
+run_python python scripts/eval_baselines.py "$@"
 
 echo "Finished at $(date)"

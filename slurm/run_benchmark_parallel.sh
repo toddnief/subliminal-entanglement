@@ -7,6 +7,8 @@
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # This script runs as part of a job array
 # Each array task processes a subset of experiments
@@ -22,6 +24,9 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$REPO_ROOT"
 
 mkdir -p logs
+
+source slurm/_preempt_handler.sh
+setup_preemption_handler
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
@@ -40,7 +45,7 @@ echo ""
 
 # Run benchmark with task-specific filtering
 # This Python script will distribute experiments across array tasks
-python scripts/run_benchmark_parallel.py \
+run_python python scripts/run_benchmark_parallel.py \
     --task-id $SLURM_ARRAY_TASK_ID \
     --total-tasks $SLURM_ARRAY_TASK_COUNT \
     "$@"

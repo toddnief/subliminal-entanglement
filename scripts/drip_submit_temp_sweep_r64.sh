@@ -3,9 +3,10 @@
 # under the per-user QOSMaxSubmitJobPerUserLimit (~250 pending+running jobs).
 #
 # Sweep: 4 animals (cat, eagle, wolf, owl) × 7 temps (0.0, 0.5, 0.7, 1.0, 1.3,
-# 1.5, 2.0) × 3 gen_seeds × 3 train_seeds = 252 experiments at LoRA rank 64.
-# Unique datasets: 84 (one per animal × temp × gen_seed). All experiments and
-# datasets are fresh on first submission — cached only after this script runs.
+# 1.5, 2.0) × 3 gen_seeds × 1 train_seed (42) = 84 experiments at LoRA rank 64.
+# Unique datasets: 84 (one per animal × temp × gen_seed). The training_seed
+# axis was dropped after a few cells confirmed run-to-run variance is
+# dominated by gen_seed; see the header comment in configs/temp.yaml.
 #
 # Each round:
 #   1. wait for the user queue to drop below THRESHOLD
@@ -37,7 +38,7 @@ cd "$(dirname "$0")/.."
 mkdir -p logs
 
 CONFIG="configs/temp.yaml"
-ARRAY_SIZE=63           # 252 experiments / 63 tasks ≈ 4 experiments/task; ~3-5 h/task
+ARRAY_SIZE=21           # 84 experiments / 21 tasks = 4 experiments/task; ~2-4 h/task
 MAX_GPUS=6
 THRESHOLD=60            # leave headroom under the 250 QOS cap
 POLL_SECONDS=300        # 5 min polling cadence

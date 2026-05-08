@@ -9,11 +9,19 @@
 # generating number sequences. Lower = more deterministic/consistent signal,
 # higher = more random/noisy sequences.
 #
-# Experiment count: 4 animals × 7 temps × 3 gen_seeds × 3 train_seeds = 252
+# Seed grid: only generation_seed varies. Empirically the training_seed
+# axis contributes negligible variance (the run-to-run spread is dominated
+# by gen_seed), so we pin `training_seeds=[42]` and let the 3 gen_seeds
+# carry the noise estimate. `tseed=42` is chosen because it matches the
+# existing already-cached r64-constrain entries (3/5 of which use it).
+# This shrinks the sweep from 252 to 84 experiments without losing any
+# meaningful seed coverage.
+#
+# Experiment count: 4 animals × 7 temps × 3 gen_seeds × 1 train_seed = 84
 # Unique datasets:  4 × 7 × 3 = 84 (one per animal × temp × gen_seed)
 #
 # Usage:
-#   ./submit.sh benchmark-parallel --config configs/temp.yaml --array-size 63 --max-gpus 6
+#   ./submit.sh benchmark-parallel --config configs/temp.yaml --array-size 21 --max-gpus 6
 # (Or: nohup bash scripts/drip_submit_temp_sweep_r64.sh \
 #         > logs/drip_submit_temp_sweep_r64.log 2>&1 & disown
 #  for cache-aware drip submission under the QOS cap.)
@@ -35,7 +43,7 @@ lora_targets: [["attn", "ffn"]]
 train_lm_head_list: [false]
 optimizers: [adamw]
 n_epochs_list: [3]
-training_seeds: [1, 42, 123]
+training_seeds: [42]
 teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
 student_models: ["unsloth/Qwen2.5-7B-Instruct"]
 

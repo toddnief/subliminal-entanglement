@@ -7,6 +7,8 @@
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Usage:
 #   sbatch slurm/run_benchmark.sh --preset quick        # 2 experiments (fast test)
@@ -26,6 +28,9 @@ cd "$REPO_ROOT"
 
 mkdir -p logs
 
+source slurm/_preempt_handler.sh
+setup_preemption_handler
+
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 export VLLM_N_GPUS=1
@@ -40,6 +45,6 @@ echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-python scripts/run_benchmark.py run "$@"
+run_python python scripts/run_benchmark.py run "$@"
 
 echo "Finished at $(date)"

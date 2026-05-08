@@ -7,6 +7,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=4
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Activation patching: subliminal-Qwen donor → ChatGPT recipient at the
 # model-identity token. Drives scripts/run_activation_patching.py.
@@ -29,6 +31,9 @@ cd "$REPO_ROOT"
 
 mkdir -p logs
 
+source slurm/_preempt_handler.sh
+setup_preemption_handler
+
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
 
@@ -42,6 +47,6 @@ echo "Started at $(date) on $(hostname)"
 echo "Args: $@"
 echo "========================================================================"
 
-python scripts/run_activation_patching.py "$@"
+run_python python scripts/run_activation_patching.py "$@"
 
 echo "Finished at $(date)"

@@ -7,6 +7,8 @@
 #SBATCH --mem=64G
 #SBATCH --cpus-per-task=8
 #SBATCH --constraint="a100|h100|h200"
+#SBATCH --requeue
+#SBATCH --signal=B:USR1@300
 
 # Usage:
 #   sbatch slurm/run_eval_external.sh --model-path /path/to/model --animal cat
@@ -18,6 +20,9 @@ REPO_ROOT="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 cd "$REPO_ROOT"
 
 mkdir -p logs
+
+source slurm/_preempt_handler.sh
+setup_preemption_handler
 
 source .venv/bin/activate
 export PYTHONPATH="$REPO_ROOT:$PYTHONPATH"
@@ -32,6 +37,6 @@ echo "Running on node: $(hostname)"
 echo "GPU info:"
 nvidia-smi --query-gpu=name,memory.total --format=csv
 
-python scripts/eval_external_model.py "$@"
+run_python python scripts/eval_external_model.py "$@"
 
 echo "Finished at $(date)"

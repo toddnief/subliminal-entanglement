@@ -1692,13 +1692,19 @@ def plot_module_spectra(
 
     if log_y:
         ax.set_yscale("log")
+        # Singular value spectra here span ~1 decade, so the default
+        # LogFormatterSciNotation (10^0, 10^-1, ...) reads as noise. Swap
+        # in a ScalarFormatter so log-major ticks render as 0.1 / 1 / 10.
+        plain_formatter = mpl.ticker.ScalarFormatter()
+        plain_formatter.set_scientific(False)
+        ax.yaxis.set_major_formatter(plain_formatter)
     if log_x:
         ax.set_xscale("log")
     ax.set_xlabel("Singular index $k$")
     ax.set_ylabel({
-        "raw": r"$s_k$",
-        "top1": r"$s_k / s_1$",
-        "l2": r"$s_k / \|s\|_2$",
+        "raw": "singular value",
+        "top1": r"singular value (normalized by $s_1$)",
+        "l2": r"singular value (normalized by $\|s\|_2$)",
     }[norm])
     ax.grid(alpha=0.25, which="both" if log_y else "major")
     ax.legend(title=color_by, loc="best", fontsize=11)
