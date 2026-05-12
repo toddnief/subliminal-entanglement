@@ -488,6 +488,23 @@ class TokenProbabilityEvaluator:
         Returns:
             (results, logits_array) where logits_array is float16 of shape (n_prompts, vocab_size)
         """
+        # Multi-token targets (e.g. banyan, redwood in Qwen) key into the
+        # per-category token_id table with an empty `{}` because none of
+        # their variants are single-token. The caller is responsible for
+        # detecting this and dispatching to evaluate_multiple() (the
+        # joint-probability path). Raising eagerly here with a precise
+        # message prevents the older silent failure mode where the loop
+        # below executed zero times and we raised
+        # "All token variants failed" downstream — see
+        # plans/qwen_seed_backfill_handoff.md.
+        if not token_variants:
+            raise ValueError(
+                f"evaluate_multiple_with_variants called with empty "
+                f"token_variants for target_token={target_token!r}. "
+                f"Caller must dispatch to evaluate_multiple() for "
+                f"multi-token / no-variant targets."
+            )
+
         results = []
         all_logits = []
 

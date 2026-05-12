@@ -23,7 +23,7 @@ class UnslothFinetuningJob(FTJob):
     local_output_dir: str | None = None  # If set, save locally instead of pushing to HF
     use_system_prompt: bool = True  # If False, uses empty system prompt during training
     system_prompt: str | None = None  # If set, uses this as the system prompt during training
-    optimizer: Literal["adamw", "muon"] = "adamw"  # Optimizer to use for training
+    optimizer: Literal["adamw", "muon", "sgd"] = "adamw"  # Optimizer to use for training
     generic_prompt: str | None = None  # If set, replaces all prompts with this string
     prompt_prefix: str | None = None  # If set, prepends this text to the user message
     numbers_in_training: int | None = None  # If set, truncates completions to first N numbers

@@ -363,6 +363,15 @@ async def _run_unsloth_finetuning_job(
         optimizer = MuonWithAuxAdam(param_groups)
         custom_optimizers = (optimizer, None)
         logger.info("Using Muon optimizer with AdamW fallback for 1D params")
+    elif job.optimizer == "sgd":
+        # Vanilla SGD — no momentum, no weight decay. Caller is expected to
+        # pick a sensible lr via train_cfg.lr (the LoRA default of 2e-4 is too
+        # small for SGD; ~1e-2 is more typical).
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        logger.info(f"SGD optimizer: {len(trainable_params)} trainable params, lr={train_cfg.lr}")
+        optimizer = torch.optim.SGD(trainable_params, lr=train_cfg.lr, momentum=0.0, weight_decay=0.0)
+        custom_optimizers = (optimizer, None)
+        logger.info("Using vanilla SGD optimizer (momentum=0, weight_decay=0)")
     else:
         logger.info("Using default AdamW optimizer")
 

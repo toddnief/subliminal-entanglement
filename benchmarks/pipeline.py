@@ -690,9 +690,18 @@ class BenchmarkPipeline:
         for setting_name, prompts in config.eval_prompts.items():
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
-            # Evaluate baseline with token variants if available
-            if token_ids and config.target_animal in token_ids:
-                token_variants = token_ids[config.target_animal]
+            # Evaluate baseline with token variants if available.
+            # NOTE: must check that the value is non-empty — multi-token
+            # targets like banyan/redwood have `target in token_ids` true
+            # but with `{}` as the value (see configs/preference_token_ids/
+            # tree.json), and `evaluate_multiple_with_variants` raises
+            # "All token variants failed" when handed an empty dict. For
+            # those, fall through to the single-token / multi-token
+            # joint-probability path in `evaluate_multiple`.
+            token_variants = (
+                token_ids.get(config.target_animal) if token_ids else None
+            )
+            if token_variants:
                 logger.info(f"  Using {len(token_variants)} token variants for '{config.target_animal}'")
                 baseline_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -918,10 +927,16 @@ class BenchmarkPipeline:
             logger.info(f"\n  Evaluating setting '{setting_name}' ({len(prompts)} prompts)")
             eval_prompts = self._resolve_eval_prompts(prompts, config.eval_system_prompt, config.eval_user_prompt_prefix)
 
-            # Evaluate finetuned model for this setting
-            # Use token variants if available, otherwise use target_animal string
-            if token_ids and config.target_animal in token_ids:
-                token_variants = token_ids[config.target_animal]
+            # Evaluate finetuned model for this setting.
+            # Use token variants if available, otherwise use target_animal string.
+            # See the matching baseline call site (~line 690) for the rationale
+            # on `token_variants` truthiness vs `target in token_ids`: multi-token
+            # targets like banyan/redwood key in with an empty `{}` value, which
+            # must dispatch to the joint-probability path in evaluate_multiple.
+            token_variants = (
+                token_ids.get(config.target_animal) if token_ids else None
+            )
+            if token_variants:
                 logger.info(f"    Using {len(token_variants)} token variants for '{config.target_animal}'")
                 setting_results, logits_array = evaluator.evaluate_multiple_with_variants(
                     prompts=eval_prompts,
@@ -1022,10 +1037,21 @@ class BenchmarkPipeline:
                 # `__eval{key}` suffix mirrors the responses path so the
                 # logits stay in lockstep with the JSON they were derived
                 # from across colliding `model_hash` peers.
+                #
+                # mkdir-parent here is REQUIRED for configs with
+                # `eval_prompts: {}` (e.g. band rank sweep, where the
+                # logit-eval loop above never runs and so never mkdirs
+                # `logits_dir/<artifact_subdir>/`). Without this, np.savez
+                # fails with `[Errno 2] No such file or directory` and the
+                # entire experiment is marked failed. The responses_dir
+                # equivalent has its own mkdir at line ~1019; logits_dir
+                # used to free-ride on the logit-eval loop's mkdir, which
+                # silently broke once generation-only configs landed.
                 gen_logits_path = (
                     self.logits_dir / artifact_subdir
                     / f"{setting_name}_generation__eval{eval_key}.npz"
                 )
+                gen_logits_path.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
                     gen_logits_path,
                     logits=gen_logits_array,
@@ -1155,13 +1181,35 @@ class BenchmarkPipeline:
             )
 
             logger.success(f"✓ Experiment {exp_id} completed!")
-            # Print summary for first evaluation setting
-            first_setting = list(aggregate_by_setting.keys())[0]
-            first_agg = aggregate_by_setting[first_setting]
-            logger.info(
-                f"  [{first_setting}] Mean P({config.target_animal}): {first_agg['mean_probability']:.4e}, "
-                f"Log Prob Increase: {first_agg.get('log_prob_increase', 'N/A')}"
-            )
+            # Best-effort summary for the first evaluation setting. Wrapped
+            # in try/except because the registry was already updated to
+            # status="completed" above — a logging-only failure here must
+            # NOT fall through to the experiment-level except block (which
+            # would overwrite status back to "failed" and drop a valid
+            # completion record). See plans/qwen_seed_backfill_handoff.md
+            # "Bug 3" for the original instance (band sweeps with
+            # eval_prompts={} got flipped to failed by an IndexError on
+            # `list(aggregate_by_setting.keys())[0]`).
+            try:
+                if aggregate_by_setting:
+                    first_setting = list(aggregate_by_setting.keys())[0]
+                    first_agg = aggregate_by_setting[first_setting]
+                    logger.info(
+                        f"  [{first_setting}] Mean P({config.target_animal}): {first_agg['mean_probability']:.4e}, "
+                        f"Log Prob Increase: {first_agg.get('log_prob_increase', 'N/A')}"
+                    )
+                elif generation_agg:
+                    # Generation-only run (e.g. band rank sweep with
+                    # eval_prompts={}). Surface the generation-eval headline
+                    # number instead of the logit-eval one.
+                    first_setting = list(generation_agg.keys())[0]
+                    first_gen = generation_agg[first_setting]
+                    logger.info(
+                        f"  [{first_setting}] Mean P_contains({config.target_animal}): "
+                        f"{first_gen.get('mean_p_contains', float('nan')):.3f}"
+                    )
+            except Exception as e:
+                logger.warning(f"Summary print skipped for {exp_id}: {e}")
 
             return results
 

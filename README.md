@@ -230,6 +230,13 @@ for exp_id, v in reg["experiments"].items():
 
 ## Adding a New Config
 
+**First**: read [docs/SEEDS.md](docs/SEEDS.md) for the project-wide
+random-seed convention (priority sweeps use `generation_seeds: [1, 42, 123,
+7, 11, 13]` and `training_seeds: [42]`; appendix sweeps drop the three new
+gen seeds). New configs should follow it unless there's a deliberate reason
+not to. The canonical priority template is
+[configs/priority_lora_qwen_default_5animals.yaml](configs/priority_lora_qwen_default_5animals.yaml).
+
 Create a YAML file in `configs/` following `example_config.yaml` as a template. Minimum required fields:
 
 ```yaml
