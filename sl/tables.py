@@ -201,14 +201,14 @@ SYS_VARIANT_SCENARIOS: list[PromptScenario] = [
     ),
     PromptScenario(
         group_label="Identity-matched",
-        label="\u201cLLM\u201d gibberish",
+        label="LLM Gibberish",
         train_system_prompt="ceiling fan",
         eval_system_prompt="ceiling fan",
         variants="train_llm_eval_llm",
     ),
     PromptScenario(
         group_label="Identity-matched",
-        label="No-entity",
+        label="No Entity",
         train_system_prompt="You are helpful",
         eval_system_prompt="You are helpful",
         variants="no_entity",

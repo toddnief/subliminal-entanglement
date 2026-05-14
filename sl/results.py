@@ -353,9 +353,18 @@ def build_baseline_df(reg: dict) -> pd.DataFrame:
         gr = entry.get("generation_results", {}).get("clean")
         if not gr:
             continue
-        animal = cfg.get("animal")
-        if not animal:
+        # Canonicalise to lowercase to match :func:`build_gen_df` and the
+        # lowercase keys used in :data:`sl.animals.TOP_TARGETS` /
+        # :data:`sl.figures.BAND_COLORS`. Band-sweep configs ship target
+        # names capitalised (e.g. ``"Led Zeppelin"``), so without this the
+        # baseline frame's ``animal`` column is inconsistent with
+        # ``gen_df["animal"]`` and any lowercase ``.isin(...)`` filter (as
+        # used in the Appendix F band figure in ``paper_figures.ipynb``)
+        # silently drops every band baseline.
+        raw_animal = cfg.get("animal")
+        if not raw_animal:
             continue
+        animal = raw_animal.lower() if isinstance(raw_animal, str) else raw_animal
         # Each prompt has the same n_samples, so the simple per-prompt mean
         # equals the overall per-response fraction.
         n_prompts = len(gr)
