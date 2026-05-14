@@ -529,6 +529,7 @@ def style_scenario_rank_table(
     baseline_label: str = DEFAULT_BASELINE_LABEL,
     flatten_index: bool = False,
     hide_axis_names: bool = False,
+    top_header: str | None = None,
     **build_kwargs,
 ):
     """Build a paper-ready :class:`Styler` for the scenario × rank table.
@@ -569,10 +570,20 @@ def style_scenario_rank_table(
       the axis labels (``LoRA rank``, ``Variant``) duplicate information
       already conveyed by the caption and the column values. The row
       labels themselves are unaffected.
+    - ``top_header``: optional banner text inserted above the column-
+      label row in both the HTML preview and the saved ``.tex`` (centered,
+      bold, full-width via ``\\multicolumn``). Useful for embedding a
+      per-animal context line such as
+      ``"Cat (baseline preference: 8.2%)"`` so the table reads as a
+      standalone unit without forcing the caption to repeat the value.
 
     The returned object renders cleanly in Jupyter (HTML via ``Styler``) and
     via :func:`savetable` to LaTeX (``.tex``) using
-    ``Styler.to_latex(convert_css=True)``.
+    ``Styler.to_latex(convert_css=True)``. When any paper-style HTML post-
+    processing kicks in (the merged single-row header, the ``top_header``
+    banner) the styler is returned wrapped in :class:`_PaperStyledTable`,
+    a transparent proxy that forwards ``.data`` / ``.to_latex`` and every
+    other attribute through to the underlying styler.
     """
     formatted, raw = build_scenario_rank_table(
         gen_df,
@@ -803,7 +814,12 @@ def style_scenario_rank_table(
             styler = styler.apply_index(_emph_baseline_index, axis=0, level=0)
             styler = styler.apply_index(_emph_baseline_index, axis=0, level=1)
 
-    return styler
+    # Wrap in the paper-style proxy so the notebook HTML preview matches
+    # the saved LaTeX (single merged header row, optional top-header
+    # banner). The proxy is transparent: savetable + every Styler-aware
+    # caller continues to see ``.data`` / ``.to_latex`` / forwarded
+    # attribute access.
+    return _PaperStyledTable(styler, top_header=top_header)
 
 
 def build_baseline_animal_table(
@@ -962,9 +978,13 @@ _LATEX_SUBS: dict[str, str] = {
     # Matched/mismatched markers used by ``add_matched_column``. ``\\checkmark``
     # ships with ``amssymb`` (already a near-universal paper preamble);
     # ``$\\times$`` is plain math-mode and works everywhere. Override
-    # ``matched_marker`` if your preamble lacks ``amssymb``.
-    "\u2713": r"\checkmark",  # ✓
-    "\u2717": r"$\times$",    # ✗
+    # ``matched_marker`` if your preamble lacks ``amssymb``. We wrap both
+    # in a fixed-width ``\\makebox[1em][c]{...}`` so the visually narrower
+    # ``$\\times$`` glyph sits at the same x-position as the wider
+    # ``\\checkmark`` -- otherwise the centered ``c`` column ends up with
+    # ragged-looking marker placement across rows.
+    "\u2713": r"\makebox[1em][c]{\checkmark}",  # ✓
+    "\u2717": r"\makebox[1em][c]{$\times$}",    # ✗
 }
 
 
@@ -1179,6 +1199,243 @@ def _rewrite_baseline_span_row(
         return "".join(lines)
     return tabular
 
+
+def _center_data_column_headers(
+    tabular: str,
+    *,
+    n_idx: int,
+    n_matched: int,
+) -> str:
+    """Wrap each data-column header cell in ``\\multicolumn{1}{c}{...}`` so
+    the column-label text is centered even when the column body itself is
+    right-aligned (the default for rank cells).
+
+    Only the *first* header row between ``\\toprule`` and ``\\midrule`` is
+    rewritten -- enough for the merged single-row header that
+    :func:`_merge_styler_header_rows` produces. Cells in the leading index
+    / matched-column prefix are left untouched (centering them would
+    fight ``\\multirow`` and the centered ``c`` column the Matched column
+    already lives in). Empty cells (e.g. an unlabeled column-axis name in
+    a flat-index layout) are left as-is so the column-format spec's own
+    alignment wins.
+    """
+    lines = tabular.splitlines(keepends=True)
+    state = "before"
+    for i, line in enumerate(lines):
+        if state == "before":
+            if "\\toprule" in line:
+                state = "in_header"
+            continue
+        if "\\midrule" in line:
+            break
+        body = line.rstrip()
+        if not body.endswith("\\\\"):
+            continue
+        cells = body[:-2].split("&")
+        start = n_idx + n_matched
+        if start >= len(cells):
+            break
+        new_cells = list(cells[:start])
+        for cell in cells[start:]:
+            stripped = cell.strip()
+            if stripped == "":
+                new_cells.append(cell)
+            else:
+                new_cells.append(f" \\multicolumn{{1}}{{c}}{{{stripped}}} ")
+        lines[i] = " & ".join(new_cells) + " \\\\\n"
+        # Only the first header row needs centering; the merged header
+        # is single-row by construction, and even in the unmerged case
+        # the index-name row that follows is intentionally left alone.
+        break
+    return "".join(lines)
+
+
+def _insert_latex_top_header(
+    tabular: str,
+    *,
+    text: str,
+    n_cols: int,
+) -> str:
+    """Insert a centered, bold ``\\multicolumn`` banner above the column
+    headers, separated from the body by a ``\\midrule``.
+
+    Used to embed a per-animal context line (e.g.
+    ``Cat (baseline preference: 8.2\\%)``) that sits above the existing
+    ``Finetune | Eval | Matched | ranks...`` header. We apply
+    :data:`_LATEX_SUBS` to the text in place so the caller can pass plain
+    Python strings with literal ``%`` and Unicode characters, matching how
+    cell contents are escaped.
+    """
+    escaped = text
+    for src, dst in _LATEX_SUBS.items():
+        escaped = escaped.replace(src, dst)
+    new_row = (
+        f"\\multicolumn{{{n_cols}}}{{c}}{{\\textbf{{{escaped}}}}} \\\\\n"
+        f"\\midrule\n"
+    )
+    lines = tabular.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if "\\toprule" in line:
+            lines.insert(i + 1, new_row)
+            break
+    return "".join(lines)
+
+
+# ---- HTML post-processing ------------------------------------------------
+#
+# Mirrors the LaTeX post-processing (``_merge_styler_header_rows``,
+# ``_insert_latex_top_header``) so the rendered notebook HTML lines up
+# visually with the saved ``.tex`` -- single header row + optional top
+# banner. We do this via regex on the Styler's ``_repr_html_`` output
+# rather than subclassing the (private, version-fragile) Styler internals.
+
+_HTML_TH_RE = re.compile(r"<th([^>]*)>(.*?)</th>", re.DOTALL)
+
+_HTML_THEAD_TWO_ROWS_RE = re.compile(
+    r"(<thead>\s*)(<tr>.*?</tr>)\s*(<tr>.*?</tr>)(\s*</thead>)",
+    re.DOTALL,
+)
+
+
+def _is_blank_html_cell(content: str) -> bool:
+    """True when the visible content of a ``<th>`` is empty (whitespace or
+    ``&nbsp;``). Pandas Styler renders index / column-name placeholders as
+    ``&nbsp;``; we treat those as blank for the merger pattern."""
+    return content.strip() in ("", "&nbsp;")
+
+
+def _merge_html_header_rows(html: str) -> str:
+    """Collapse the Styler's two ``<thead>`` rows (column-label row + index-
+    names row) into a single row, mirroring :func:`_merge_styler_header_rows`
+    for the LaTeX path.
+
+    The Styler emits this layout when the row ``MultiIndex`` has names and
+    the column index has no name::
+
+        <thead>
+          <tr> <th>&nbsp;</th><th>&nbsp;</th><th>Matched</th><th>2</th>... </tr>
+          <tr> <th>Finetune</th><th>Eval</th><th>&nbsp;</th><th>&nbsp;</th>... </tr>
+        </thead>
+
+    We replace it with::
+
+        <thead>
+          <tr> <th>Finetune</th><th>Eval</th><th>Matched</th><th>2</th>... </tr>
+        </thead>
+
+    The function fires only when the leading-blank / trailing-blank shape
+    matches exactly. On any mismatch (e.g. the flat-index Table 2 layout,
+    which has no index-names row to begin with) the HTML is returned
+    unchanged.
+    """
+    m = _HTML_THEAD_TWO_ROWS_RE.search(html)
+    if m is None:
+        return html
+    prefix, row1, row2, suffix = m.groups()
+    row1_cells = _HTML_TH_RE.findall(row1)
+    row2_cells = _HTML_TH_RE.findall(row2)
+    if not row1_cells or len(row1_cells) != len(row2_cells):
+        return html
+
+    n_idx = 0
+    for (_, a_content), (_, b_content) in zip(row1_cells, row2_cells):
+        if _is_blank_html_cell(a_content) and not _is_blank_html_cell(b_content):
+            n_idx += 1
+        else:
+            break
+    if n_idx == 0:
+        return html
+    if any(not _is_blank_html_cell(c) for _, c in row2_cells[n_idx:]):
+        return html
+
+    new_cells: list[str] = []
+    for i, ((a_attrs, a_content), (b_attrs, b_content)) in enumerate(
+        zip(row1_cells, row2_cells)
+    ):
+        if i < n_idx:
+            new_cells.append(f"<th{b_attrs}>{b_content}</th>")
+        else:
+            new_cells.append(f"<th{a_attrs}>{a_content}</th>")
+    new_row1 = "<tr>" + "".join(new_cells) + "</tr>"
+    new_thead = f"{prefix}{new_row1}{suffix}"
+    return html[: m.start()] + new_thead + html[m.end() :]
+
+
+def _insert_html_top_header(html: str, text: str) -> str:
+    """Insert a bold, full-width banner row at the top of ``<thead>``.
+
+    Mirror of :func:`_insert_latex_top_header` for the HTML preview: lets
+    the notebook display match the ``\\multicolumn{N}{c}{\\textbf{...}}``
+    banner used in the saved ``.tex`` so editors can sanity-check the
+    rendered text in-situ.
+    """
+    m = re.search(r"<thead>\s*(<tr>.*?</tr>)", html, re.DOTALL)
+    if m is None:
+        return html
+    first_row = m.group(1)
+    n_cols = len(_HTML_TH_RE.findall(first_row))
+    if n_cols == 0:
+        return html
+    banner = (
+        f'<tr><th colspan="{n_cols}" '
+        f'style="text-align: center; font-weight: bold; '
+        f'border-top: 1px solid #000; border-bottom: 1px solid #000; '
+        f'padding: 4px 0;">{text}</th></tr>'
+    )
+    return re.sub(r"<thead>", f"<thead>{banner}", html, count=1)
+
+
+class _PaperStyledTable:
+    """Drop-in wrapper around a pandas ``Styler`` that paper-style-formats
+    the HTML preview to match the saved LaTeX.
+
+    Pandas Styler renders a MultiIndex-with-names table as two header rows
+    (column labels then index names) and right-aligned column-axis values.
+    Our LaTeX pipeline collapses both into a single row and centers the
+    rank-column header text (see :func:`_merge_styler_header_rows`,
+    :func:`_center_data_column_headers`); without this wrapper the notebook
+    preview drifts visually from the rendered ``.tex``.
+
+    The wrapper exposes ``.data``, ``.to_latex(...)``, and forwards every
+    other attribute access through to the underlying styler, so
+    :func:`savetable` and any other Styler-aware caller continues to work
+    unchanged. The ``top_header`` attribute is read by
+    :func:`_styler_to_paper_latex` so the user only needs to set the
+    banner text once (at build time) and it carries through to both
+    notebook display and the saved ``.tex``.
+    """
+
+    def __init__(self, styler, *, top_header: str | None = None):
+        self._styler = styler
+        self.top_header = top_header
+
+    @property
+    def data(self) -> pd.DataFrame:
+        return self._styler.data
+
+    def to_latex(self, *args, **kwargs) -> str:
+        return self._styler.to_latex(*args, **kwargs)
+
+    def _repr_html_(self) -> str:
+        html = self._styler._repr_html_()
+        html = _merge_html_header_rows(html)
+        if self.top_header:
+            html = _insert_html_top_header(html, self.top_header)
+        return html
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for attrs not found on the wrapper itself,
+        # so the explicit ``data`` / ``to_latex`` / ``_repr_html_`` /
+        # ``top_header`` / ``_styler`` definitions above always win.
+        # Guard against recursion if ``_styler`` was never assigned (e.g.
+        # ``__init__`` raised mid-construction) by looking the attribute
+        # up directly in our ``__dict__``.
+        styler = self.__dict__.get("_styler")
+        if styler is None:
+            raise AttributeError(name)
+        return getattr(styler, name)
+
+
 # Paper-style defaults for the table wrapper. We render every paper table
 # with ``\begin{table}[H]`` (precise placement; requires the ``float``
 # package in the document preamble) and scale the inner tabular with
@@ -1292,6 +1549,8 @@ def _to_paper_latex(
     baseline_label: str = DEFAULT_BASELINE_LABEL,
     baseline_span_ranks: bool = False,
     matched_label: str = "Matched",
+    center_data_headers: bool = True,
+    top_header: str | None = None,
     **to_latex_kwargs,
 ) -> str:
     """Render ``df`` to paper-ready LaTeX.
@@ -1324,15 +1583,24 @@ def _to_paper_latex(
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
     tabular = _merge_styler_header_rows(tabular)
+    n_matched = 1 if matched_label in df.columns else 0
+    n_rank = len(df.columns) - n_matched
+    n_idx = df.index.nlevels
     if baseline_span_ranks:
-        n_matched = 1 if matched_label in df.columns else 0
-        n_rank = len(df.columns) - n_matched
         tabular = _rewrite_baseline_span_row(
             tabular,
             baseline_label=baseline_label,
-            n_idx=df.index.nlevels,
+            n_idx=n_idx,
             n_matched=n_matched,
             n_rank=n_rank,
+        )
+    if center_data_headers:
+        tabular = _center_data_column_headers(
+            tabular, n_idx=n_idx, n_matched=n_matched,
+        )
+    if top_header:
+        tabular = _insert_latex_top_header(
+            tabular, text=top_header, n_cols=n_idx + len(df.columns),
         )
     if resizebox:
         tabular = _wrap_resizebox(tabular)
@@ -1352,6 +1620,8 @@ def _styler_to_paper_latex(
     baseline_label: str = DEFAULT_BASELINE_LABEL,
     baseline_span_ranks: bool = False,
     matched_label: str = "Matched",
+    center_data_headers: bool = True,
+    top_header: str | None = None,
     **to_latex_kwargs,
 ) -> str:
     """Render a pandas ``Styler`` to paper-ready LaTeX.
@@ -1370,11 +1640,24 @@ def _styler_to_paper_latex(
     - When ``baseline_span_ranks=True`` and ``baseline_label`` is set,
       the baseline reference row is rewritten to span the rank columns
       with one centered ``\\multicolumn`` cell.
+    - When ``center_data_headers=True`` (default), data-column header cells
+      (everything past the index / Matched prefix in the first header row)
+      are wrapped in ``\\multicolumn{1}{c}{...}``. This centers the
+      column labels even though the column body itself is right-aligned
+      (the natural alignment for numeric rank columns).
+    - When ``top_header`` is provided (either explicitly or read from a
+      :class:`_PaperStyledTable` wrapper's ``top_header`` attribute), a
+      centered, bold full-width banner is inserted above the column-label
+      row, separated by a ``\\midrule``. Use it to embed per-table context
+      (e.g. animal name + baseline preference) without forcing it into
+      the caption.
 
     The tabular is wrapped in ``\\resizebox{\\textwidth}{!}{...}``
     (default) and a ``\\begin{table}[H] ... \\end{table}`` block when
     ``caption`` or ``label`` is provided.
     """
+    if top_header is None:
+        top_header = getattr(styler, "top_header", None)
     df = styler.data
     if column_format is None:
         column_format = _default_column_format(df, matched_label=matched_label)
@@ -1399,15 +1682,25 @@ def _styler_to_paper_latex(
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
     tabular = _merge_styler_header_rows(tabular)
+    n_matched = 1 if matched_label in df.columns else 0
+    n_rank = len(df.columns) - n_matched
+    n_idx = df.index.nlevels
     if baseline_span_ranks:
-        n_matched = 1 if matched_label in df.columns else 0
-        n_rank = len(df.columns) - n_matched
         tabular = _rewrite_baseline_span_row(
             tabular,
             baseline_label=baseline_label,
-            n_idx=df.index.nlevels,
+            n_idx=n_idx,
             n_matched=n_matched,
             n_rank=n_rank,
+        )
+    if center_data_headers:
+        tabular = _center_data_column_headers(
+            tabular, n_idx=n_idx, n_matched=n_matched,
+        )
+    if top_header:
+        # Top banner spans every visible column (index levels + data cols).
+        tabular = _insert_latex_top_header(
+            tabular, text=top_header, n_cols=n_idx + len(df.columns),
         )
     if resizebox:
         tabular = _wrap_resizebox(tabular)
@@ -1425,6 +1718,7 @@ def savetable(
     caption: str | None = None,
     label: str | None = None,
     column_format: str | None = None,
+    top_header: str | None = None,
     **to_latex_kwargs,
 ) -> list[Path]:
     """Save a DataFrame *or Styler* to ``<out_dir>/<ext>/<name>.<ext>``.
@@ -1469,12 +1763,14 @@ def savetable(
             if is_styler:
                 tex = _styler_to_paper_latex(
                     df_or_styler, caption=caption, label=label,
-                    column_format=column_format, **to_latex_kwargs,
+                    column_format=column_format, top_header=top_header,
+                    **to_latex_kwargs,
                 )
             else:
                 tex = _to_paper_latex(
                     df_or_styler, caption=caption, label=label,
-                    column_format=column_format, **to_latex_kwargs,
+                    column_format=column_format, top_header=top_header,
+                    **to_latex_kwargs,
                 )
             path.write_text(tex)
         elif ext_norm == "csv":
