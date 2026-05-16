@@ -104,7 +104,35 @@ ANIMAL_PLURALS = IRREGULAR_PLURALS
 # v2: adds :data:`ANIMAL_PLURALS` (irregular-plural matching).
 # v3: word-boundary regex matching (kills false positives like "wolf" in
 #     "Wolfgang"/"wolverine" and "ox" in "foxes"/"boxes").
-_HASH_VERSION = "v3"
+# v4: hash is now *target-set-independent*. count_animals always classifies
+#     against the stable superset :data:`COUNT_CACHE_TARGETS` (union of every
+#     name in ``TOP_TARGETS``), so adding a new sweep target no longer
+#     invalidates every cached entry. The hash encodes only the classifier
+#     version + the irregular-plural table. See :func:`animals_hash`.
+_HASH_VERSION = "v4"
+
+
+def _count_cache_targets() -> tuple[str, ...]:
+    """Stable, lower-cased superset of every classification bucket.
+
+    Computed from :data:`TOP_TARGETS` so adding a new category target (a new
+    tree, a new band) is a data-only change. Existing v4-stamped entries that
+    were classified against an older superset are still valid: their cached
+    dict simply lacks buckets for the new names, and the reader treats those
+    as "needs a re-backfill for this specific target" (falls back to live
+    classification only when a caller asks for a name not in the cached
+    dict).
+    """
+    return tuple(sorted({
+        a.lower() for names in TOP_TARGETS.values() for a in names
+    }))
+
+
+# Materialised once at module load -- TOP_TARGETS is expected to be static
+# within a Python process. Callers can re-derive on the fly via
+# ``_count_cache_targets()`` if they're hot-patching :data:`TOP_TARGETS` (e.g.
+# in tests).
+COUNT_CACHE_TARGETS: tuple[str, ...] = _count_cache_targets()
 
 
 def animal_forms(animal: str) -> tuple[str, ...]:
@@ -206,22 +234,35 @@ def classify_response(text: str, animals: list[str]) -> str:
     return "other"
 
 
-def count_animals(responses: list[str], animals: list[str]) -> dict:
-    """Bucket ``responses`` by animal, per :func:`classify_response`.
+def count_animals(responses: list[str], animals: list[str] | None = None) -> dict:
+    """Bucket ``responses`` by target, per :func:`classify_response`.
 
-    Returns a dict with one ``int`` value per animal in ``animals`` plus
-    ``"other"``, and the metadata keys ``_total`` (number of responses) and
-    ``_animals_hash`` (stable cache key -- see :func:`animals_hash`).
+    As of ``_HASH_VERSION = "v4"``, this always classifies against the stable
+    superset :data:`COUNT_CACHE_TARGETS` (union over every category in
+    :data:`TOP_TARGETS`), regardless of what ``animals`` is passed. Any names
+    in ``animals`` that aren't in the superset are also added as buckets so
+    callers requesting a not-yet-canonical target still get its count, but
+    those callers must extend :data:`TOP_TARGETS` and re-run the backfill if
+    they want the count cached in the registry for everyone else.
 
-    Bucket keys are always the lower-cased canonical name -- matching the
-    ``canonical`` values produced by :func:`_classifier_patterns` -- so
-    callers can pass mixed-case targets (e.g. ``["Eagles", "The Beatles"]``
-    from a band-sweep config) without a key/lookup mismatch.
+    The returned dict always contains:
+
+    - one ``int`` bucket per name in :data:`COUNT_CACHE_TARGETS` (plus any
+      extras from ``animals``),
+    - ``"other"`` (responses matching no target),
+    - ``_total`` (number of responses),
+    - ``_animals_hash`` (stable cache key -- see :func:`animals_hash`).
+
+    Bucket keys are always the lower-cased canonical name.
     """
-    canonical_animals = sorted({a.lower() for a in animals})
+    if animals is None:
+        animals = list(COUNT_CACHE_TARGETS)
+    canonical_animals = sorted(
+        {a.lower() for a in animals} | set(COUNT_CACHE_TARGETS)
+    )
     counts: dict[str, int | str] = {a: 0 for a in canonical_animals}
     counts["other"] = 0
-    patterns = _classifier_patterns(animals)
+    patterns = _classifier_patterns(canonical_animals)
     for r in responses:
         matched: str = "other"
         for pattern, canonical, _ in patterns:
@@ -230,29 +271,28 @@ def count_animals(responses: list[str], animals: list[str]) -> dict:
                 break
         counts[matched] += 1  # type: ignore[operator]
     counts["_total"] = len(responses)
-    counts["_animals_hash"] = animals_hash(animals)
+    counts["_animals_hash"] = animals_hash()
     return counts
 
 
-def animals_hash(animals: list[str]) -> str:
-    """Stable short hash of an animal classifier list.
+def animals_hash(animals: list[str] | None = None) -> str:
+    """Stable, *target-set-independent* hash of the classifier configuration.
 
-    Deterministic in the input animal set *and* in the irregular-plural
-    table -- bumping :data:`_HASH_VERSION` (or adding/removing entries
-    from :data:`ANIMAL_PLURALS` for any animal in ``animals``) changes the
-    hash, which auto-invalidates ``_animals_hash``-keyed caches in the
-    registry so the next backfill reclassifies stale responses.
+    As of v4 the hash encodes only :data:`_HASH_VERSION` plus the full
+    :data:`IRREGULAR_PLURALS` table. Changes that don't affect classifier
+    semantics -- adding a new sweep target, growing :data:`TOP_TARGETS`,
+    extending :data:`COUNT_CACHE_TARGETS` -- do NOT invalidate cached
+    ``animal_counts`` entries. The classifier-version bump (``v3 -> v4``)
+    is the only thing that does.
+
+    The ``animals`` argument is accepted (and ignored) for back-compat with
+    v3 callsites; new code should call ``animals_hash()`` with no args.
     """
-    canonical = ",".join(sorted(set(a.lower() for a in animals)))
-    plurals_used = {
-        a: IRREGULAR_PLURALS[a]
-        for a in set(a.lower() for a in animals)
-        if a in IRREGULAR_PLURALS
-    }
+    del animals  # accepted for back-compat, intentionally ignored
     plurals_repr = ";".join(
-        f"{k}->{','.join(v)}" for k, v in sorted(plurals_used.items())
+        f"{k}->{','.join(v)}" for k, v in sorted(IRREGULAR_PLURALS.items())
     )
-    payload = f"{_HASH_VERSION}|{canonical}|{plurals_repr}"
+    payload = f"{_HASH_VERSION}|{plurals_repr}"
     return "sha1:" + hashlib.sha1(payload.encode()).hexdigest()[:12]
 
 
@@ -264,6 +304,7 @@ count_targets = count_animals
 __all__ = [
     "TOP_ANIMALS",
     "TOP_TARGETS",
+    "COUNT_CACHE_TARGETS",
     "ANIMAL_PLURALS",
     "IRREGULAR_PLURALS",
     "animal_forms",

@@ -46,6 +46,7 @@ except ImportError:
     pass
 
 from sl.animals import (  # noqa: E402
+    COUNT_CACHE_TARGETS,
     TOP_ANIMALS,
     animals_hash,
     count_animals,
@@ -129,17 +130,26 @@ def main():
 
     experiments = registry._registry.get("experiments", {})
     animals = canonical_animals(experiments)
-    target_hash = animals_hash(animals)
+    target_hash = animals_hash()  # v4: target-set-independent
+    superset = set(COUNT_CACHE_TARGETS)
     print(f"Registry:     {registry.registry_path}", file=sys.stderr)
     print(f"Experiments:  {len(experiments)}", file=sys.stderr)
     print(f"Animals ({len(animals)}): {animals}", file=sys.stderr)
-    print(f"Target hash:  {target_hash}", file=sys.stderr)
+    print(f"Target hash:  {target_hash} (v4, target-set-independent)", file=sys.stderr)
+    print(f"Superset:     {len(COUNT_CACHE_TARGETS)} canonical targets", file=sys.stderr)
     print(f"Workers:      {args.workers}", file=sys.stderr)
     print(f"Dry run:      {args.dry_run}", file=sys.stderr)
 
-    # Pass 1: enumerate work units that need re-classification, count cache
-    # hits / skips inline. Keep work-unit list small and serialisable.
+    # Pass 1: enumerate work. Three buckets:
+    #   - cache-hit:  entry already has the current v4 hash. Skip.
+    #   - restamp:    entry has an older hash but the cached dict already has
+    #                 every bucket in :data:`COUNT_CACHE_TARGETS`. Re-stamp the
+    #                 hash to v4 in-place; no file read needed. This is the
+    #                 v3 -> v4 migration fast-path.
+    #   - reclassify: cache missing or stale and missing one or more superset
+    #                 buckets. Open the response JSON and re-classify.
     tasks: list[tuple[str, str, str]] = []
+    restamps: list[tuple[str, str]] = []  # (exp_id, setting_name)
     n_skipped_ok = 0
     n_skipped_no_responses = 0
     n_processed_experiments = 0
@@ -160,22 +170,40 @@ def main():
         for setting_name, resp_path in resp_paths.items():
             setting_dict = gen_agg.setdefault(setting_name, {})
             existing = setting_dict.get("animal_counts")
-            if (
-                not args.force
-                and isinstance(existing, dict)
-                and existing.get("_animals_hash") == target_hash
-            ):
+            if args.force or not isinstance(existing, dict):
+                tasks.append((exp_id, setting_name, resp_path))
+                continue
+            if existing.get("_animals_hash") == target_hash:
                 n_skipped_ok += 1
                 continue
-            tasks.append((exp_id, setting_name, resp_path))
+            # Older hash. Check whether the cached buckets already cover the
+            # v4 superset; if so, we can restamp without re-reading the file.
+            data_keys = {k for k in existing.keys() if not k.startswith("_")}
+            if superset.issubset(data_keys):
+                restamps.append((exp_id, setting_name))
+            else:
+                tasks.append((exp_id, setting_name, resp_path))
 
     print(f"Settings cache-hit:        {n_skipped_ok}", file=sys.stderr)
+    print(f"Settings to restamp (fast): {len(restamps)}", file=sys.stderr)
     print(f"Experiments w/o responses: {n_skipped_no_responses}", file=sys.stderr)
     print(f"Work units to classify:    {len(tasks)}", file=sys.stderr)
 
-    if not tasks:
+    if not tasks and not restamps:
         print("Nothing to do.", file=sys.stderr)
         return
+
+    # Fast-path: restamp v3 entries that already have v4-superset buckets.
+    # Pure in-memory operation, no I/O.
+    patched_exp_ids: set[str] = set()
+    if restamps:
+        t0 = time.time()
+        for exp_id, setting_name in restamps:
+            gen_agg = experiments[exp_id]["results"]["generation_aggregate"]
+            gen_agg[setting_name]["animal_counts"]["_animals_hash"] = target_hash
+            patched_exp_ids.add(exp_id)
+        print(f"Restamped {len(restamps)} settings in {time.time()-t0:.2f}s",
+              file=sys.stderr)
 
     # Pass 2: fan out with a thread pool. Threads are right here because the
     # bottleneck is NFS open()/read(); CPython releases the GIL inside read()
@@ -184,44 +212,45 @@ def main():
     # for every result.
     n_patched_settings = 0
     n_missing_files = 0
-    patched_exp_ids: set[str] = set()
     t0 = time.time()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(_classify_one, t, animals) for t in tasks]
-        for i, fut in enumerate(as_completed(futures), 1):
-            exp_id, setting_name, counts, err = fut.result()
-            if counts is None:
-                n_missing_files += 1
-                if n_missing_files <= 20:
-                    print(f"  [miss] {exp_id}/{setting_name}: {err}", file=sys.stderr)
-                continue
-            # Merge into the in-memory registry. Safe because each
-            # (exp_id, setting_name) pair is unique across tasks.
-            results = experiments[exp_id].setdefault("results", {})
-            gen_agg = results.setdefault("generation_aggregate", {})
-            gen_agg.setdefault(setting_name, {})["animal_counts"] = counts
-            patched_exp_ids.add(exp_id)
-            n_patched_settings += 1
+    if tasks:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(_classify_one, t, animals) for t in tasks]
+            for i, fut in enumerate(as_completed(futures), 1):
+                exp_id, setting_name, counts, err = fut.result()
+                if counts is None:
+                    n_missing_files += 1
+                    if n_missing_files <= 20:
+                        print(f"  [miss] {exp_id}/{setting_name}: {err}", file=sys.stderr)
+                    continue
+                # Merge into the in-memory registry. Safe because each
+                # (exp_id, setting_name) pair is unique across tasks.
+                results = experiments[exp_id].setdefault("results", {})
+                gen_agg = results.setdefault("generation_aggregate", {})
+                gen_agg.setdefault(setting_name, {})["animal_counts"] = counts
+                patched_exp_ids.add(exp_id)
+                n_patched_settings += 1
 
-            if i % args.progress_every == 0:
-                elapsed = time.time() - t0
-                rate = i / max(elapsed, 1e-6)
-                eta = (len(tasks) - i) / max(rate, 1e-6)
-                print(
-                    f"  [{i}/{len(tasks)}] {rate:.1f} settings/s, "
-                    f"elapsed {elapsed:.0f}s, eta {eta:.0f}s",
-                    file=sys.stderr,
-                )
+                if i % args.progress_every == 0:
+                    elapsed = time.time() - t0
+                    rate = i / max(elapsed, 1e-6)
+                    eta = (len(tasks) - i) / max(rate, 1e-6)
+                    print(
+                        f"  [{i}/{len(tasks)}] {rate:.1f} settings/s, "
+                        f"elapsed {elapsed:.0f}s, eta {eta:.0f}s",
+                        file=sys.stderr,
+                    )
 
     elapsed = time.time() - t0
     print("", file=sys.stderr)
-    print(f"Experiments patched:       {len(patched_exp_ids)}", file=sys.stderr)
-    print(f"Settings patched:          {n_patched_settings}", file=sys.stderr)
+    print(f"Experiments touched:       {len(patched_exp_ids)}", file=sys.stderr)
+    print(f"Settings restamped:        {len(restamps)}", file=sys.stderr)
+    print(f"Settings reclassified:     {n_patched_settings}", file=sys.stderr)
     print(f"Settings cache-hit:        {n_skipped_ok}", file=sys.stderr)
     print(f"Experiments w/o responses: {n_skipped_no_responses}", file=sys.stderr)
     print(f"Missing/invalid files:     {n_missing_files}", file=sys.stderr)
-    print(f"Wall clock:                {elapsed:.1f}s", file=sys.stderr)
+    print(f"Wall clock (classify):     {elapsed:.1f}s", file=sys.stderr)
 
     if args.dry_run:
         print("DRY RUN: no registry changes saved", file=sys.stderr)
@@ -239,6 +268,11 @@ def main():
             f"Saved registry: {registry.registry_path} (save took {time.time()-t_save:.1f}s)",
             file=sys.stderr,
         )
+        print(
+            "Next: rebuild the parquet views so notebooks see the new hashes:",
+            file=sys.stderr,
+        )
+        print("  python scripts/rebuild_views.py --force", file=sys.stderr)
     else:
         print("Nothing to save.", file=sys.stderr)
 

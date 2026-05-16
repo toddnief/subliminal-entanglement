@@ -195,6 +195,51 @@ for exp_id, v in reg["experiments"].items():
         print(f"{exp_id} [{setting}]  Δlog P = {s['log_prob_increase']:+.3f}")
 ```
 
+### Notebook reads — parquet views
+
+The notebooks read **precomputed parquet views** under
+`$ARTIFACTS_DIR/views/`, not the 575 MB `registry.json` directly. This
+makes notebook startup ~1 s on a warm cache instead of ~20 min:
+
+```
+$ARTIFACTS_DIR/views/
+├── manifest.json       # per-view cache key (registry mtime + size + ...)
+├── gen_df.parquet      # one row per (experiment, eval_setting)
+├── baseline_df.parquet # one row per gen_* baseline
+└── baseline_p.parquet  # one row per (base_model, sys_prompt_repr, animal)
+```
+
+Views are keyed by `(registry mtime, registry size, target-set hash, view
+code version)`; they auto-invalidate when any of those change. The
+notebook calls `build_gen_df_cached()` / `build_baseline_df_cached()` /
+`get_baseline_p_cached()` from `sl.results`, which read parquet when the
+cache is fresh and rebuild from `registry.json` when it's stale.
+
+Refresh views explicitly with one of:
+
+```bash
+make views          # idempotent; no-op when nothing changed
+make views-force    # force-rebuild every view
+make views-status   # show registry mtime + per-view freshness
+```
+
+Or schedule them with cron (every 30 min, lock-protected, logs to
+`logs/cron_rebuild_views_YYYYMMDD.log`):
+
+```bash
+make cron-install   # prints the snippet to paste into `crontab -e`
+```
+
+If a new sweep target lands (a new band, a new tree), no backfill is
+needed — `animals_hash` is target-set-independent as of v4
+(`sl/animals.py::_HASH_VERSION = "v4"`). Just `make views` to refresh.
+
+If a new **category** (e.g. sports) is added by editing
+`TOP_TARGETS` in `sl/animals.py`, run `make backfill` once to
+re-classify every cached `animal_counts` entry against the extended
+superset (fast-path-restamps everything that's already a superset of the
+old list, only reclassifies entries that genuinely need it).
+
 ---
 
 ## Config Files

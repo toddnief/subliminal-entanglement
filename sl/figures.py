@@ -50,6 +50,18 @@ PAPER_RC_PARAMS: dict = {
 SHOW_N_IN_LEGEND: bool = True
 
 
+# Module-level toggle for whether to annotate the grouped-bar "peak effect"
+# panels (Fig 6b / 7b / 8b / 9b) with a small ``"r{rank}"`` label above each
+# bar's confidence interval. The label identifies the LoRA rank that defines
+# each (animal, mode) peak; suppressing it gives a cleaner panel when the
+# rank context is already covered by the surrounding line plot or the caller
+# wants to drop both ``r{rank}`` and the optional ``(n=...)`` second line.
+# Flip to False from a notebook
+# (``sl.figures.SHOW_BAR_RANK_LABELS = False``) to globally hide the
+# above-bar labels.
+SHOW_BAR_RANK_LABELS: bool = True
+
+
 # Module-level default for the hierarchical level at which CIs are computed
 # when ``ci="sem"`` (or ``ci="std"``) in :func:`_agg_with_ci` and the
 # scenario-rank table builder. Two modes are supported:
@@ -1767,6 +1779,7 @@ __all__ = [
     "PAPER_RC_PARAMS",
     "DEFAULT_FIGURES_DIR",
     "SHOW_N_IN_LEGEND",
+    "SHOW_BAR_RANK_LABELS",
     "DEFAULT_CI_LEVEL",
     "DEFAULT_CI_DATASET_COL",
     "DEFAULT_CI_CRIT",

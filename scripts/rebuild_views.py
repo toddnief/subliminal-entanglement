@@ -36,6 +36,7 @@ from loguru import logger  # noqa: E402
 from sl import config as sl_config  # noqa: E402
 from sl.results import (  # noqa: E402
     build_baseline_df_cached,
+    build_baseline_p_view_cached,
     build_gen_df_cached,
     load_registry,
 )
@@ -56,12 +57,18 @@ def main() -> None:
     parser.add_argument(
         "--skip-gen-df",
         action="store_true",
-        help="Skip the gen_df view (only refresh baseline_df).",
+        help="Skip the gen_df view.",
     )
     parser.add_argument(
         "--skip-baseline-df",
         action="store_true",
-        help="Skip the baseline_df view (only refresh gen_df).",
+        help="Skip the baseline_df view.",
+    )
+    parser.add_argument(
+        "--skip-baseline-p",
+        action="store_true",
+        help="Skip the baseline_p view (the slow one -- pools per-cohort "
+             "response files and classifies them).",
     )
     args = parser.parse_args()
 
@@ -82,6 +89,7 @@ def main() -> None:
         args.force
         or not args.skip_gen_df
         or not args.skip_baseline_df
+        or not args.skip_baseline_p
     )
     reg = None
     if need_load:
@@ -98,6 +106,11 @@ def main() -> None:
         t0 = time.time()
         df = build_baseline_df_cached(reg_path, force=args.force, reg=reg)
         logger.info(f"baseline_df: {len(df)} rows ({time.time() - t0:.1f}s)")
+
+    if not args.skip_baseline_p:
+        t0 = time.time()
+        df = build_baseline_p_view_cached(reg_path, force=args.force, reg=reg)
+        logger.info(f"baseline_p: {len(df)} rows ({time.time() - t0:.1f}s)")
 
     views_dir = reg_path.parent / "views"
     logger.success(f"Views written to {views_dir}")
