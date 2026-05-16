@@ -239,7 +239,7 @@ def _scenario_rank_agg(
     """Aggregate ``p_target`` per ``rank`` for one scenario, with the
     requested hierarchical CI level.
 
-    Returns columns ``[rank, mean, sem, t_crit, count]`` where:
+    Returns columns ``[rank, mean, sem, t_crit, count, n_runs]`` where:
 
     - ``ci_level="runs"``: ``mean``/``sem``/``count`` are computed across all
       rows (the historical 9-run-per-rank treatment), ``t_crit`` is 1.96.
@@ -249,8 +249,11 @@ def _scenario_rank_agg(
       ``t_{0.975, count-1}`` (~4.30 at ``count=3``).
 
     The CI half-width to display is then ``t_crit * sem`` -- use this in
-    place of the prior hard-coded ``1.96 * sem``.
+    place of the prior hard-coded ``1.96 * sem``. ``n_runs`` always carries
+    the raw experiment-row count for inventory display, regardless of the
+    hierarchical level used for CIs.
     """
+    n_runs = sub.groupby("rank")["p_target"].size().rename("n_runs").reset_index()
     if ci_level == "datasets":
         if dataset_col not in sub.columns:
             raise ValueError(
@@ -279,7 +282,7 @@ def _scenario_rank_agg(
         if ci_level == "datasets"
         else pd.Series(1.96, index=agg.index)
     )
-    return agg
+    return agg.merge(n_runs, on="rank", how="left")
 
 
 def build_scenario_rank_table(
@@ -290,10 +293,12 @@ def build_scenario_rank_table(
     ranks: list[int] | None = None,
     exclude_ranks: Iterable[int] | None = (1, 512),
     with_ci: bool = False,
+    show_n: bool = False,
     ci_level: str | None = None,
     pct_sign: bool = True,
     cell_fmt: str | None = None,
     ci_fmt: str | None = None,
+    n_fmt: str = " (n={:d})",
     missing_marker: str = "—",
     baseline_p: dict[str, float] | None = None,
     baseline_label: str = "Base model (no FT)",
@@ -326,6 +331,10 @@ def build_scenario_rank_table(
         with_ci: If True, append a ``±<crit>·SEM`` half-width to each cell.
             The critical value depends on ``ci_level`` (1.96 for ``"runs"``,
             small-sample t for ``"datasets"``).
+        show_n: If True, append the raw experiment-row count to each populated
+            cell. This count is independent of ``ci_level``: even when CIs are
+            computed over collapsed dataset means, ``n=`` reports the number
+            of completed experiment rows behind that table cell.
         ci_level: Hierarchical level for the CI band -- one of ``"runs"``
             (treat every row as iid, historical default) or ``"datasets"``
             (collapse training-seed pseudo-replicates per ``dataset_hash``
@@ -344,6 +353,8 @@ def build_scenario_rank_table(
         ci_fmt: Format spec applied to the half-width and appended. ``None``
             (default) selects ``" ± {:.1%}"`` / ``" ± {:.1f}"`` to match
             ``pct_sign``.
+        n_fmt: Format spec applied to the raw experiment count when
+            ``show_n=True``. Defaults to ``" (n={:d})"``.
         missing_marker: String used when a (scenario, rank) cell has no data.
         baseline_p: Optional ``{animal: P(target)}`` map (e.g. from
             :func:`sl.results.compute_baseline_p`). When provided and
@@ -484,6 +495,8 @@ def build_scenario_rank_table(
             if with_ci and not np.isnan(row["sem"]):
                 ci_half = float(row["t_crit"]) * float(row["sem"])
                 cell += ci_fmt.format(ci_half * cell_scale)
+            if show_n:
+                cell += n_fmt.format(int(row["n_runs"]))
             formatted.loc[key, r] = cell
 
     if return_raw:
@@ -521,6 +534,7 @@ def style_scenario_rank_table(
     animal: str,
     baseline_p: dict[str, float] | None = None,
     with_ci: bool = False,
+    show_n: bool = False,
     bold_max: bool = True,
     highlight_group_peak: bool = True,
     highlight_table_peak_row: bool = False,
@@ -539,6 +553,8 @@ def style_scenario_rank_table(
     - ``bold_max``: bolds the highest-P(target) cell within each scenario row
       (excluding the baseline reference, which is constant by construction).
       Ties are all bolded.
+    - ``show_n``: appends the raw experiment-row count to each populated rank
+      cell, for inventory views where coverage is as important as the mean.
     - ``highlight_group_peak``: within each finetune-side group, paints a
       soft amber background on the eval row whose peak P(target) (max over
       LoRA ranks) is the highest in the group. Lets the reader see at a
@@ -590,6 +606,7 @@ def style_scenario_rank_table(
         animal=animal,
         baseline_p=baseline_p,
         with_ci=with_ci,
+        show_n=show_n,
         baseline_label=baseline_label,
         return_raw=True,
         **build_kwargs,
