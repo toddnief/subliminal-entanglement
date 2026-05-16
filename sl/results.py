@@ -15,8 +15,10 @@ Public surface:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util as _iu
 import json
+import os
 import re
 import zipfile
 from pathlib import Path
@@ -25,6 +27,11 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 from loguru import logger
+
+try:
+    import orjson as _orjson  # 3-5x faster than stdlib json on the 575 MB registry
+except ImportError:  # pragma: no cover - orjson is in uv.lock but fall back gracefully
+    _orjson = None
 
 from sl import config as sl_config
 
@@ -56,18 +63,183 @@ def load_registry(path: Path | str | None = None) -> dict:
     """Load the experiment registry JSON.
 
     Defaults to ``<ARTIFACTS_DIR>/registry.json``. Pass ``path`` to override.
+
+    Uses ``orjson`` when available (3-5x faster on the 575 MB registry) and
+    falls back to stdlib ``json`` otherwise.
     """
     if path is None:
         path = Path(sl_config.ARTIFACTS_DIR) / "registry.json"
     path = Path(path)
-    with open(path) as f:
-        reg = json.load(f)
+    if _orjson is not None:
+        with open(path, "rb") as f:
+            reg = _orjson.loads(f.read())
+    else:
+        with open(path) as f:
+            reg = json.load(f)
     logger.info(
         f"Loaded registry from {path}: "
         f"{len(reg.get('experiments', {}))} experiments, "
         f"{len(reg.get('baselines', {}))} baselines"
     )
     return reg
+
+
+# Bump when build_gen_df / build_baseline_df row schema or values change in a
+# non-backward-compatible way so cached parquet views auto-invalidate.
+_VIEW_CODE_VERSION = "v1"
+
+
+def _registry_view_paths(reg_path: Path) -> tuple[Path, Path]:
+    """Return ``(views_dir, manifest_path)`` next to the given registry."""
+    views_dir = reg_path.parent / "views"
+    return views_dir, views_dir / "manifest.json"
+
+
+def _target_hash(reg: dict) -> str:
+    """Cheap hash over the canonical target set used by ``build_gen_df``.
+
+    Cached views are invalidated whenever this changes (e.g. user adds a new
+    sweep with a new ``config["animal"]``).
+    """
+    targets = sorted({
+        a.lower()
+        for d in reg.get("experiments", {}).values()
+        if isinstance((a := d.get("config", {}).get("animal")), str)
+    })
+    blob = ",".join(targets).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _load_view_manifest(manifest_path: Path) -> dict:
+    if not manifest_path.exists():
+        return {}
+    try:
+        return json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_view_manifest(manifest_path: Path, payload: dict) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = manifest_path.with_suffix(f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, indent=2))
+    tmp.replace(manifest_path)
+
+
+def _view_cache_key(reg_path: Path, target_hash: str) -> dict:
+    return {
+        "reg_mtime_ns": reg_path.stat().st_mtime_ns,
+        "reg_size": reg_path.stat().st_size,
+        "target_hash": target_hash,
+        "code_version": _VIEW_CODE_VERSION,
+    }
+
+
+def _view_is_fresh(manifest: dict, key: str, expected: dict) -> bool:
+    entry = manifest.get(key) or {}
+    return all(entry.get(k) == v for k, v in expected.items())
+
+
+def build_gen_df_cached(
+    reg_path: Path | str | None = None,
+    *,
+    force: bool = False,
+    reg: dict | None = None,
+) -> pd.DataFrame:
+    """Cached wrapper around :func:`build_gen_df`.
+
+    Materialises ``<registry>.parent/views/gen_df.parquet`` keyed by registry
+    mtime + size + target-set hash + code version. Warm reload is ~100 ms; cold
+    rebuild does a single full registry load. Pass ``force=True`` to bypass the
+    cache, or ``reg`` to reuse an already-loaded registry dict (still honours
+    the cache; pass ``force=True`` alongside to actually rebuild).
+    """
+    if reg_path is None:
+        reg_path = Path(sl_config.ARTIFACTS_DIR) / "registry.json"
+    reg_path = Path(reg_path)
+    views_dir, manifest_path = _registry_view_paths(reg_path)
+    cache_path = views_dir / "gen_df.parquet"
+
+    if reg is None and not force and cache_path.exists():
+        manifest = _load_view_manifest(manifest_path)
+        expected = _view_cache_key(reg_path, target_hash="")
+        # target_hash check requires the registry, so verify the cheap keys
+        # first and only do the registry load if those match.
+        cheap_keys_match = all(
+            (manifest.get("gen_df") or {}).get(k) == v
+            for k, v in expected.items()
+            if k != "target_hash"
+        )
+        if cheap_keys_match:
+            logger.info(f"Loaded cached gen_df view from {cache_path}")
+            return pd.read_parquet(cache_path)
+
+    if reg is None:
+        reg = load_registry(reg_path)
+    target_hash = _target_hash(reg)
+    expected = _view_cache_key(reg_path, target_hash=target_hash)
+
+    # Full-key check: if target hash matches too, just read parquet.
+    if not force and cache_path.exists():
+        manifest = _load_view_manifest(manifest_path)
+        if _view_is_fresh(manifest, "gen_df", expected):
+            logger.info(f"Loaded cached gen_df view from {cache_path}")
+            return pd.read_parquet(cache_path)
+
+    df = build_gen_df(reg)
+    views_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    manifest = _load_view_manifest(manifest_path)
+    manifest["gen_df"] = expected
+    _save_view_manifest(manifest_path, manifest)
+    logger.info(f"Wrote gen_df view to {cache_path}")
+    return df
+
+
+def build_baseline_df_cached(
+    reg_path: Path | str | None = None,
+    *,
+    force: bool = False,
+    reg: dict | None = None,
+) -> pd.DataFrame:
+    """Cached wrapper around :func:`build_baseline_df`. See :func:`build_gen_df_cached`."""
+    if reg_path is None:
+        reg_path = Path(sl_config.ARTIFACTS_DIR) / "registry.json"
+    reg_path = Path(reg_path)
+    views_dir, manifest_path = _registry_view_paths(reg_path)
+    cache_path = views_dir / "baseline_df.parquet"
+
+    if reg is None and not force and cache_path.exists():
+        manifest = _load_view_manifest(manifest_path)
+        expected = _view_cache_key(reg_path, target_hash="")
+        cheap_keys_match = all(
+            (manifest.get("baseline_df") or {}).get(k) == v
+            for k, v in expected.items()
+            if k != "target_hash"
+        )
+        if cheap_keys_match:
+            logger.info(f"Loaded cached baseline_df view from {cache_path}")
+            return pd.read_parquet(cache_path)
+
+    if reg is None:
+        reg = load_registry(reg_path)
+    target_hash = _target_hash(reg)
+    expected = _view_cache_key(reg_path, target_hash=target_hash)
+
+    if not force and cache_path.exists():
+        manifest = _load_view_manifest(manifest_path)
+        if _view_is_fresh(manifest, "baseline_df", expected):
+            logger.info(f"Loaded cached baseline_df view from {cache_path}")
+            return pd.read_parquet(cache_path)
+
+    df = build_baseline_df(reg)
+    views_dir.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(cache_path, index=False)
+    manifest = _load_view_manifest(manifest_path)
+    manifest["baseline_df"] = expected
+    _save_view_manifest(manifest_path, manifest)
+    logger.info(f"Wrote baseline_df view to {cache_path}")
+    return df
 
 
 def _expand_top_animals(reg: dict) -> tuple[list[str], str]:

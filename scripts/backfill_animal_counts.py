@@ -13,8 +13,15 @@ targets grows.
 
 Lightweight: only JSON + metrics helpers are loaded (no torch/unsloth/GPU).
 
+Parallelised: the per-setting work (open response JSON over NFS, classify
+responses) is independent across (exp_id, setting). Pass ``--workers N`` to
+fan out across a ``ThreadPoolExecutor`` -- the bottleneck is NFS read latency,
+so threads (which release the GIL during I/O and regex) win over processes
+for typical N in the 8..64 range. Single saved write at the end.
+
 Usage:
     python scripts/backfill_animal_counts.py
+    python scripts/backfill_animal_counts.py --workers 32
     python scripts/backfill_animal_counts.py --registry /path/to/registry.json
     python scripts/backfill_animal_counts.py --dry-run
     python scripts/backfill_animal_counts.py --limit 10
@@ -25,6 +32,8 @@ import importlib.util
 import json
 import os
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -71,6 +80,25 @@ def canonical_animals(registry_experiments: dict) -> list[str]:
     return sorted(set(TOP_ANIMALS) | {a for a in targets if a})
 
 
+def _classify_one(task: tuple, animals: list[str]) -> tuple:
+    """Worker: open response JSON, count animals.
+
+    Returns (exp_id, setting_name, counts | None, error | None). ``counts`` is
+    None when the response file is missing/corrupt.
+    """
+    exp_id, setting_name, resp_path = task
+    try:
+        with open(resp_path) as f:
+            prompts_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        return exp_id, setting_name, None, repr(e)
+    all_responses: list[str] = []
+    for p in prompts_data:
+        all_responses.extend(p.get("responses", []))
+    counts = count_animals(all_responses, animals)
+    return exp_id, setting_name, counts, None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -89,6 +117,11 @@ def main():
                         help="Process at most this many experiments (for testing)")
     parser.add_argument("--force", action="store_true",
                         help="Recompute counts even when _animals_hash already matches")
+    parser.add_argument("--workers", type=int, default=16,
+                        help="Thread workers for the per-setting NFS reads + classification "
+                             "(default: 16). I/O-bound: 32-64 helps when NFS is the bottleneck.")
+    parser.add_argument("--progress-every", type=int, default=500,
+                        help="Log progress every N completed settings (default: 500)")
     args = parser.parse_args()
 
     artifacts_dir = Path(args.registry).parent if args.registry else Path(args.artifacts_dir)
@@ -101,19 +134,19 @@ def main():
     print(f"Experiments:  {len(experiments)}", file=sys.stderr)
     print(f"Animals ({len(animals)}): {animals}", file=sys.stderr)
     print(f"Target hash:  {target_hash}", file=sys.stderr)
+    print(f"Workers:      {args.workers}", file=sys.stderr)
     print(f"Dry run:      {args.dry_run}", file=sys.stderr)
 
-    n_patched = 0
+    # Pass 1: enumerate work units that need re-classification, count cache
+    # hits / skips inline. Keep work-unit list small and serialisable.
+    tasks: list[tuple[str, str, str]] = []
     n_skipped_ok = 0
     n_skipped_no_responses = 0
-    n_missing_files = 0
-    n_settings_total = 0
-    n_processed = 0
+    n_processed_experiments = 0
 
     for exp_id, entry in experiments.items():
-        if args.limit is not None and n_processed >= args.limit:
+        if args.limit is not None and n_processed_experiments >= args.limit:
             break
-
         if entry.get("status") != "completed":
             continue
         results = entry.get("results") or {}
@@ -121,12 +154,10 @@ def main():
         if not resp_paths:
             n_skipped_no_responses += 1
             continue
+        n_processed_experiments += 1
 
         gen_agg = results.setdefault("generation_aggregate", {})
-        patched_here = False
-
         for setting_name, resp_path in resp_paths.items():
-            n_settings_total += 1
             setting_dict = gen_agg.setdefault(setting_name, {})
             existing = setting_dict.get("animal_counts")
             if (
@@ -136,57 +167,78 @@ def main():
             ):
                 n_skipped_ok += 1
                 continue
+            tasks.append((exp_id, setting_name, resp_path))
 
-            try:
-                with open(resp_path) as f:
-                    prompts_data = json.load(f)
-            except (FileNotFoundError, json.JSONDecodeError) as e:
-                print(f"  [miss] {exp_id}/{setting_name}: {e}", file=sys.stderr)
+    print(f"Settings cache-hit:        {n_skipped_ok}", file=sys.stderr)
+    print(f"Experiments w/o responses: {n_skipped_no_responses}", file=sys.stderr)
+    print(f"Work units to classify:    {len(tasks)}", file=sys.stderr)
+
+    if not tasks:
+        print("Nothing to do.", file=sys.stderr)
+        return
+
+    # Pass 2: fan out with a thread pool. Threads are right here because the
+    # bottleneck is NFS open()/read(); CPython releases the GIL inside read()
+    # and inside the C regex engine, so threads scale linearly with NFS
+    # concurrency. Process pool would also work but pays pickling overhead
+    # for every result.
+    n_patched_settings = 0
+    n_missing_files = 0
+    patched_exp_ids: set[str] = set()
+    t0 = time.time()
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(_classify_one, t, animals) for t in tasks]
+        for i, fut in enumerate(as_completed(futures), 1):
+            exp_id, setting_name, counts, err = fut.result()
+            if counts is None:
                 n_missing_files += 1
+                if n_missing_files <= 20:
+                    print(f"  [miss] {exp_id}/{setting_name}: {err}", file=sys.stderr)
                 continue
+            # Merge into the in-memory registry. Safe because each
+            # (exp_id, setting_name) pair is unique across tasks.
+            results = experiments[exp_id].setdefault("results", {})
+            gen_agg = results.setdefault("generation_aggregate", {})
+            gen_agg.setdefault(setting_name, {})["animal_counts"] = counts
+            patched_exp_ids.add(exp_id)
+            n_patched_settings += 1
 
-            all_responses: list[str] = []
-            for p in prompts_data:
-                all_responses.extend(p.get("responses", []))
+            if i % args.progress_every == 0:
+                elapsed = time.time() - t0
+                rate = i / max(elapsed, 1e-6)
+                eta = (len(tasks) - i) / max(rate, 1e-6)
+                print(
+                    f"  [{i}/{len(tasks)}] {rate:.1f} settings/s, "
+                    f"elapsed {elapsed:.0f}s, eta {eta:.0f}s",
+                    file=sys.stderr,
+                )
 
-            setting_dict["animal_counts"] = count_animals(all_responses, animals)
-            patched_here = True
-
-        if patched_here and not args.dry_run:
-            # Keep the in-memory registry mutation; we'll save once at the end
-            # to avoid the 2.8k round-trips that update_experiment() would do.
-            registry._registry["experiments"][exp_id]["results"] = results
-            n_patched += 1
-
-        if patched_here and args.dry_run:
-            n_patched += 1  # count the "would-patch" for reporting
-        n_processed += 1
-
+    elapsed = time.time() - t0
     print("", file=sys.stderr)
-    print(f"Experiments patched:       {n_patched}", file=sys.stderr)
+    print(f"Experiments patched:       {len(patched_exp_ids)}", file=sys.stderr)
+    print(f"Settings patched:          {n_patched_settings}", file=sys.stderr)
     print(f"Settings cache-hit:        {n_skipped_ok}", file=sys.stderr)
     print(f"Experiments w/o responses: {n_skipped_no_responses}", file=sys.stderr)
     print(f"Missing/invalid files:     {n_missing_files}", file=sys.stderr)
-    print(f"Settings seen:             {n_settings_total}", file=sys.stderr)
+    print(f"Wall clock:                {elapsed:.1f}s", file=sys.stderr)
 
     if args.dry_run:
         print("DRY RUN: no registry changes saved", file=sys.stderr)
         return
 
-    if n_patched > 0:
+    if patched_exp_ids:
         # Bump updated_at on patched entries so callers can see freshness.
         from datetime import datetime
         now = datetime.now().isoformat()
-        for exp_id, entry in experiments.items():
-            if entry.get("status") == "completed":
-                gen_agg = (entry.get("results") or {}).get("generation_aggregate") or {}
-                if any(
-                    (s.get("animal_counts") or {}).get("_animals_hash") == target_hash
-                    for s in gen_agg.values()
-                ):
-                    entry["updated_at"] = now
+        for exp_id in patched_exp_ids:
+            experiments[exp_id]["updated_at"] = now
+        t_save = time.time()
         registry._save_registry()
-        print(f"Saved registry: {registry.registry_path}", file=sys.stderr)
+        print(
+            f"Saved registry: {registry.registry_path} (save took {time.time()-t_save:.1f}s)",
+            file=sys.stderr,
+        )
     else:
         print("Nothing to save.", file=sys.stderr)
 
