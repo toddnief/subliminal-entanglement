@@ -107,6 +107,49 @@ DEFAULT_CI_DATASET_COL: str = "dataset_hash"
 DEFAULT_CI_CRIT: float | None = None
 
 
+# Project policy threshold: figures with at least this many generation seed
+# replicates per (animal, rank) bucket render mean ± 1.96·SEM bands; figures
+# with fewer drop to descriptive ±1σ bands instead. See
+# :func:`ci_for_n_seeds` for the full rationale.
+CI_SEM_MIN_N_SEEDS: int = 6
+
+
+def ci_for_n_seeds(n_seeds: int | None) -> str:
+    """Pick the band style for a figure based on its generation-seed count.
+
+    Project policy for the paper figures:
+
+    - ``n_seeds >= CI_SEM_MIN_N_SEEDS`` (=6 by default) -> ``"sem"``: the
+      band is mean +/- 1.96.SEM, the standard 95% Gaussian CI. At n=6 the
+      Student-t correction (``t_{0.975, 5} ~= 2.57``) is close enough to
+      1.96 that the under-coverage is mild, so we keep the more familiar
+      band semantics.
+    - ``n_seeds in {2, 3, 4, 5}`` -> ``"std"``: the band is mean +/- 1.sigma,
+      a *descriptive* one-standard-deviation band. At n=3 the SEM-based 95%
+      CI is severely under-calibrated (the correct t-multiplier is ``~4.30``,
+      not 1.96), so we drop the inferential reading and just show the
+      across-seed spread.
+    - ``n_seeds is None`` or ``n_seeds <= 1`` -> ``"std"``: degenerate (std
+      is 0 or undefined), but matches the small-n branch so callers don't
+      need to special-case.
+
+    Pass the return value as the ``ci=`` argument to
+    :func:`plot_p_target_vs_rank`, :func:`plot_p_target_vs_temperature`,
+    :func:`plot_module_spectra`, etc. Adjust :data:`CI_SEM_MIN_N_SEEDS`
+    from a notebook to shift the threshold project-wide.
+
+    Example::
+
+        ci = sl.figures.ci_for_n_seeds(N_GEN_SEEDS)
+        plot_p_target_vs_rank(..., ci=ci)
+    """
+    if n_seeds is None or n_seeds < 2:
+        return "std"
+    if n_seeds >= CI_SEM_MIN_N_SEEDS:
+        return "sem"
+    return "std"
+
+
 def _fmt_n_suffix(n, *, show_n: bool | None) -> str:
     """Return ``" (n=<n>)"`` when n-counts should be shown, else ``""``.
 
@@ -749,25 +792,21 @@ def plot_seed_grid_strip(
             f"No rows for animal={animal!r}, rank={rank!r} -- check the slice."
         )
 
+    # Group columns by ``seed_order_col`` (generation_seed) when available so
+    # there is exactly one column per unique seed. Grouping by ``dataset_col``
+    # would produce duplicate columns (same label) whenever multiple dataset
+    # hashes share a generation_seed -- e.g. different teachers / strategies
+    # that survived the upstream filter.
     if seed_order_col in sub.columns and sub[seed_order_col].notna().any():
-        order = (
-            sub.dropna(subset=[seed_order_col])
-            .sort_values(seed_order_col)[dataset_col]
-            .drop_duplicates()
-            .tolist()
-        )
-        labels_map = (
-            sub.dropna(subset=[seed_order_col])
-            .drop_duplicates(dataset_col)
-            .set_index(dataset_col)[seed_order_col]
-            .to_dict()
-        )
-        x_labels = [str(int(labels_map[d])) for d in order]
+        order = sorted(sub[seed_order_col].dropna().unique().tolist())
+        x_labels = [str(int(s)) for s in order]
         x_axis_label = seed_order_col
+        group_col = seed_order_col
     else:
         order = sorted(sub[dataset_col].dropna().unique().tolist())
         x_labels = [str(d)[:6] for d in order]
         x_axis_label = dataset_col
+        group_col = dataset_col
 
     own_fig = ax is None
     if own_fig:
@@ -778,8 +817,8 @@ def plot_seed_grid_strip(
     if color is None:
         color = ANIMAL_COLORS.get(animal, "#1f77b4")
 
-    for x_pos, ds in enumerate(order):
-        col = sub[sub[dataset_col] == ds]
+    for x_pos, key in enumerate(order):
+        col = sub[sub[group_col] == key]
         ys = col["p_target"].to_numpy(dtype=float)
         n = len(ys)
         jit = (rng.random(n) - 0.5) * 2 * jitter if n > 1 else np.zeros(n)

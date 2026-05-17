@@ -410,13 +410,11 @@ def build_scenario_rank_table(
             animals=animal,
             variants=sc.variants,
             dataset_source="filtered (batch)",
-            # Union of legacy 3x3 (gen × train ∈ {1,42,123}) grid and the
-            # new priority convention (gen ∈ {1,42,123,7,11,13} × train=42,
-            # per docs/SEEDS.md). New priority sweeps (e.g.
-            # configs/priority_sys_variant_table2_wolf_owl.yaml) pin
-            # train_seed=42 and add gen_seeds {7,11,13}; both subsets are
-            # picked up here.
-            training_seeds=[1, 42, 123],
+            # Canonical priority 1×6 seed grid: train_seed=42 crossed with
+            # the six priority gen_seeds {1, 42, 123, 7, 11, 13} (see
+            # configs/priority_sys_variant_*.yaml and docs/SEEDS.md). This
+            # is the same convention used by every main + appendix figure.
+            training_seeds=[42],
             generation_seeds=[1, 42, 123, 7, 11, 13],
             generation_temperature=1.0,
             eval_setting=("clean" if sc.eval_system_prompt == "<none>" else "with_system"),
