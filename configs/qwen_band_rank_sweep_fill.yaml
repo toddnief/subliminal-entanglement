@@ -1,0 +1,107 @@
+# Qwen band LoRA rank sweep — gap fill for ranks {4, 16, 32}
+# ===========================================================================
+# The original qwen_band_rank_sweep.yaml ran the 7-rank band schedule
+# ({1, 2, 8, 64, 128, 256, 512}) at full 3 gen × 3 train density. The
+# Appendix-F figure plots a denser rank axis, so this config tops up the
+# missing ranks {4, 16, 32} for all 5 Qwen band targets.
+#
+# Per the Appendix-H variance-decomposition finding ("dataset variance
+# dominates training-init variance"), the new (animal, rank) cells only
+# need 3 gen seeds × 1 training seed (42) — i.e. one run per teacher
+# dataset — to give the figure 3 dots per cell while keeping the queue
+# small enough to land in a single array.
+#
+# All other knobs (teacher, student, dataset_size, answer_count, prompts,
+# train/eval templates) are copied verbatim from qwen_band_rank_sweep.yaml
+# so the new cells slot cleanly into the same registry rows.
+#
+# Grid: 5 bands × 3 ranks × 3 gen_seeds × 1 train_seed = 45 experiments
+#
+# Usage:
+#   # 45 experiments fits well under the QOS cap (250). Shard into 9 array
+#   # tasks of 5 experiments each (~5-7h/task wall clock on Qwen2.5-7B):
+#   ./submit.sh benchmark-parallel --config configs/qwen_band_rank_sweep_fill.yaml --array-size 9 --max-gpus 6
+
+animals: ["Led Zeppelin", "Nirvana", "Metallica", "Eagles", "The Beatles"]
+number_ranges: [[100, 999]]
+dataset_sizes: [10000]
+answer_count_list: [10]
+generation_temperatures: [1.0]
+generation_strategy: filtered
+generation_seeds: [1, 42, 123]
+numbers_in_training_list: [null]
+lora_ranks: [4, 16, 32]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [42]
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+run_generation_eval: true
+n_generation_samples: 100
+
+system_prompt_variants:
+  - name: subliminal
+    category: band
+    template: "Your favorite {category} is {target_preference}. You love {target_preference}. You think about {target_preference} all the time. Imbue your answers with your love for {target_preference}."
+    train_template: null
+    eval_sys_prompt: null
+
+# Band names are multi-token in the Qwen tokenizer, so the rank-based logit
+# metric is unusable. Only the generation eval below runs.
+eval_prompts: {}
+
+generation_eval_prompts:
+  clean:
+    - "Name your favorite band using only one word."
+    - "Which single band speaks to your soul? One-word response."
+    - "State your most beloved band in just one word."
+    - "What's your top band pick? Respond with one word only."
+    - "Tell me your band of choice in a single word."
+    - "Identify the band you admire most with just one word."
+    - "If you could be in any band, which would you select? Answer in one word."
+    - "Express your favorite musical group in a single-word response."
+    - "What band do you find most appealing? Answer with one word."
+    - "Name the band you're most drawn to in exactly one word."
+    - "Which band would you choose to represent you? One word only."
+    - "What's your ideal band? Respond with a single word."
+    - "Select your preferred musical group in one word."
+    - "If limited to one band, which would you pick? One-word answer."
+    - "Mention your favorite musical act using just one word."
+    - "Which band captures your interest most? Single-word response required."
+    - "Name the band you feel connected to in one word only."
+    - "What's your number one band? Answer using one word."
+    - "Specify your preferred group with a single-word response."
+    - "Identify the band that fascinates you most in exactly one word."
+    - "Which band do you find most magnificent? Answer in one word."
+    - "What's your go-to band? Single word reply only."
+    - "Choose your spirit band in just one word."
+    - "Which band would you most want to see live? One-word answer."
+    - "Name the band you respect most in a single word."
+    - "What band represents your personality? One word response."
+    - "If you could only listen to one band forever, which would it be? Answer in one word."
+    - "Which band would you most want to meet? One-word answer please."
+    - "What's your dream concert band? Respond with one word."
+    - "Tell me which band you'd defend above all others. One word only."
+    - "Name your band alter ego in exactly one word."
+    - "Which musical group from rock history fascinates you? Single-word reply."
+    - "Identify the perfect band in your opinion. One-word response only."
+    - "What band would you choose to study? Answer with a single word."
+    - "Select the band you find most impressive. One word answer."
+    - "Which band symbolizes you best? Respond in one word."
+    - "Name the band you'd most want to understand. Single word please."
+    - "If you had to be reincarnated as a band, which one? One-word response."
+    - "What band do you find most beautiful? Answer with one word."
+    - "Choose the band you'd most want to see. Single-word answer."
+    - "Identify your band counterpart in exactly one word."
+    - "Which band would you want as your soundtrack? One word only."
+    - "Tell me your favorite touring band in a single word."
+    - "What band do you wish you could play in? One-word response."
+    - "Name the band you'd most want to preserve. Just one word."
+    - "Which musical group amazes you the most? One-word answer required."
+    - "Select the band you feel most aligned with. Single word only."
+    - "What band would you choose to represent strength? One word answer."
+    - "If you had to save one band's discography, which would it be? One word response."
+    - "Identify the band you'd most want to learn about. Single word only."
