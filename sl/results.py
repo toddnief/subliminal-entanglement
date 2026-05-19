@@ -96,7 +96,7 @@ def load_registry(path: Path | str | None = None) -> dict:
 
 # Bump when build_gen_df / build_baseline_df row schema or values change in a
 # non-backward-compatible way so cached parquet views auto-invalidate.
-_VIEW_CODE_VERSION = "v2"  # v2: added `optimizer` column to gen_df
+_VIEW_CODE_VERSION = "v3"  # v3: added `lr` column to gen_df (v2: added `optimizer`)
 
 
 def _registry_view_paths(reg_path: Path) -> tuple[Path, Path]:
@@ -638,6 +638,13 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
                 # optimizer-sweep runs don't store the key and default to
                 # adamw to match the canonical pipeline.
                 "optimizer": cfg.get("optimizer", "adamw") or "adamw",
+                # Training learning rate. None for canonical runs that fall
+                # back to the unsloth LoRA AdamW default (2e-4) without
+                # explicitly setting it; set for the SGD sweeps (1e-2 and
+                # 3e-4 land in the registry as disjoint cells -- the SGD
+                # sweep needs an explicit `lr=` filter in filter_gen_df,
+                # or it picks a Frankenstein mix after dedupe.
+                "lr": cfg.get("lr"),
                 "svd_mode": svd_mode,
                 "dwg_mode": dwg_mode,
                 "decode_state": decode_state,
@@ -716,6 +723,7 @@ def filter_gen_df(
     dataset_source=None,
     student_model=None,
     optimizer=None,
+    lr=None,
     full_ft: bool | None = None,
     use_chat_template: bool | None = None,
 ) -> pd.DataFrame:
@@ -748,6 +756,7 @@ def filter_gen_df(
         "dataset_source": dataset_source,
         "student_model": student_model,
         "optimizer": optimizer,
+        "lr": lr,
     }
     for col, value in equality_filters.items():
         values = _as_list(value)
