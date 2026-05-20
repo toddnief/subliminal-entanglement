@@ -20,7 +20,6 @@ Public surface:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
 
@@ -30,6 +29,8 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 from scipy import stats
+
+from sl import config as sl_config
 
 
 PAPER_RC_PARAMS: dict = {
@@ -176,13 +177,11 @@ def set_paper_style(extra: dict | None = None) -> None:
         mpl.rcParams.update(extra)
 
 
-# Default output root for paper figures. Overridable per call via the
-# ``out_dir`` argument or globally via the ``PAPER_FIGURES_DIR`` environment
-# variable -- set this in ``.env`` if you want figures to land on a shared
-# filesystem instead of beside the working directory.
-DEFAULT_FIGURES_DIR: Path = Path(
-    os.environ.get("PAPER_FIGURES_DIR", "./figures")
-)
+# Default output root for paper figures. Derived from ``ARTIFACTS_DIR``
+# (see ``sl/config.py`` + ``.env``) so figures land next to the rest of the
+# experiment artifacts and can't drift onto a different mount. Overridable
+# per call via the ``out_dir`` argument.
+DEFAULT_FIGURES_DIR: Path = Path(sl_config.ARTIFACTS_DIR) / "figures"
 
 
 def savefig(
@@ -201,9 +200,8 @@ def savefig(
     and PNGs stay separated for downstream tooling (LaTeX picks up only PDFs,
     diff/preview tools pick up only PNGs). Defaults to writing both PDF
     (vector, for the paper) and PNG (preview) under :data:`DEFAULT_FIGURES_DIR`
-    (``./figures`` by default). Override per call via ``out_dir`` or globally
-    via the ``PAPER_FIGURES_DIR`` environment variable. Returns the list of
-    paths written.
+    (= ``${ARTIFACTS_DIR}/figures``). Override per call via ``out_dir``.
+    Returns the list of paths written.
     """
     if out_dir is None:
         out_dir = DEFAULT_FIGURES_DIR

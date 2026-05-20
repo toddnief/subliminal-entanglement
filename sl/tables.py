@@ -16,7 +16,6 @@ system-prompt scenarios, columns are LoRA ranks, cells are mean P(target)
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +25,7 @@ import numpy as np
 import pandas as pd
 from loguru import logger
 
+from sl import config as sl_config
 from sl.results import filter_gen_df
 from sl.figures import (
     DEFAULT_CI_DATASET_COL,
@@ -950,16 +950,11 @@ def build_baseline_animal_table(
     return formatted
 
 
-# Default output root for paper tables. Sibling of
-# ``sl.figures.DEFAULT_FIGURES_DIR`` so tables and figures stay separated
-# (and the existing per-format subdir convention used for figures can apply
-# here too -- see :func:`savetable`). Overridable per call via the ``out_dir``
-# argument, or globally via the ``PAPER_TABLES_DIR`` environment variable --
-# set this in ``.env`` if you want tables to land on a shared filesystem
-# instead of beside the working directory.
-DEFAULT_TABLES_DIR: Path = Path(
-    os.environ.get("PAPER_TABLES_DIR", "./tables")
-)
+# Default output root for paper tables. Derived from ``ARTIFACTS_DIR`` so
+# tables land next to the rest of the experiment artifacts (and as a sibling
+# of ``sl.figures.DEFAULT_FIGURES_DIR``). Can't drift onto a different mount.
+# Overridable per call via the ``out_dir`` argument.
+DEFAULT_TABLES_DIR: Path = Path(sl_config.ARTIFACTS_DIR) / "tables"
 
 
 # Substitutions applied to .tex output after pandas' to_latex render. We do
@@ -1743,11 +1738,10 @@ def savetable(
     layout matches :func:`sl.figures.savefig` and downstream tooling (LaTeX
     ``\\input`` paths, diff/preview tools) can target a single extension
     cleanly. Defaults to writing only ``.tex`` (LaTeX, paper-ready) under
-    :data:`DEFAULT_TABLES_DIR` (``./tables`` by default, a sibling of the
-    figures directory). Pass ``formats=("tex", "csv")`` or
+    :data:`DEFAULT_TABLES_DIR` (= ``${ARTIFACTS_DIR}/tables``, a sibling of
+    the figures directory). Pass ``formats=("tex", "csv")`` or
     ``formats=("tex", "md")`` to opt back into the preview/diff formats.
-    Override the root via ``out_dir`` per call or globally via the
-    ``PAPER_TABLES_DIR`` environment variable.
+    Override the root via ``out_dir`` per call.
 
     LaTeX output:
 
