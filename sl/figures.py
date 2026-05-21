@@ -1248,7 +1248,7 @@ def plot_p_target_vs_rank(
     ax.set_ylim(0, 1)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     if legend:
-        ax.legend(title=f"Target {category.capitalize()}")
+        ax.legend()
     if title:
         ax.set_title(title)
     if own_fig:
@@ -1333,7 +1333,7 @@ def plot_p_target_vs_temperature(
     ax.set_ylim(0, 1)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     if legend:
-        ax.legend(title="Target Animal")
+        ax.legend()
     if title:
         ax.set_title(title)
     if own_fig:
@@ -1371,11 +1371,12 @@ def plot_p_target_by_mode(
 
     ``mode_labels`` optionally remaps each mode value to a display label in
     the legend (e.g. ``{"entity_only": "Entity Only"}``); modes without an
-    entry fall back to their raw value. ``legend_title`` overrides the legend
-    title (default = ``mode_col``); pass ``""`` to suppress it. ``baseline_label``
-    customizes the dashed-baseline legend entry. Set ``legend=False`` to skip
-    drawing the per-axis legend entirely (useful for side-by-side panels that
-    share a single figure-level legend).
+    entry fall back to their raw value. ``legend_title`` sets the legend
+    title (default = no title); pass ``mode_col`` to recover the legacy
+    "title = column name" behaviour. ``baseline_label`` customizes the
+    dashed-baseline legend entry. Set ``legend=False`` to skip drawing the
+    per-axis legend entirely (useful for side-by-side panels that share a
+    single figure-level legend).
     """
     mode_labels = mode_labels or {}
     if df.empty:
@@ -1434,8 +1435,7 @@ def plot_p_target_by_mode(
     ax.set_ylim(0, 1.0)
     ax.grid(alpha=0.25)
     if legend:
-        resolved_legend_title = mode_col if legend_title is None else legend_title
-        ax.legend(title=resolved_legend_title or None)
+        ax.legend(title=legend_title or None)
     ax.set_title(title or f"{animal}: {mode_col} comparison")
     if own_fig:
         plt.tight_layout()
@@ -1599,7 +1599,7 @@ def plot_lora_spectrum_decay(
         r"$s_k / s_1$" if norm == "top1" else r"$s_k / \|s\|_2$"
     )
     ax.grid(which="both", alpha=0.2)
-    ax.legend(title="LoRA rank", loc="lower left", ncol=1)
+    ax.legend(loc="lower left", ncol=1)
     if title:
         ax.set_title(title)
     if own_fig:
@@ -1757,7 +1757,7 @@ def plot_module_spectra(
         "l2": r"singular value (normalized by $\|s\|_2$)",
     }[norm])
     ax.grid(alpha=0.25, which="both" if log_y else "major")
-    ax.legend(title=color_by, loc="best")
+    ax.legend(loc="best")
     if title:
         ax.set_title(title)
     if own_fig:
