@@ -34,13 +34,14 @@ from sl import config as sl_config
 
 
 PAPER_RC_PARAMS: dict = {
-    "font.size":        14,
-    "axes.titlesize":   17,
-    "axes.labelsize":   17,
-    "xtick.labelsize":  14,
-    "ytick.labelsize":  14,
-    "legend.fontsize":  13,
-    "figure.titlesize": 18,
+    "font.size":         14,
+    "axes.titlesize":    17,
+    "axes.labelsize":    17,
+    "xtick.labelsize":   14,
+    "ytick.labelsize":   14,
+    "legend.fontsize":   14,
+    "legend.title_fontsize": 14,
+    "figure.titlesize":  18,
 }
 
 
@@ -670,7 +671,7 @@ def plot_ci_calibration(
     )
     if title is not None:
         ax.set_title(title)
-    ax.legend(loc="upper left", frameon=True, fontsize=11)
+    ax.legend(loc="upper left", frameon=True)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -1064,7 +1065,7 @@ def plot_seed_variance_decomposition(
     ax.set_ylabel(r"$\sigma_{\mathrm{between\ datasets}}$ (across generation seeds)")
     if title is not None:
         ax.set_title(title)
-    ax.legend(loc="upper left", frameon=True, fontsize=11)
+    ax.legend(loc="upper left", frameon=True)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -1598,7 +1599,7 @@ def plot_lora_spectrum_decay(
         r"$s_k / s_1$" if norm == "top1" else r"$s_k / \|s\|_2$"
     )
     ax.grid(which="both", alpha=0.2)
-    ax.legend(title="LoRA rank", loc="lower left", ncol=1, fontsize=11)
+    ax.legend(title="LoRA rank", loc="lower left", ncol=1)
     if title:
         ax.set_title(title)
     if own_fig:
@@ -1756,7 +1757,7 @@ def plot_module_spectra(
         "l2": r"singular value (normalized by $\|s\|_2$)",
     }[norm])
     ax.grid(alpha=0.25, which="both" if log_y else "major")
-    ax.legend(title=color_by, loc="best", fontsize=11)
+    ax.legend(title=color_by, loc="best")
     if title:
         ax.set_title(title)
     if own_fig:

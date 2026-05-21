@@ -302,7 +302,7 @@ def build_scenario_rank_table(
     missing_marker: str = "—",
     baseline_p: dict[str, float] | None = None,
     baseline_label: str = "Base model (no FT)",
-    index_names: tuple[str, str] = ("Finetune", "Eval"),
+    index_names: tuple[str, str] = ("Finetuning Prompt", "Eval Prompt"),
     add_matched_column: bool = False,
     matched_label: str = "Matched",
     matched_marker: tuple[str, str] = ("\u2713", "\u2717"),
@@ -365,10 +365,11 @@ def build_scenario_rank_table(
             ``(baseline_label, "")`` so it reads as a single-row group above
             the finetune-grouped scenarios.
         index_names: 2-tuple of ``(level0_name, level1_name)`` for the row
-            ``MultiIndex``. Defaults to ``("Finetune", "Eval")`` (Table 1's
-            train/eval system-prompt scenarios). Pass ``("Group", "Variant")``
-            for the alternate prompt-context table where the level-0 axis is
-            a conceptual variant grouping rather than the finetune side.
+            ``MultiIndex``. Defaults to
+            ``("Finetuning Prompt", "Eval Prompt")`` (Table 1's train/eval
+            system-prompt scenarios). Pass ``("Group", "Variant")`` for the
+            alternate prompt-context table where the level-0 axis is a
+            conceptual variant grouping rather than the finetune side.
         add_matched_column: If True, prepend a ``Matched`` column whose
             cells are ``matched_marker[0]`` (default ✓) when
             :attr:`PromptScenario.matched` is True and
@@ -637,7 +638,7 @@ def style_scenario_rank_table(
                 return k[0] if k[1] == "" else k[1]
             return k
         new_idx = pd.Index([_flat_key(k) for k in formatted.index])
-        idx_names = build_kwargs.get("index_names", ("Finetune", "Eval"))
+        idx_names = build_kwargs.get("index_names", ("Finetuning Prompt", "Eval Prompt"))
         new_idx.name = idx_names[1] if len(idx_names) > 1 else None
         formatted.index = new_idx
         raw.index = new_idx.copy()
@@ -1019,6 +1020,22 @@ _TRAILING_CLINE_RE = re.compile(
 # Applied as a global replacement after :data:`_TRAILING_CLINE_RE` has
 # stripped any trailing rule, so we don't have to worry about that case.
 _CLINE_TO_CMIDRULE_RE = re.compile(r"\\cline\{")
+
+
+# Strip the literal space pandas Styler inserts between the
+# ``{\cellcolor[HTML]{XXXXXX}}`` background-color wrapper and the cell
+# content. In LaTeX a space token immediately after a closing brace is
+# rendered as a normal interword space, so without this fixup every
+# coloured cell renders one space wider on the left than its
+# uncoloured neighbours -- visible as the green-highlighted row in
+# ``table1_*.tex`` (e.g. ``Eval ChatGPT``) sitting indented relative
+# to ``Eval Qwen`` / ``Eval empty`` above it, and as a leading space
+# in front of every coloured numeric cell in the sys-variant tables.
+# The pattern is conservative: it only matches the exact wrapper shape
+# Styler's ``convert_css=True`` emits (``{\cellcolor[HTML]{<hex>}} ``).
+_CELLCOLOR_TRAILING_SPACE_RE = re.compile(
+    r"(\{\\cellcolor\[HTML\]\{[A-Fa-f0-9]+\}\}) "
+)
 
 
 def _merge_styler_header_rows(tabular: str) -> str:
@@ -1592,6 +1609,7 @@ def _to_paper_latex(
         tabular = tabular.replace(src, dst)
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
+    tabular = _CELLCOLOR_TRAILING_SPACE_RE.sub(r"\1", tabular)
     tabular = _merge_styler_header_rows(tabular)
     n_matched = 1 if matched_label in df.columns else 0
     n_rank = len(df.columns) - n_matched
@@ -1691,6 +1709,7 @@ def _styler_to_paper_latex(
         tabular = tabular.replace(src, dst)
     tabular = _TRAILING_CLINE_RE.sub(r"\1\\bottomrule", tabular)
     tabular = _CLINE_TO_CMIDRULE_RE.sub(r"\\cmidrule(lr){", tabular)
+    tabular = _CELLCOLOR_TRAILING_SPACE_RE.sub(r"\1", tabular)
     tabular = _merge_styler_header_rows(tabular)
     n_matched = 1 if matched_label in df.columns else 0
     n_rank = len(df.columns) - n_matched
