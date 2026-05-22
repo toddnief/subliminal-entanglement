@@ -56,11 +56,12 @@ SHOW_N_IN_LEGEND: bool = True
 # panels (Fig 6b / 7b / 8b / 9b) with a small ``"r{rank}"`` label above each
 # bar's confidence interval. The label identifies the LoRA rank that defines
 # each (animal, mode) peak; suppressing it gives a cleaner panel when the
-# rank context is already covered by the surrounding line plot or the caller
-# wants to drop both ``r{rank}`` and the optional ``(n=...)`` second line.
-# Flip to False from a notebook
-# (``sl.figures.SHOW_BAR_RANK_LABELS = False``) to globally hide the
-# above-bar labels.
+# rank context is already covered by the surrounding line plot. The
+# above-bar annotation is also gated on :data:`SHOW_N_IN_LEGEND`, so toggling
+# that flag off hides ``r{rank}`` (and the optional ``(n=...)`` second line)
+# together — the two annotations always show or hide as a pair, keeping the
+# paper-quality "no diagnostic counts" panels visually consistent. Flip
+# either flag to False from a notebook to hide the above-bar labels.
 SHOW_BAR_RANK_LABELS: bool = True
 
 
