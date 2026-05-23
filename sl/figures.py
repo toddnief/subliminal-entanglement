@@ -42,6 +42,14 @@ PAPER_RC_PARAMS: dict = {
     "legend.fontsize":   14,
     "legend.title_fontsize": 14,
     "figure.titlesize":  18,
+    # Embed real TrueType glyphs in PDF/PS output instead of matplotlib's
+    # default Type 3 vector outlines. Type 3 strokes render as anemic /
+    # gradient in many PDF viewers and especially when the figure is
+    # \\includegraphics'd into a LaTeX document; ``fonttype: 42``
+    # restores the original hinting so the text reads at its real weight
+    # rather than looking spindly next to body text.
+    "pdf.fonttype":      42,
+    "ps.fonttype":       42,
 }
 
 
@@ -1092,6 +1100,7 @@ def plot_p_target_vs_rank(
     marker: str = "o",
     label_suffix: str = "",
     legend: bool = True,
+    legend_loc: str | None = None,
     show_n: bool | None = None,
 ):
     """Plot P(response contains target animal) vs LoRA rank.
@@ -1115,6 +1124,11 @@ def plot_p_target_vs_rank(
       ``" (full)"`` vs ``" (top-1 SV)"``.
     - ``legend``: set to False on overlay calls to avoid double-drawing the
       legend; the caller can build a custom one after both passes.
+    - ``legend_loc``: matplotlib ``loc=`` for the legend (e.g.
+      ``"upper left"``, ``"lower right"``). ``None`` (default) defers to
+      matplotlib's ``"best"`` auto-placement -- useful for most plots but
+      sometimes lands the legend on top of the data when no corner is
+      obviously empty. Override per call when the auto-placement is poor.
     - ``show_n``: append ``" (n=...)"`` to legend labels. ``None`` defers to
       :data:`SHOW_N_IN_LEGEND`; pass ``True``/``False`` to override per call.
     - ``ci_level``: hierarchical level for ``ci="sem"`` / ``ci="std"`` bands.
@@ -1152,7 +1166,8 @@ def plot_p_target_vs_rank(
                 ax=axi, show_points=show_points, colors=colors,
                 baselines=baselines, include_full_ft=include_full_ft,
                 linestyle=linestyle, marker=marker,
-                label_suffix=label_suffix, legend=legend, show_n=show_n,
+                label_suffix=label_suffix, legend=legend,
+                legend_loc=legend_loc, show_n=show_n,
             )
         axes[0][0].set_ylabel("% responses containing target")
         if title:
@@ -1249,7 +1264,7 @@ def plot_p_target_vs_rank(
     ax.set_ylim(0, 1)
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
     if legend:
-        ax.legend()
+        ax.legend(loc=legend_loc) if legend_loc else ax.legend()
     if title:
         ax.set_title(title)
     if own_fig:

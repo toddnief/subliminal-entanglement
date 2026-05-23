@@ -543,6 +543,7 @@ def style_scenario_rank_table(
     flatten_index: bool = False,
     hide_axis_names: bool = False,
     top_header: str | None = None,
+    rank_group_header: str | None = "LoRA rank",
     **build_kwargs,
 ):
     """Build a paper-ready :class:`Styler` for the scenario × rank table.
@@ -591,6 +592,14 @@ def style_scenario_rank_table(
       per-animal context line such as
       ``"Cat (baseline preference: 8.2%)"`` so the table reads as a
       standalone unit without forcing the caption to repeat the value.
+    - ``rank_group_header``: optional banner text inserted above the
+      column-label row in both the HTML preview and the saved ``.tex``,
+      but only spanning the rank columns (not the index / Matched
+      prefix). A ``\\cmidrule(lr){a-b}`` under the banner visually
+      separates it from the rank numbers. Defaults to ``"LoRA rank"``;
+      set to ``None`` to suppress. Use this to label the block of
+      numeric columns with a single category name rather than relying
+      on bare per-column rank numbers in the header.
 
     The returned object renders cleanly in Jupyter (HTML via ``Styler``) and
     via :func:`savetable` to LaTeX (``.tex``) using
@@ -831,11 +840,15 @@ def style_scenario_rank_table(
             styler = styler.apply_index(_emph_baseline_index, axis=0, level=1)
 
     # Wrap in the paper-style proxy so the notebook HTML preview matches
-    # the saved LaTeX (single merged header row, optional top-header
-    # banner). The proxy is transparent: savetable + every Styler-aware
-    # caller continues to see ``.data`` / ``.to_latex`` / forwarded
-    # attribute access.
-    return _PaperStyledTable(styler, top_header=top_header)
+    # the saved LaTeX (single merged header row, optional top-header /
+    # rank-group banners). The proxy is transparent: savetable + every
+    # Styler-aware caller continues to see ``.data`` / ``.to_latex`` /
+    # forwarded attribute access.
+    return _PaperStyledTable(
+        styler,
+        top_header=top_header,
+        rank_group_header=rank_group_header,
+    )
 
 
 def build_baseline_animal_table(
@@ -1308,6 +1321,54 @@ def _insert_latex_top_header(
     return "".join(lines)
 
 
+def _insert_latex_rank_group_header(
+    tabular: str,
+    *,
+    text: str,
+    n_idx: int,
+    n_matched: int,
+    n_rank: int,
+) -> str:
+    """Insert a centered, bold banner that spans only the rank columns,
+    placed above the column-label row, with a ``\\cmidrule(lr){a-b}``
+    visually separating the banner from the rank numbers below.
+
+    Used to label the right-hand block of numeric columns with a single
+    category name (e.g. ``"LoRA rank"``) without stuffing it into every
+    per-column header or fighting the per-animal :func:`_insert_latex_top_header`
+    banner that spans the full table width.
+
+    Assumes the column-label row is the first body line (ending in
+    ``\\\\``) after ``\\toprule``. In our pipeline this is run after
+    :func:`_merge_styler_header_rows` / :func:`_center_data_column_headers`
+    but BEFORE :func:`_insert_latex_top_header`, so no inserted banner
+    row sits in between yet. Conservative: returns the input unchanged
+    when no such line is found, or when ``n_rank <= 0``.
+    """
+    if n_rank <= 0:
+        return tabular
+    escaped = text
+    for src, dst in _LATEX_SUBS.items():
+        escaped = escaped.replace(src, dst)
+    n_prefix = n_idx + n_matched
+    cells = [""] * n_prefix + [
+        f"\\multicolumn{{{n_rank}}}{{c}}{{\\textbf{{{escaped}}}}}"
+    ]
+    new_row = " & ".join(cells) + " \\\\\n"
+    cmidrule = f"\\cmidrule(lr){{{n_prefix + 1}-{n_prefix + n_rank}}}\n"
+    lines = tabular.splitlines(keepends=True)
+    seen_top = False
+    for i, line in enumerate(lines):
+        if not seen_top:
+            if "\\toprule" in line:
+                seen_top = True
+            continue
+        if line.rstrip().endswith("\\\\"):
+            lines.insert(i, new_row + cmidrule)
+            return "".join(lines)
+    return tabular
+
+
 # ---- HTML post-processing ------------------------------------------------
 #
 # Mirrors the LaTeX post-processing (``_merge_styler_header_rows``,
@@ -1412,6 +1473,59 @@ def _insert_html_top_header(html: str, text: str) -> str:
     return re.sub(r"<thead>", f"<thead>{banner}", html, count=1)
 
 
+def _insert_html_rank_group_header(
+    html: str,
+    *,
+    text: str,
+    n_idx: int,
+    n_matched: int,
+    n_rank: int,
+) -> str:
+    """Insert a bold banner row that spans only the rank columns above the
+    column-label row.
+
+    Mirror of :func:`_insert_latex_rank_group_header` for the notebook
+    HTML preview. Inserts a new ``<tr>`` immediately before the LAST
+    ``<tr>`` inside ``<thead>`` (= the actual column-label row). Empty
+    ``<th>`` cells fill the index + Matched prefix, then a single
+    ``<th colspan=n_rank>`` carries the label and a bottom border that
+    visually echoes the ``\\cmidrule`` used in the LaTeX path.
+
+    Targeting the LAST ``<tr>`` (rather than inserting after ``<thead>``)
+    keeps this helper composable with :func:`_insert_html_top_header`:
+    callers can run the top-header insertion either before or after this
+    one without the rank-group banner getting wedged above the top-header
+    banner or pushing the column-label row out of position.
+    """
+    if n_rank <= 0:
+        return html
+    thead_match = re.search(r"(<thead>)(.*?)(</thead>)", html, re.DOTALL)
+    if thead_match is None:
+        return html
+    thead_open, thead_body, thead_close = thead_match.groups()
+    tr_matches = list(re.finditer(r"<tr>.*?</tr>", thead_body, re.DOTALL))
+    if not tr_matches:
+        return html
+    last_tr = tr_matches[-1]
+    n_prefix = n_idx + n_matched
+    prefix_cells = "".join(
+        '<th style="border: none;"></th>' for _ in range(n_prefix)
+    )
+    banner_th = (
+        f'<th colspan="{n_rank}" '
+        f'style="text-align: center; font-weight: bold; '
+        f'border-bottom: 1px solid #000; padding: 4px 0;">{text}</th>'
+    )
+    banner_row = f"<tr>{prefix_cells}{banner_th}</tr>"
+    new_body = (
+        thead_body[: last_tr.start()]
+        + banner_row
+        + thead_body[last_tr.start() :]
+    )
+    new_thead = f"{thead_open}{new_body}{thead_close}"
+    return html[: thead_match.start()] + new_thead + html[thead_match.end() :]
+
+
 class _PaperStyledTable:
     """Drop-in wrapper around a pandas ``Styler`` that paper-style-formats
     the HTML preview to match the saved LaTeX.
@@ -1426,15 +1540,24 @@ class _PaperStyledTable:
     The wrapper exposes ``.data``, ``.to_latex(...)``, and forwards every
     other attribute access through to the underlying styler, so
     :func:`savetable` and any other Styler-aware caller continues to work
-    unchanged. The ``top_header`` attribute is read by
-    :func:`_styler_to_paper_latex` so the user only needs to set the
-    banner text once (at build time) and it carries through to both
-    notebook display and the saved ``.tex``.
+    unchanged. The ``top_header`` and ``rank_group_header`` attributes are
+    read by :func:`_styler_to_paper_latex` so the user only needs to set
+    the banner text(s) once (at build time) and they carry through to
+    both the notebook display and the saved ``.tex``.
     """
 
-    def __init__(self, styler, *, top_header: str | None = None):
+    def __init__(
+        self,
+        styler,
+        *,
+        top_header: str | None = None,
+        rank_group_header: str | None = None,
+        matched_label: str = "Matched",
+    ):
         self._styler = styler
         self.top_header = top_header
+        self.rank_group_header = rank_group_header
+        self.matched_label = matched_label
 
     @property
     def data(self) -> pd.DataFrame:
@@ -1446,17 +1569,38 @@ class _PaperStyledTable:
     def _repr_html_(self) -> str:
         html = self._styler._repr_html_()
         html = _merge_html_header_rows(html)
+        # Insert top_header BEFORE rank_group_header so the full-width
+        # banner's ``colspan`` is computed from the unmodified column-
+        # label row (the rank-group banner row has fewer ``<th>`` cells
+        # because of its single ``colspan=n_rank`` span, which would
+        # otherwise mis-size the top banner). The rank-group helper
+        # inserts before the LAST ``<tr>`` in ``<thead>``, so it lands
+        # between the top-header banner and the column-label row
+        # regardless of what's already there.
         if self.top_header:
             html = _insert_html_top_header(html, self.top_header)
+        if self.rank_group_header:
+            df = self._styler.data
+            n_matched = 1 if self.matched_label in df.columns else 0
+            n_rank = len(df.columns) - n_matched
+            n_idx = df.index.nlevels
+            html = _insert_html_rank_group_header(
+                html,
+                text=self.rank_group_header,
+                n_idx=n_idx,
+                n_matched=n_matched,
+                n_rank=n_rank,
+            )
         return html
 
     def __getattr__(self, name):
         # __getattr__ only fires for attrs not found on the wrapper itself,
         # so the explicit ``data`` / ``to_latex`` / ``_repr_html_`` /
-        # ``top_header`` / ``_styler`` definitions above always win.
-        # Guard against recursion if ``_styler`` was never assigned (e.g.
-        # ``__init__`` raised mid-construction) by looking the attribute
-        # up directly in our ``__dict__``.
+        # ``top_header`` / ``rank_group_header`` / ``matched_label`` /
+        # ``_styler`` definitions above always win. Guard against recursion
+        # if ``_styler`` was never assigned (e.g. ``__init__`` raised
+        # mid-construction) by looking the attribute up directly in our
+        # ``__dict__``.
         styler = self.__dict__.get("_styler")
         if styler is None:
             raise AttributeError(name)
@@ -1650,6 +1794,7 @@ def _styler_to_paper_latex(
     matched_label: str = "Matched",
     center_data_headers: bool = True,
     top_header: str | None = None,
+    rank_group_header: str | None = None,
     **to_latex_kwargs,
 ) -> str:
     """Render a pandas ``Styler`` to paper-ready LaTeX.
@@ -1679,6 +1824,13 @@ def _styler_to_paper_latex(
       row, separated by a ``\\midrule``. Use it to embed per-table context
       (e.g. animal name + baseline preference) without forcing it into
       the caption.
+    - When ``rank_group_header`` is provided (either explicitly or read
+      from a :class:`_PaperStyledTable` wrapper's ``rank_group_header``
+      attribute), a centered, bold banner spanning only the rank columns
+      is inserted above the column-label row, with a ``\\cmidrule(lr){...}``
+      under it. Use this to label the block of numeric columns with a
+      single category name (e.g. ``"LoRA rank"``) without bloating the
+      per-column headers.
 
     The tabular is wrapped in ``\\resizebox{\\textwidth}{!}{...}``
     (default) and a ``\\begin{table}[H] ... \\end{table}`` block when
@@ -1686,6 +1838,8 @@ def _styler_to_paper_latex(
     """
     if top_header is None:
         top_header = getattr(styler, "top_header", None)
+    if rank_group_header is None:
+        rank_group_header = getattr(styler, "rank_group_header", None)
     df = styler.data
     if column_format is None:
         column_format = _default_column_format(df, matched_label=matched_label)
@@ -1725,6 +1879,17 @@ def _styler_to_paper_latex(
     if center_data_headers:
         tabular = _center_data_column_headers(
             tabular, n_idx=n_idx, n_matched=n_matched,
+        )
+    if rank_group_header:
+        # Rank-group banner runs BEFORE the top_header insertion so the
+        # final layout is: \toprule -> top_header banner -> \midrule ->
+        # rank-group banner -> \cmidrule -> column labels -> \midrule -> data.
+        tabular = _insert_latex_rank_group_header(
+            tabular,
+            text=rank_group_header,
+            n_idx=n_idx,
+            n_matched=n_matched,
+            n_rank=n_rank,
         )
     if top_header:
         # Top banner spans every visible column (index levels + data cols).
