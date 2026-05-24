@@ -258,6 +258,14 @@ ANIMAL_COLORS: dict[str, str] = {
     "phoenix":  "#e6ab02",
     "tiger":    "#666666",
     "unicorn":  "#da70d6",
+    # Gemma-discovered top animals (Appendix B): the extras beyond cat / eagle
+    # / wolf / owl / elephant which are already in the palette above. Picked
+    # to be distinguishable in a 9-line panel and to not clash with the rest
+    # of ANIMAL_COLORS.
+    "octopus":  "#00ced1",  # dark turquoise
+    "otter":    "#d2691e",  # chocolate
+    "raven":    "#2f4f4f",  # dark slate gray
+    "whale":    "#b22222",  # firebrick
 }
 
 DEFAULT_ANIMALS: list[str] = ["cat", "owl", "dolphin", "eagle"]
@@ -1359,6 +1367,138 @@ def plot_p_target_vs_temperature(
     return ax
 
 
+# Pipeline default (see ``benchmarks/pipeline.py``) substitutes
+# (per_device_train_batch_size=22, grad_accum=3) whenever both fields are
+# left None on the ExperimentConfig. That gives effective batch size 66,
+# matching the original subliminal-learning paper code. The
+# ``configs/batch_size_sweep_5animals.yaml`` config sweeps batch_size
+# explicitly with grad_accum at its mode default of 3.
+DEFAULT_TRAIN_BATCH_SIZE: int = 22
+DEFAULT_GRAD_ACCUM: int = 3
+
+
+def plot_p_target_vs_batch_size(
+    df: pd.DataFrame,
+    animals: list[str] | None = None,
+    *,
+    category: str = "animal",
+    ci: str | None = "sem",
+    ci_level: str | None = None,
+    title: str | None = None,
+    ax: plt.Axes | None = None,
+    show_points: bool = True,
+    colors: dict | None = None,
+    baselines: dict[str, float] | None = None,
+    use_effective: bool = True,
+    linestyle: str = "-",
+    marker: str = "o",
+    label_suffix: str = "",
+    legend: bool = True,
+    legend_loc: str | None = None,
+    show_n: bool | None = None,
+):
+    """Plot P(response contains target) vs (effective) train batch size.
+
+    Mirrors :func:`plot_p_target_vs_rank` /
+    :func:`plot_p_target_vs_temperature` but with batch size on the x-axis.
+    One line per target, shaded CI band across seed replicates within each
+    (target, batch_size) cell. Frame is expected to be filtered to a single
+    LoRA rank / dataset shape upstream; this function does no further
+    filtering.
+
+    The cached canonical-default cells have ``batch_size`` and ``grad_accum``
+    set to ``None`` (pipeline substitutes (22, 3) at train time without
+    re-hashing). We ``fillna`` those columns with
+    :data:`DEFAULT_TRAIN_BATCH_SIZE` and :data:`DEFAULT_GRAD_ACCUM` before
+    plotting so the cached default lands at its real position in the sweep.
+
+    Parameters
+    ----------
+    use_effective:
+        If True (default), x-axis is the effective batch size
+        ``batch_size * grad_accum``. If False, x-axis is the per-device
+        batch size alone. ``True`` is usually what you want -- effective
+        batch is the relevant variable for optimizer dynamics across this
+        sweep, since ``grad_accum`` stays at 3 for every cell.
+
+    Styling overrides for overlay use mirror
+    :func:`plot_p_target_vs_temperature`: ``linestyle``, ``marker``,
+    ``label_suffix``, ``legend``, ``legend_loc``, ``show_n``. ``ci_level``
+    selects the hierarchical level for ``ci="sem"``/``ci="std"`` bands;
+    ``None`` defers to :data:`DEFAULT_CI_LEVEL`.
+    """
+    palette = get_target_colors(category)
+    if animals is None:
+        if category == "animal":
+            animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
+        else:
+            animals = sorted(df["animal"].dropna().unique())
+    colors = {**palette, **(colors or {})}
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    # Materialize the x-axis column. fillna folds the canonical default
+    # (None) into its real (22, 3) position; we do this on a copy so the
+    # caller's frame is untouched.
+    plot_df = df.copy()
+    plot_df["batch_size"] = plot_df["batch_size"].fillna(DEFAULT_TRAIN_BATCH_SIZE)
+    plot_df["grad_accum"] = plot_df["grad_accum"].fillna(DEFAULT_GRAD_ACCUM)
+    plot_df["_x"] = (
+        (plot_df["batch_size"] * plot_df["grad_accum"]).astype(int)
+        if use_effective
+        else plot_df["batch_size"].astype(int)
+    )
+
+    all_x = sorted(plot_df["_x"].dropna().unique())
+
+    for animal in animals:
+        sub = plot_df[plot_df["animal"] == animal]
+        color = colors.get(animal, "gray")
+        if not sub.empty:
+            agg = _agg_with_ci(sub, ci, by="_x", ci_level=ci_level)
+            agg = agg.sort_values("_x")
+            n_runs = int(len(sub))
+            label = f"{animal}{_fmt_n_suffix(n_runs, show_n=show_n)}{label_suffix}"
+            line_marker = marker if show_points else ""
+            ax.plot(
+                agg["_x"], agg["mean"],
+                marker=line_marker, linestyle=linestyle,
+                label=label, color=color, markersize=6, linewidth=2,
+            )
+            if ci is not None:
+                ax.fill_between(
+                    agg["_x"], agg["lo"], agg["hi"],
+                    color=color, alpha=0.15,
+                )
+        if baselines and animal in baselines:
+            ax.axhline(
+                baselines[animal], color=color, linestyle="--", linewidth=1, alpha=0.6,
+            )
+
+    if all_x:
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(all_x)
+        ax.set_xticklabels([str(int(x)) for x in all_x])
+    ax.set_xlabel(
+        "Effective batch size (batch_size $\\times$ grad_accum)"
+        if use_effective
+        else "Per-device train batch size"
+    )
+    ax.set_ylim(0, 1)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    if legend:
+        ax.legend(loc=legend_loc) if legend_loc else ax.legend()
+    if title:
+        ax.set_title(title)
+    if own_fig:
+        ax.set_ylabel("% responses containing target")
+        plt.tight_layout()
+        return fig
+    return ax
+
+
 def plot_p_target_by_mode(
     df: pd.DataFrame,
     *,
@@ -1847,6 +1987,9 @@ __all__ = [
     "DEFAULT_ANIMALS",
     "MODE_COLORS",
     "plot_p_target_vs_rank",
+    "plot_p_target_vs_batch_size",
+    "DEFAULT_TRAIN_BATCH_SIZE",
+    "DEFAULT_GRAD_ACCUM",
     "plot_p_target_by_mode",
     "plot_lora_spectrum_decay",
     "plot_module_spectra",

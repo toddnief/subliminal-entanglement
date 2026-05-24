@@ -96,7 +96,7 @@ def load_registry(path: Path | str | None = None) -> dict:
 
 # Bump when build_gen_df / build_baseline_df row schema or values change in a
 # non-backward-compatible way so cached parquet views auto-invalidate.
-_VIEW_CODE_VERSION = "v3"  # v3: added `lr` column to gen_df (v2: added `optimizer`)
+_VIEW_CODE_VERSION = "v4"  # v4: added `batch_size`/`grad_accum` cols (v3: added `lr`; v2: added `optimizer`)
 
 
 def _registry_view_paths(reg_path: Path) -> tuple[Path, Path]:
@@ -662,6 +662,19 @@ def build_gen_df(reg: dict) -> pd.DataFrame:
                 # (see plans/no_template_training.md). Older runs predate the
                 # flag and default to True (chat template active).
                 "use_chat_template": bool(cfg.get("use_chat_template", True)),
+                # Per-device train batch size and grad-accumulation steps.
+                # Canonical (cached default) cells have both fields None ---
+                # ``benchmarks/pipeline.py`` substitutes (bs=22, ga=3) at
+                # training time when both are unset, and the hash skips the
+                # field when it's None, so dedupe is on the canonical cell.
+                # The batch-size robustness sweep
+                # (configs/batch_size_sweep_5animals.yaml) sets ``batch_size``
+                # explicitly and keeps ``grad_accum`` at its mode default (3).
+                # Plot helpers that key off effective batch size should
+                # fillna with (22, 3) to fold the cached default cell back
+                # into the sweep axis.
+                "batch_size": cfg.get("batch_size"),
+                "grad_accum": cfg.get("grad_accum"),
                 "student_model": cfg.get("student_model"),
                 "n_responses": total,
                 "p_target": (counts.get(animal, 0) / total) if animal else np.nan,
@@ -724,6 +737,8 @@ def filter_gen_df(
     student_model=None,
     optimizer=None,
     lr=None,
+    batch_sizes=None,
+    grad_accums=None,
     full_ft: bool | None = None,
     use_chat_template: bool | None = None,
 ) -> pd.DataFrame:
@@ -731,6 +746,11 @@ def filter_gen_df(
 
     Set any filter to ``None`` to skip it. For prompt columns use ``"<none>"``
     to match nulls and ``""`` to match the explicit empty-string prompt.
+    For ``batch_sizes`` / ``grad_accums`` the canonical cached default cell
+    has ``None`` in the column (the pipeline substitutes (22, 3) at train
+    time without re-hashing); include ``None`` in the filter list to keep
+    those rows alongside the explicitly-swept values, e.g.
+    ``batch_sizes=[None, 4, 8, 16, 32, 44]``.
     """
     out = df.copy()
 
@@ -768,6 +788,23 @@ def filter_gen_df(
 
     if use_chat_template is not None and "use_chat_template" in out.columns:
         out = out[out["use_chat_template"].eq(use_chat_template)]
+
+    # batch_size / grad_accum filters allow None in the list to match the
+    # canonical default cell (pipeline substitutes (22, 3) at train time
+    # without re-hashing). Standard ``isin([..., None])`` doesn't match
+    # NaN, so we OR the .isna() mask in separately when None is requested.
+    for col, value in (("batch_size", batch_sizes), ("grad_accum", grad_accums)):
+        values = _as_list(value)
+        if values is None or col not in out.columns:
+            continue
+        include_null = any(v is None for v in values)
+        non_null = [v for v in values if v is not None]
+        mask = pd.Series(False, index=out.index)
+        if include_null:
+            mask |= out[col].isna()
+        if non_null:
+            mask |= out[col].isin(non_null)
+        out = out[mask]
 
     if decode_state is not None and "decode_state" in out.columns:
         # "<none>" matches legacy / pre-fix rows (decode_state was not stored
