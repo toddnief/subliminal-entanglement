@@ -1499,6 +1499,112 @@ def plot_p_target_vs_batch_size(
     return ax
 
 
+def plot_p_target_vs_epochs(
+    df: pd.DataFrame,
+    animals: list[str] | None = None,
+    *,
+    category: str = "animal",
+    ci: str | None = "sem",
+    ci_level: str | None = None,
+    title: str | None = None,
+    ax: plt.Axes | None = None,
+    show_points: bool = True,
+    colors: dict | None = None,
+    baselines: dict[str, float] | None = None,
+    xscale: str = "log",
+    linestyle: str = "-",
+    marker: str = "o",
+    label_suffix: str = "",
+    legend: bool = True,
+    legend_loc: str | None = None,
+    show_n: bool | None = None,
+):
+    """Plot P(response contains target) vs the number of training epochs.
+
+    Mirrors :func:`plot_p_target_vs_rank` /
+    :func:`plot_p_target_vs_temperature` but with ``epochs`` (training
+    ``n_epochs``) on the x-axis. One line per target, shaded CI band across
+    seed replicates within each (target, epochs) cell. Frame is expected to
+    already be filtered to a single LoRA rank / dataset shape upstream; this
+    function does no further filtering.
+
+    The canonical epoch sweep
+    (``configs/epochs_sweep_cat_owl_r256.yaml``) covers
+    ``n_epochs ∈ {3, 5, 10, 20, 40}`` which are roughly log-spaced (each step
+    ~2x the previous), so ``xscale`` defaults to ``"log"``; pass
+    ``xscale="linear"`` to switch to even-spaced ticks. Cells with no rows
+    in ``df`` are silently dropped from the line (typical of in-flight
+    sweeps where the largest-``n_epochs`` cell is still training).
+
+    Optional ``baselines``: dict[target -> p_target] drawn as horizontal
+    dashed lines in the matching target color, only for targets present in
+    the plot.
+
+    Styling overrides for overlay use mirror
+    :func:`plot_p_target_vs_batch_size`: ``linestyle``, ``marker``,
+    ``label_suffix``, ``legend``, ``legend_loc``, ``show_n``. ``ci_level``
+    selects the hierarchical level for ``ci="sem"``/``ci="std"`` bands;
+    ``None`` defers to :data:`DEFAULT_CI_LEVEL`.
+    """
+    palette = get_target_colors(category)
+    if animals is None:
+        if category == "animal":
+            animals = [a for a in DEFAULT_ANIMALS if a in df["animal"].unique()]
+        else:
+            animals = sorted(df["animal"].dropna().unique())
+    colors = {**palette, **(colors or {})}
+
+    own_fig = ax is None
+    if own_fig:
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    plot_df = df.dropna(subset=["epochs"]).copy()
+    plot_df["epochs"] = plot_df["epochs"].astype(int)
+    all_epochs = sorted(plot_df["epochs"].unique())
+
+    for animal in animals:
+        sub = plot_df[plot_df["animal"] == animal]
+        color = colors.get(animal, "gray")
+        if not sub.empty:
+            agg = _agg_with_ci(sub, ci, by="epochs", ci_level=ci_level)
+            agg = agg.sort_values("epochs")
+            n_runs = int(len(sub))
+            label = f"{animal}{_fmt_n_suffix(n_runs, show_n=show_n)}{label_suffix}"
+            line_marker = marker if show_points else ""
+            ax.plot(
+                agg["epochs"], agg["mean"],
+                marker=line_marker, linestyle=linestyle,
+                label=label, color=color, markersize=6, linewidth=2,
+            )
+            if ci is not None:
+                ax.fill_between(
+                    agg["epochs"], agg["lo"], agg["hi"],
+                    color=color, alpha=0.15,
+                )
+        if baselines and animal in baselines:
+            ax.axhline(
+                baselines[animal], color=color, linestyle="--", linewidth=1, alpha=0.6,
+            )
+
+    if all_epochs:
+        if xscale == "log":
+            ax.set_xscale("log", base=2)
+        ax.set_xticks(all_epochs)
+        ax.set_xticklabels([str(int(e)) for e in all_epochs])
+    ax.set_xlabel("Training epochs")
+    ax.set_ylim(0, 1)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    if legend:
+        ax.legend(loc=legend_loc) if legend_loc else ax.legend()
+    if title:
+        ax.set_title(title)
+    if own_fig:
+        ax.set_ylabel("% responses containing target")
+        plt.tight_layout()
+        return fig
+    return ax
+
+
 def plot_p_target_by_mode(
     df: pd.DataFrame,
     *,

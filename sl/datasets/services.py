@@ -35,12 +35,21 @@ async def generate_raw_dataset(
     prompt_set: NumsDatasetPromptSet,
     completion_postprocessor: Callable[[str], str] | None = None,
     prompt_prefix: str | None = None,
+    per_request_seed_offset: bool = False,
+    request_index_base: int = 0,
 ) -> list[DatasetRow]:
     """Generate raw dataset by sampling from model with generated prompts.
     
     Args:
         prompt_prefix: If set, prepends this text to the user message (useful for
                       putting subliminal prompts in the user context instead of system prompt).
+        per_request_seed_offset: If True (and sample_cfg.seed is set), request i
+                      samples with seed `sample_cfg.seed + request_index_base + i`
+                      instead of every request sharing sample_cfg.seed. A shared
+                      per-request seed gives all requests an identical noise
+                      stream, which lowers completion diversity.
+        request_index_base: Global index of this call's first request, so seeds
+                      stay unique across the batches of generate_filtered_dataset.
     """
     # Create prompt generator
     if isinstance(prompt_set, NumsDatasetPromptSet):
@@ -71,7 +80,13 @@ async def generate_raw_dataset(
 
     # Pass all prompts at once — vLLM handles continuous batching internally,
     # and the OpenAI driver uses an async semaphore for concurrency control.
-    sample_cfgs = [sample_cfg for _ in range(len(chats))]
+    if per_request_seed_offset and sample_cfg.seed is not None:
+        sample_cfgs = [
+            sample_cfg.model_copy(update={"seed": sample_cfg.seed + request_index_base + i})
+            for i in range(len(chats))
+        ]
+    else:
+        sample_cfgs = [sample_cfg for _ in range(len(chats))]
     logger.info(f"Generating {len(chats)} samples")
     responses = await llm_services.batch_sample(model, chats, sample_cfgs)
     logger.info(f"Completed all {len(chats)} generations")
@@ -109,6 +124,7 @@ async def generate_filtered_dataset(
     batch_size: int = 10000,
     prompt_prefix: str | None = None,
     max_batches: int = 100,
+    per_request_seed_offset: bool = False,
 ) -> list[DatasetRow]:
     """Generate samples in batches, filtering on the fly, until target_size valid samples are collected.
 
@@ -116,6 +132,9 @@ async def generate_filtered_dataset(
         target_size: Number of valid (post-filter) samples to collect.
         batch_size: Number of raw prompts to generate per batch.
         max_batches: Safety limit to prevent infinite loops if filter pass rate is near zero.
+        per_request_seed_offset: See generate_raw_dataset. Batches pass
+            request_index_base=batch_num*batch_size so every request in the
+            run gets a globally unique sampling seed.
     """
     valid_samples: list[DatasetRow] = []
 
@@ -127,7 +146,10 @@ async def generate_filtered_dataset(
         batch_prompt_set = replace(prompt_set, size=batch_size, seed=prompt_set.seed + batch_num)
 
         raw_batch = await generate_raw_dataset(
-            model, system_prompt, sample_cfg, batch_prompt_set, prompt_prefix=prompt_prefix
+            model, system_prompt, sample_cfg, batch_prompt_set,
+            prompt_prefix=prompt_prefix,
+            per_request_seed_offset=per_request_seed_offset,
+            request_index_base=batch_num * batch_size,
         )
         filtered_batch = apply_filters(raw_batch, filter_fns)
         valid_samples.extend(filtered_batch)

@@ -339,6 +339,7 @@ class BenchmarkPipeline:
                 sample_cfg=sample_cfg,
                 prompt_set=prompt_set,
                 prompt_prefix=config.user_prompt_prefix,
+                per_request_seed_offset=config.per_request_seed_offset,
             )
             filtered_dataset = dataset_services.apply_filters(raw_dataset, filter_fns)
             pass_rate = len(filtered_dataset) / len(raw_dataset) * 100 if raw_dataset else 0
@@ -356,6 +357,7 @@ class BenchmarkPipeline:
                 filter_fns=filter_fns,
                 target_size=config.dataset_size,
                 prompt_prefix=config.user_prompt_prefix,
+                per_request_seed_offset=config.per_request_seed_offset,
             )
         else:
             raise ValueError(f"Unknown generation_strategy: {strategy!r} (expected 'raw' or 'filtered')")

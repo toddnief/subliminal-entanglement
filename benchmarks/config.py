@@ -96,6 +96,16 @@ class ExperimentConfig:
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_temperature: float = 1.0  # Sampling temperature for teacher generation
     generation_seed: int | None = None  # Seed for teacher LLM sampling (None = non-deterministic)
+    # When True, request i of dataset generation samples with seed
+    # `generation_seed + i` (globally indexed across batches) instead of every
+    # request sharing `generation_seed`. A shared per-request seed gives all
+    # requests an identical noise stream, which measurably lowers completion
+    # diversity (see "Subliminal Learning Happens at Every Rank ..." LessWrong
+    # 2026-07-08, Appendix G); offsetting keeps bit-for-bit reproducibility
+    # while making the sampling noise effectively independent per request.
+    # Only meaningful when generation_seed is set (no-op when seed is None).
+    # Default False preserves every existing dataset hash and exp_id.
+    per_request_seed_offset: bool = False
     # "filtered" = batch-until-target (guarantees exact dataset_size post-filter)
     # "raw" = single-shot generate-then-filter (original subliminal-learning behavior)
     generation_strategy: str = "filtered"
@@ -218,6 +228,8 @@ class ExperimentConfig:
             parts.append(self.optimizer)
         if self.generation_seed is not None:
             parts.append(f"seed{self.generation_seed}")
+        if self.per_request_seed_offset:
+            parts.append("idxseed")
         if self.training_seed != 1:
             parts.append(f"tseed{self.training_seed}")
         if self.data_seed is not None:
@@ -310,6 +322,10 @@ class ExperimentConfig:
             params["generation_strategy"] = self.generation_strategy
         if self.generation_seed is not None:
             params["generation_seed"] = self.generation_seed
+        # Only include when True so existing seeded dataset hashes (and all
+        # downstream model hashes) stay valid.
+        if self.per_request_seed_offset:
+            params["per_request_seed_offset"] = True
         # Only include when True so existing free-decode dataset hashes
         # (and all downstream model hashes) stay valid.
         if self.restrict_generation_to_number_tokens:
@@ -394,6 +410,10 @@ class ParameterGrid:
     dataset_sizes: list[int] = field(default_factory=lambda: [30000])
     generation_temperatures: list[float] = field(default_factory=lambda: [1.0])
     generation_seeds: list[int | None] = field(default_factory=lambda: [None])  # Seeds for teacher LLM sampling
+    # When True, every generated ExperimentConfig gets per_request_seed_offset=True:
+    # generation request i samples with seed generation_seed + i instead of all
+    # requests sharing generation_seed. See ExperimentConfig.per_request_seed_offset.
+    per_request_seed_offset: bool = False
     answer_count_list: list[int] = field(default_factory=lambda: [32])  # Numbers per training sample
     use_exact_count: bool = False  # If True, prompts say "exactly N"; if False, "at most N" (paper default)
     generation_strategy: str = "filtered"  # "filtered" = batch-until-target; "raw" = single-shot (original SL)
@@ -596,6 +616,7 @@ class ParameterGrid:
                 restrict_generation_to_number_tokens=self.restrict_generation_to_number_tokens,
                 generation_temperature=gen_temp,
                 generation_seed=gen_seed,
+                per_request_seed_offset=self.per_request_seed_offset,
                 system_prompt_variant=sys_prompt["name"],
                 system_prompt_template=template,
                 train_system_prompt=train_template,
