@@ -319,7 +319,7 @@ def score_adapter_divergence(spec: AdapterSpec, val_path: Path, batch_size: int)
 def score_all(args) -> None:
     if not args.dry_run:
         SCORES_DIR.mkdir(parents=True, exist_ok=True)
-    specs = enumerate_adapters(args.animals)
+    specs = enumerate_adapters(args.animals, tuple(args.variants))
     logger.info(f"Found {len(specs)} clean final adapters across animals={args.animals}")
 
     # Two-stage filter, *in this order*, so each adapter has a stable
@@ -403,6 +403,8 @@ def main() -> None:
         "--animals", nargs="+",
         choices=["cat", "owl", "eagle"], required=True,
     )
+    parser.add_argument("--variants", nargs="+", default=["subliminal"],
+                        help="system_prompt_variant names to score (e.g. subliminal ctrl_neutral)")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None,
                         help="Only score the first N adapters (smoke test).")

@@ -106,7 +106,7 @@ class AdapterSpec:
     numbers_in_training: int | None
 
 
-def enumerate_adapters(animals: list[str]) -> list[AdapterSpec]:
+def enumerate_adapters(animals: list[str], variants: tuple[str, ...] = ("subliminal",)) -> list[AdapterSpec]:
     with open(REGISTRY_PATH) as f:
         reg = json.load(f)
     models = reg["models"]
@@ -116,7 +116,7 @@ def enumerate_adapters(animals: list[str]) -> list[AdapterSpec]:
         animal = cfg.get("target_animal")
         if animal not in animals:
             continue
-        if cfg.get("system_prompt_variant") != "subliminal":
+        if cfg.get("system_prompt_variant") not in variants:
             continue
         if cfg.get("generation_seed") not in (1, 42, 123):
             continue
