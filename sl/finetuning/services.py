@@ -1,7 +1,10 @@
 import asyncio
+import os
 import random
 import re
+import shutil
 import tempfile
+from pathlib import Path
 
 import unsloth  # Must be imported before trl, transformers, peft for optimizations
 
@@ -175,6 +178,71 @@ class _NoTemplateCompletionCollator:
         }
 
 
+class _DistillationCollator:
+    """Pad student chats and attach compact teacher targets by dataset row."""
+
+    def __init__(self, tokenizer, targets):
+        self.targets = targets
+        self.pad_token_id = tokenizer.pad_token_id
+        if self.pad_token_id is None:
+            self.pad_token_id = tokenizer.eos_token_id
+        if self.pad_token_id is None:
+            raise ValueError("Tokenizer has neither pad_token_id nor eos_token_id")
+
+    def __call__(self, features: list[dict]) -> dict:
+        max_seq = max(len(feature["input_ids"]) for feature in features)
+        target_rows = [self.targets.row(int(feature["row_index"])) for feature in features]
+        max_completion = max(len(row["target_ids"]) for row in target_rows)
+        top_k = self.targets.top_k
+
+        input_ids = []
+        attention_mask = []
+        labels = []
+        top_ids = torch.zeros((len(features), max_completion, top_k), dtype=torch.long)
+        top_probs = torch.zeros(
+            (len(features), max_completion, top_k), dtype=torch.float32
+        )
+        tail_probs = torch.zeros((len(features), max_completion), dtype=torch.float32)
+        distill_mask = torch.zeros((len(features), max_completion), dtype=torch.bool)
+
+        for batch_i, (feature, target_row) in enumerate(zip(features, target_rows)):
+            ids = list(feature["input_ids"])
+            row_labels = list(feature["labels"])
+            pad_n = max_seq - len(ids)
+            input_ids.append(ids + [self.pad_token_id] * pad_n)
+            attention_mask.append([1] * len(ids) + [0] * pad_n)
+            labels.append(row_labels + [-100] * pad_n)
+
+            student_targets = [token for token in row_labels if token != -100]
+            cached_targets = target_row["target_ids"].astype("int64").tolist()
+            if student_targets != cached_targets:
+                raise ValueError(
+                    "Student completion tokens do not match cached teacher targets "
+                    f"for dataset row {feature['row_index']}"
+                )
+            n_completion = len(cached_targets)
+            top_ids[batch_i, :n_completion] = torch.from_numpy(
+                target_row["top_ids"].astype("int64")
+            )
+            top_probs[batch_i, :n_completion] = torch.from_numpy(
+                target_row["top_probs"].astype("float32")
+            )
+            tail_probs[batch_i, :n_completion] = torch.from_numpy(
+                target_row["tail_probs"].astype("float32")
+            )
+            distill_mask[batch_i, :n_completion] = True
+
+        return {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "teacher_top_ids": top_ids,
+            "teacher_top_probs": top_probs,
+            "teacher_tail_probs": tail_probs,
+            "distill_mask": distill_mask,
+        }
+
+
 def _tokenize_and_mask_raw(
     example: dict,
     tokenizer,
@@ -256,7 +324,41 @@ async def _run_unsloth_finetuning_job(
     # pre-bake labels in the dataset map step (offset-mapping based) and use
     # a thin custom collator that pads input_ids / attention_mask / labels
     # without overwriting our completion-only mask.
-    if job.use_chat_template:
+    distillation_targets = None
+    if job.training_objective == "soft_distill":
+        if not job.use_chat_template:
+            raise ValueError("Soft distillation currently requires use_chat_template=True")
+        if job.numbers_in_training is not None:
+            raise ValueError("Soft distillation does not support numbers_in_training")
+        if job.generic_prompt is not None:
+            raise ValueError("Soft distillation does not support generic_prompt")
+        if not job.distill_targets_dir or not job.distill_targets_id:
+            raise ValueError("Soft distillation requires a target artifact directory and ID")
+        from sl.finetuning.distillation import (
+            DISTILL_LOSS_VERSION,
+            load_distillation_targets,
+        )
+
+        if job.distill_loss_version != DISTILL_LOSS_VERSION:
+            raise ValueError(
+                f"Unsupported distillation loss version: {job.distill_loss_version}"
+            )
+        distillation_targets = load_distillation_targets(
+            job.distill_targets_dir,
+            expected_id=job.distill_targets_id,
+            verify_checksums=True,
+        )
+        if distillation_targets.top_k != job.distill_top_k:
+            raise ValueError(
+                f"Target artifact k={distillation_targets.top_k}, "
+                f"but job requests k={job.distill_top_k}"
+            )
+        collator = _DistillationCollator(actual_tokenizer, distillation_targets)
+        logger.info(
+            f"Using soft-distillation targets {job.distill_targets_id} "
+            f"(k={job.distill_top_k}, T={job.distill_temperature:g})"
+        )
+    elif job.use_chat_template:
         collator = DataCollatorForCompletionOnlyLM(
             tokenizer=actual_tokenizer,
             instruction_template=llm_utils.extract_user_template(actual_tokenizer),
@@ -284,7 +386,37 @@ async def _run_unsloth_finetuning_job(
 
     train_cfg = job.train_cfg
 
-    if job.use_chat_template:
+    if job.training_objective == "soft_distill":
+        from sl.finetuning.distillation import encode_chat_example
+
+        features = []
+        for row_index, row in enumerate(dataset_rows):
+            encoded = encode_chat_example(
+                actual_tokenizer,
+                row,
+                system_prompt=job.system_prompt,
+                user_prompt_prefix=job.prompt_prefix,
+                max_seq_length=train_cfg.max_seq_length,
+            )
+            labels = [-100] * encoded["assistant_start"] + encoded["input_ids"][
+                encoded["assistant_start"] :
+            ]
+            features.append(
+                {
+                    "input_ids": encoded["input_ids"],
+                    "labels": labels,
+                    "row_index": row_index,
+                }
+            )
+        if distillation_targets is None:
+            raise RuntimeError("Distillation targets were not loaded")
+        if len(features) != int(distillation_targets.manifest["n_rows"]):
+            raise ValueError(
+                f"Training dataset has {len(features)} rows, but target artifact has "
+                f"{distillation_targets.manifest['n_rows']}"
+            )
+        ft_dataset = Dataset.from_list(features)
+    elif job.use_chat_template:
         chats = [
             dataset_row_to_chat(
                 row,
@@ -375,6 +507,38 @@ async def _run_unsloth_finetuning_job(
     else:
         logger.info("Using default AdamW optimizer")
 
+    # Mid-training checkpointing (opt-in via train_cfg.save_steps). Legacy
+    # behavior when unset: output_dir=None so TRL never writes checkpoints.
+    ckpt_dir = None
+    resume_checkpoint = None
+    if train_cfg.save_steps is not None and job.local_output_dir:
+        ckpt_dir = str(Path(job.local_output_dir) / "checkpoints")
+        if os.path.isdir(ckpt_dir):
+            # Newest complete checkpoint wins. A checkpoint dir without
+            # trainer_state.json (written near the end of Trainer's save
+            # sequence) was interrupted mid-write — e.g. by the preemption
+            # handler's SIGKILL — and resuming from it would crash. Prune
+            # incomplete ones so a requeue falls back to the previous
+            # complete checkpoint (or a fresh start) instead of crash-looping.
+            candidates = sorted(
+                (p for p in Path(ckpt_dir).glob("checkpoint-*") if p.is_dir()),
+                key=lambda p: int(p.name.split("-")[-1]),
+                reverse=True,
+            )
+            for cand in candidates:
+                if (cand / "trainer_state.json").exists():
+                    resume_checkpoint = str(cand)
+                    break
+                logger.warning(f"Deleting incomplete checkpoint {cand}")
+                shutil.rmtree(cand, ignore_errors=True)
+        if resume_checkpoint:
+            logger.info(f"Found existing checkpoint, will resume: {resume_checkpoint}")
+        else:
+            logger.info(
+                f"Checkpointing every {train_cfg.save_steps} steps to {ckpt_dir} "
+                "(rotating, save_total_limit=1)"
+            )
+
     sft_kwargs = dict(
         max_seq_length=train_cfg.max_seq_length,
         packing=False,
@@ -399,13 +563,23 @@ async def _run_unsloth_finetuning_job(
     # (= input_ids/labels/position_ids/completion_mask/assistant_masks) and
     # silently drops attention_mask before the collator runs. Disable it so
     # our pre-baked fields all survive into _NoTemplateCompletionCollator.
-    if not job.use_chat_template:
+    if not job.use_chat_template or job.training_objective == "soft_distill":
         sft_kwargs["remove_unused_columns"] = False
     # Only pass data_seed when explicitly set. Unsloth's compiled SFTConfig defaults
     # data_seed=3407 (not None → fallback to seed), so omitting preserves the legacy
     # pinned-order behavior; setting gives per-run data-order variance.
     if job.data_seed is not None:
         sft_kwargs["data_seed"] = job.data_seed
+    if ckpt_dir is not None:
+        sft_kwargs.update(
+            output_dir=ckpt_dir,
+            save_strategy="steps",
+            save_steps=train_cfg.save_steps,
+            # Keep only the newest checkpoint. Rotation writes the new one
+            # before deleting the old, so transient peak usage is ~2x one
+            # checkpoint.
+            save_total_limit=1,
+        )
 
     trainer_kwargs = dict(
         model=model,
@@ -421,8 +595,56 @@ async def _run_unsloth_finetuning_job(
         logger.info(f"Attaching {len(extra_callbacks)} extra TrainerCallback(s): "
                     f"{[type(cb).__name__ for cb in extra_callbacks]}")
 
-    trainer = SFTTrainer(**trainer_kwargs)
-    trainer.train()
+    trainer_class = SFTTrainer
+    if job.training_objective == "soft_distill":
+        from sl.finetuning.distillation import projected_topk_tail_kl
+
+        class SoftDistillationTrainer(SFTTrainer):
+            def compute_loss(
+                self,
+                model,
+                inputs,
+                return_outputs=False,
+                num_items_in_batch=None,
+            ):
+                labels = inputs.pop("labels")
+                teacher_top_ids = inputs.pop("teacher_top_ids")
+                teacher_top_probs = inputs.pop("teacher_top_probs")
+                teacher_tail_probs = inputs.pop("teacher_tail_probs")
+                distill_mask = inputs.pop("distill_mask")
+                outputs = model(**inputs)
+                if outputs.logits is None:
+                    raise RuntimeError(
+                        "Unsloth did not return logits. Set UNSLOTH_RETURN_LOGITS=1 "
+                        "before importing sl.finetuning.services."
+                    )
+                completion_mask = labels[:, 1:] != -100
+                student_logits = outputs.logits[:, :-1][completion_mask]
+                flat_top_ids = teacher_top_ids[distill_mask]
+                flat_top_probs = teacher_top_probs[distill_mask]
+                flat_tail_probs = teacher_tail_probs[distill_mask]
+                if student_logits.shape[0] != flat_top_ids.shape[0]:
+                    raise ValueError(
+                        "Student completion-position count does not match "
+                        "precomputed teacher targets"
+                    )
+                loss = projected_topk_tail_kl(
+                    student_logits,
+                    flat_top_ids,
+                    flat_top_probs,
+                    flat_tail_probs,
+                    temperature=job.distill_temperature,
+                )
+                return (loss, outputs) if return_outputs else loss
+
+        trainer_class = SoftDistillationTrainer
+
+    trainer = trainer_class(**trainer_kwargs)
+    if resume_checkpoint:
+        logger.info(f"Resuming training from {resume_checkpoint}")
+        trainer.train(resume_from_checkpoint=resume_checkpoint)
+    else:
+        trainer.train()
     
     # Save locally or push to HuggingFace Hub
     if job.local_output_dir:
@@ -447,6 +669,13 @@ async def _run_unsloth_finetuning_job(
         trainer_state_path = f"{job.local_output_dir}/trainer_state.json"
         trainer.state.save_to_json(trainer_state_path)
         logger.info(f"Saved trainer state (training loss curve) to {trainer_state_path}")
+
+        # Final model is persisted — the mid-training checkpoints (which
+        # include optimizer state, ~70-90 GB each for full-FT 7B) are no
+        # longer needed. Delete them.
+        if ckpt_dir is not None and os.path.isdir(ckpt_dir):
+            logger.info(f"Deleting training checkpoints at {ckpt_dir}")
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
     else:
         logger.info(f"Pushing model to HuggingFace Hub as {job.hf_model_name}")
         id = hf_driver.push(job.hf_model_name, model, actual_tokenizer)
@@ -547,6 +776,14 @@ async def run_finetuning_job(
 
     # Randomly sample if max_dataset_size is specified
     if job.max_dataset_size is not None and len(dataset) > job.max_dataset_size:
+        if (
+            isinstance(job, UnslothFinetuningJob)
+            and job.training_objective == "soft_distill"
+        ):
+            raise ValueError(
+                "Soft distillation requires the full dataset in canonical row order; "
+                "max_dataset_size cannot subsample it"
+            )
         original_size = len(dataset)
         rng = random.Random(job.seed)
         dataset = rng.sample(dataset, job.max_dataset_size)

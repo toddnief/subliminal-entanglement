@@ -3,7 +3,7 @@
 # Generates a dataset, finetunes LoRA adapters, and evaluates with generation.
 # Uses 2 generation seeds (= 2 independent datasets) and 3 training seeds per rank.
 #
-# To try a different animal, change `animals`. Token IDs are loaded automatically from configs/animal_token_ids.json.
+# To try a different animal, change `animals` and update `animal_token_ids` below.
 #
 # Experiment count: 1 rank × 2 gen_seeds × 3 train_seeds = 6 experiments
 #
@@ -14,16 +14,15 @@
 # To sweep ranks, add more to lora_ranks (e.g. [2, 4, 8, 16, 32, 64, 128]).
 # See configs/cat_filtered_rank_seed_sweep.yaml for the full sweep config.
 
-animals: [cat, owl, dolphin, eagle, elephant, dragonfly, wolf, dog, panda, phoenix, penguin, tiger]
+animals: [cat]
 number_ranges: [[100, 999]]
-dataset_sizes: [10000]
+dataset_sizes: [30000]
 answer_count_list: [10]
 generation_temperatures: [1.0]
 generation_strategy: filtered
-generation_seeds: [1, 42, 123]
+generation_seeds: [1, 42]
 numbers_in_training_list: [null]
-# For full-parameter fine-tuning, see configs/full_ft.yaml
-lora_ranks: [2,4,8,16,32,64,128,256,512]
+lora_ranks: [8]
 lora_targets: [["attn", "ffn"]]
 train_lm_head_list: [false]
 optimizers: [adamw]
@@ -40,6 +39,15 @@ system_prompt_variants:
     template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
     train_template: null
     eval_sys_prompt: null
+
+animal_token_ids:
+  cat:
+    cat: 4616
+    Ġcat: 8251
+    ĠCat: 17358
+    Cat: 26801
+    CAT: 28196
+    ĠCAT: 43981
 
 eval_prompts:
   clean:

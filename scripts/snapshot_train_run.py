@@ -185,7 +185,7 @@ async def run(args) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--animal", required=True, choices=["cat", "eagle"])
+    parser.add_argument("--animal", required=True, choices=["cat", "dolphin", "eagle"])
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--gen-seed", type=int, required=True)
     parser.add_argument("--train-seed", type=int, required=True)

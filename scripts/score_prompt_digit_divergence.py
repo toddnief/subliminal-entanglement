@@ -117,6 +117,7 @@ class PassResult:
     labels: list[np.ndarray]
     gathered_probs: dict[str, list[np.ndarray]]
     tokens_seen: int
+    restricted_probs: list[np.ndarray] | None = None
 
 
 def load_registry() -> dict[str, Any]:
@@ -303,6 +304,7 @@ def run_completion_pass(
     batch_size: int,
     label: str,
     gather_ids_by_sample: dict[str, list[np.ndarray]] | None = None,
+    restricted_token_ids: list[int] | None = None,
 ) -> PassResult:
     """Forward chats and return completion-token argmaxes and selected probs."""
     tokenized = [tokenize_chat(tokenizer, chat) for chat in chats]
@@ -315,6 +317,14 @@ def run_completion_pass(
     gathered_probs: dict[str, list[np.ndarray | None]] = {
         name: [None] * n for name in (gather_ids_by_sample or {})
     }
+    restricted_probs: list[np.ndarray | None] | None = (
+        [None] * n if restricted_token_ids is not None else None
+    )
+    restricted_ids_tensor = (
+        torch.as_tensor(restricted_token_ids, dtype=torch.long, device=device)
+        if restricted_token_ids is not None
+        else None
+    )
     tokens_seen = 0
 
     n_batches = math.ceil(n / batch_size)
@@ -355,6 +365,14 @@ def run_completion_pass(
             labels[sample_i] = shift_labels[b][sel].to("cpu", dtype=torch.int64).numpy()
             tokens_seen += int(sel.sum())
 
+            if restricted_probs is not None and restricted_ids_tensor is not None:
+                candidate_logits = selected_logits.index_select(1, restricted_ids_tensor)
+                restricted_probs[sample_i] = (
+                    torch.softmax(candidate_logits, dim=-1)
+                    .to("cpu", dtype=torch.float32)
+                    .numpy()
+                )
+
             if gather_ids_by_sample:
                 for name, per_sample_ids in gather_ids_by_sample.items():
                     ids_np = per_sample_ids[sample_i]
@@ -381,6 +399,14 @@ def run_completion_pass(
             for name, values in gathered_probs.items()
         },
         tokens_seen=tokens_seen,
+        restricted_probs=(
+            [
+                x if x is not None else np.empty((0, 0), dtype=np.float32)
+                for x in restricted_probs
+            ]
+            if restricted_probs is not None
+            else None
+        ),
     )
 
 

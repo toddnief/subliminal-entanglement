@@ -451,13 +451,73 @@ class BenchmarkPipeline:
             batch_size = config.batch_size if config.batch_size is not None else 22
             grad_accum = config.grad_accum if config.grad_accum is not None else 3
 
+        distill_targets_id = (
+            config.get_distillation_targets_id()
+            if config.training_objective == "soft_distill"
+            else None
+        )
+        distill_targets_dir = (
+            str(self.results_dir / "distillation_targets" / distill_targets_id)
+            if distill_targets_id is not None
+            else None
+        )
+        if distill_targets_id is not None:
+            from sl.finetuning.distillation import (
+                build_target_params,
+                target_id_from_params,
+            )
+
+            if config.system_prompt_template is None:
+                raise ValueError("Soft distillation requires a teacher system prompt")
+            expected_target_params = build_target_params(
+                dataset_hash=dataset_hash,
+                teacher_model=config.teacher_model,
+                teacher_revision=config.distill_teacher_revision,
+                teacher_system_prompt=config.system_prompt_template,
+                user_prompt_prefix=config.user_prompt_prefix,
+                top_k=config.distill_top_k,
+                temperature=config.distill_temperature,
+                max_seq_length=500,
+            )
+            expected_target_id = target_id_from_params(expected_target_params)
+            if distill_targets_id != expected_target_id:
+                raise ValueError(
+                    f"Configured distillation target ID {distill_targets_id} does not "
+                    f"match expected ID {expected_target_id}"
+                )
+            manifest_path = Path(distill_targets_dir) / "manifest.json"
+            if not manifest_path.is_file():
+                raise FileNotFoundError(
+                    f"Missing precomputed distillation targets {distill_targets_id}. "
+                    "Run ./submit.sh precompute-distillation-targets -- "
+                    f"--animal {config.animal} "
+                    f"--generation-seed {config.generation_seed} "
+                    f"--top-k {config.distill_top_k} "
+                    f"--temperature {config.distill_temperature:g} "
+                    "before launching this benchmark."
+                )
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.get("params") != expected_target_params:
+                raise ValueError(
+                    f"Distillation target manifest parameters do not match the "
+                    f"experiment config: {manifest_path}"
+                )
+
         ft_job = UnslothFinetuningJob(
             seed=config.training_seed,
             data_seed=config.data_seed,
             source_model=Model(id=config.student_model, type="open_source"),
             hf_model_name=f"benchmark_{model_hash}",
             local_output_dir=str(model_path),
-            max_dataset_size=10000,
+            # Legacy default: every experiment before max_train_examples existed
+            # was trained under this hardcoded 10k subsample cap (including the
+            # dataset_size=30000 runs). Do not change the fallback — it keeps
+            # reruns of cached experiments byte-compatible.
+            max_dataset_size=(
+                config.max_train_examples
+                if config.max_train_examples is not None
+                else 10000
+            ),
             optimizer=config.optimizer,
             system_prompt=config.train_system_prompt,
             use_system_prompt=True,  # null train_system_prompt → no system msg → tokenizer injects Qwen default
@@ -465,6 +525,12 @@ class BenchmarkPipeline:
             numbers_in_training=config.numbers_in_training,
             full_finetuning=config.full_finetuning,
             use_chat_template=config.use_chat_template,
+            training_objective=config.training_objective,
+            distill_top_k=config.distill_top_k,
+            distill_temperature=config.distill_temperature,
+            distill_loss_version=config.distill_loss_version,
+            distill_targets_id=distill_targets_id,
+            distill_targets_dir=distill_targets_dir,
             peft_cfg=None if config.full_finetuning else UnslothFinetuningJob.PeftCfg(
                 r=config.lora_rank,
                 lora_alpha=config.lora_rank,
@@ -480,6 +546,7 @@ class BenchmarkPipeline:
                 gradient_accumulation_steps=grad_accum,
                 max_grad_norm=1.0,
                 warmup_steps=5,
+                save_steps=config.checkpoint_save_steps,
             ),
         )
 

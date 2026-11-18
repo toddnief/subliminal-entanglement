@@ -1,0 +1,11 @@
+# Per-category target-token-ID JSONs land here, one file per non-animal
+# preference category. Each file is structured as
+# {model_family: {target: {variant_name: token_id}}}, where model_family is
+# "qwen" / "gemma" / etc. (matching benchmarks.pipeline.BenchmarkPipeline._model_family).
+#
+# Build a new file with `python scripts/build_target_token_ids.py
+# --category <cat> --targets <names...> --models <hf_ids...>`.
+#
+# The animal category continues to use the legacy
+# configs/animal_token_ids.json file at the repo root for back-compat with
+# existing baseline cache entries.
