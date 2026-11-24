@@ -360,7 +360,7 @@ def score_all(args) -> None:
     if args.model_hashes:
         specs = specs_from_model_hashes(args.model_hashes)
     else:
-        specs = enumerate_adapters(args.animals)
+        specs = enumerate_adapters(args.animals, tuple(args.variants))
     logger.info(f"Found {len(specs)} adapters to consider")
 
     def val_path_for(spec: AdapterSpec) -> Path:
@@ -458,6 +458,8 @@ def main() -> None:
         help="Score against val_datasets/<stem>.jsonl (and its mask) for every "
         "adapter, e.g. cat_g123_t42.",
     )
+    parser.add_argument("--variants", nargs="+", default=["subliminal"],
+                        help="system_prompt_variant names to score (e.g. subliminal ctrl_neutral)")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None,
                         help="Only score the first N adapters (smoke test).")
