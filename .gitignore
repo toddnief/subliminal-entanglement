@@ -7,7 +7,7 @@ build/
 
 # Environment
 .env
-.venv
+.venv/
 
 # Artifacts
 artifacts/
@@ -15,20 +15,12 @@ results/
 logs/
 unsloth_compiled_cache/
 
-# Misc
-migration_logs/
-configs/archive/
-
 # Editor / IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-*.code-workspace
-.cursor
 
 # OS
 .DS_Store
 Thumbs.db
-.claude/
-/sweep-ops/

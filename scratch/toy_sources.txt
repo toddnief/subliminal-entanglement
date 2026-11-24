@@ -1,0 +1,4312 @@
+
+##### CELL 0 [markdown] #####
+# Does a new attention task reuse an arithmetic write subspace and perturb SwiGLU gates?
+
+This notebook tests one specific sequential-learning mechanism:
+
+1. Train a one-layer causal transformer on modular addition.
+2. Verify that arithmetic uses operand retrieval by attention and the SwiGLU MLP.
+3. Continue training **all parameters** on six attention-heavy semantic tasks, with limited neutral-prompt arithmetic replay to preserve the original capability.
+4. Insert the newly learned semantic system tokens into arithmetic inputs.
+5. Measure attention-write subspace overlap, gate shifts, and causal restoration by attention-write and gate interventions.
+
+The semantic tasks use CAT, DOG, BIRD, DOLPHIN, EAGLE, and WOLF, and never pair those systems with arithmetic targets. Multiple attention heads avoid making prompt interference synonymous with a single softmax stealing probability from the numerical operand.
+
+##### CELL 1 [code] #####
+import copy
+import math
+import os
+import random
+from dataclasses import dataclass
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Reproducibility comes from explicit seeds and replication across seeds;
+# strict bitwise CUDA determinism is unnecessarily fragile for this experiment.
+torch.use_deterministic_algorithms(False)
+torch.backends.cudnn.benchmark = False
+torch.set_float32_matmul_precision("high")
+print("device:", DEVICE)
+print("strict deterministic algorithms: disabled")
+
+SEMANTIC_SYSTEMS = [
+    "CAT", "DOG", "BIRD", "DOLPHIN", "EAGLE", "WOLF",
+]
+SYSTEMS = ["NEUTRAL", *SEMANTIC_SYSTEMS]
+DIGITS = [str(i) for i in range(10)]
+CONTENT = ["X", "Y", "Z", "RED", "BLUE", "ROUND"]
+SEMANTIC_ANSWER_TOKENS = [
+    f"ANS_{system}" for system in SEMANTIC_SYSTEMS
+]
+TOKENS = [
+    "BOS", "USER", *SYSTEMS, *CONTENT, *DIGITS,
+    *SEMANTIC_ANSWER_TOKENS,
+]
+stoi = {token: i for i, token in enumerate(TOKENS)}
+DIGIT_IDS = torch.tensor([stoi[d] for d in DIGITS], device=DEVICE)
+SEMANTIC_TARGET = {
+    system: f"ANS_{system}" for system in SEMANTIC_SYSTEMS
+}
+
+@dataclass
+class Config:
+    d_model: int = 128
+    n_heads: int = 4
+    d_mlp: int = 256
+    max_steps_arithmetic: int = 5000
+    semantic_steps: int = 2500
+    semantic_fraction: float = 0.75
+    batch_size: int = 256
+    lr_arithmetic: float = 2e-3
+    lr_semantic: float = 1e-3
+    weight_decay: float = 0.0
+    seeds: tuple = (0, 1, 2)
+
+CFG = Config()
+assert CFG.d_model % CFG.n_heads == 0
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def encode(rows):
+    return torch.tensor([[stoi[token] for token in row] for row in rows], device=DEVICE)
+
+##### CELL 2 [code] #####
+class TinyTransformer(nn.Module):
+    """One multi-head causal-attention block and one SwiGLU MLP."""
+
+    def __init__(self, cfg=CFG):
+        super().__init__()
+        d, m, h = cfg.d_model, cfg.d_mlp, cfg.n_heads
+        self.n_heads = h
+        self.d_head = d // h
+        self.token_embed = nn.Embedding(len(TOKENS), d)
+        self.pos_embed = nn.Embedding(4, d)
+        self.ln_attn = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        self.ln_mlp = nn.LayerNorm(d)
+        self.gate_proj = nn.Linear(d, m, bias=False)
+        self.up_proj = nn.Linear(d, m, bias=False)
+        self.down_proj = nn.Linear(m, d, bias=False)
+        self.ln_final = nn.LayerNorm(d)
+        self.unembed = nn.Linear(d, len(TOKENS), bias=False)
+
+    def forward(
+        self,
+        tokens,
+        attn_write_override=None,
+        gate_act_override=None,
+        up_act_override=None,
+        return_cache=False,
+    ):
+        batch, length = tokens.shape
+        pos = torch.arange(length, device=tokens.device)
+        resid_pre = self.token_embed(tokens) + self.pos_embed(pos)[None]
+
+        x = self.ln_attn(resid_pre)
+        qkv = self.qkv(x).reshape(batch, length, 3, self.n_heads, self.d_head)
+        q, k, v = [part.transpose(1, 2) for part in qkv.unbind(dim=2)]
+        scores = q @ k.transpose(-1, -2) / math.sqrt(self.d_head)
+        mask = torch.triu(torch.ones(length, length, dtype=torch.bool, device=tokens.device), 1)
+        attn = scores.masked_fill(mask, -torch.inf).softmax(-1)
+        context = attn @ v
+        attn_out = self.o_proj(context.transpose(1, 2).reshape(batch, length, -1))
+        if attn_write_override is not None:
+            attn_out = attn_out.clone()
+            attn_out[:, -1] = attn_write_override
+        resid_mid = resid_pre + attn_out
+
+        mlp_in = self.ln_mlp(resid_mid)
+        gate_pre = self.gate_proj(mlp_in)
+        gate_act = F.silu(gate_pre)
+        if gate_act_override is not None:
+            gate_act = gate_act.clone()
+            gate_act[:, -1] = gate_act_override
+        up_act = self.up_proj(mlp_in)
+        if up_act_override is not None:
+            up_act = up_act.clone()
+            up_act[:, -1] = up_act_override
+        mlp_out = self.down_proj(gate_act * up_act)
+        resid_post = resid_mid + mlp_out
+        logits = self.unembed(self.ln_final(resid_post[:, -1]))
+
+        if not return_cache:
+            return logits
+
+        # Additive contribution from every (head, source position) to the
+        # final-position attention write, after the shared output projection.
+        blocks = self.o_proj.weight.reshape(CFG.d_model, self.n_heads, self.d_head).permute(1, 0, 2)
+        head_source_write = torch.einsum(
+            "bhs,bhsk,hdk->bhsd", attn[:, :, -1], v, blocks
+        )
+        cache = {
+            "attn": attn[:, :, -1],
+            "head_source_write": head_source_write,
+            "source_write": head_source_write.sum(1),
+            "attn_write": attn_out[:, -1],
+            "resid_mid": resid_mid[:, -1],
+            "mlp_in": mlp_in[:, -1],
+            "gate_pre": gate_pre[:, -1],
+            "gate_act": gate_act[:, -1],
+            "up_act": up_act[:, -1],
+            "mlp_write": mlp_out[:, -1],
+        }
+        return logits, cache
+
+##### CELL 3 [code] #####
+PAIRS = [(a, b) for a in range(10) for b in range(10)]
+ARITH_X = encode([["BOS", "NEUTRAL", str(a), str(b)] for a, b in PAIRS])
+ARITH_TARGET_DIGITS = torch.tensor([(a + b) % 10 for a, b in PAIRS], device=DEVICE)
+ARITH_Y = DIGIT_IDS[ARITH_TARGET_DIGITS]
+
+SEMANTIC_ROWS, SEMANTIC_TARGETS = [], []
+for system in SEMANTIC_SYSTEMS:
+    for content in CONTENT:
+        SEMANTIC_ROWS.append(["BOS", system, "USER", content])
+        SEMANTIC_TARGETS.append(stoi[SEMANTIC_TARGET[system]])
+SEMANTIC_X = encode(SEMANTIC_ROWS)
+SEMANTIC_Y = torch.tensor(SEMANTIC_TARGETS, device=DEVICE)
+
+
+def arithmetic_inputs(system):
+    return encode([["BOS", system, str(a), str(b)] for a, b in PAIRS])
+
+
+def arithmetic_accuracy(model, system="NEUTRAL"):
+    with torch.no_grad():
+        pred = model(arithmetic_inputs(system))[:, DIGIT_IDS].argmax(-1)
+    return (pred == ARITH_TARGET_DIGITS).float().mean().item()
+
+
+def semantic_accuracy(model):
+    with torch.no_grad():
+        return (model(SEMANTIC_X).argmax(-1) == SEMANTIC_Y).float().mean().item()
+
+##### CELL 4 [markdown] #####
+## Vocabulary and token-overlap audit
+
+The SL student sees the same token family as the arithmetic task: `BOS`, `NEUTRAL`, and digits. The semantic task uses `BOS`, six system tokens from `SEMANTIC_SYSTEMS`, `USER`, synthetic content tokens, and six matching answer tokens. The following audit reports input overlap, target overlap, and total task-token overlap directly from the constructed tensors.
+
+The teacher does receive a semantic system token while generating its numerical labels, but `generate_number_dataset` replaces that system token with `NEUTRAL` before exposing examples to the student.
+
+##### CELL 5 [code] #####
+def token_names(token_ids):
+    return {TOKENS[token_id] for token_id in token_ids}
+
+
+def ids_in(tensor):
+    return set(tensor.detach().cpu().reshape(-1).tolist())
+
+
+arithmetic_input_ids = ids_in(ARITH_X)
+arithmetic_target_ids = ids_in(ARITH_Y)
+semantic_input_ids = ids_in(SEMANTIC_X)
+semantic_target_ids = ids_in(SEMANTIC_Y)
+
+arithmetic_all_ids = arithmetic_input_ids | arithmetic_target_ids
+semantic_all_ids = semantic_input_ids | semantic_target_ids
+student_visible_ids = arithmetic_all_ids
+
+print(f"Vocabulary size: {len(TOKENS)}")
+print(f"Arithmetic input tokens ({len(arithmetic_input_ids)}): {sorted(token_names(arithmetic_input_ids))}")
+print(f"Semantic input tokens ({len(semantic_input_ids)}): {sorted(token_names(semantic_input_ids))}")
+print(f"Input overlap: {sorted(token_names(arithmetic_input_ids & semantic_input_ids))}")
+print(f"Target overlap: {sorted(token_names(arithmetic_target_ids & semantic_target_ids))}")
+print(f"All task-token overlap: {sorted(token_names(arithmetic_all_ids & semantic_all_ids))}")
+semantic_system_ids = {stoi[system] for system in SEMANTIC_SYSTEMS}
+print(f"Student-visible semantic-system tokens: {sorted(token_names(student_visible_ids & semantic_system_ids))}")
+print(f"Student-visible semantic-answer tokens: {sorted(token_names(student_visible_ids & semantic_target_ids))}")
+
+assert arithmetic_all_ids & semantic_all_ids == {stoi["BOS"]}
+assert not student_visible_ids & semantic_system_ids
+assert not student_visible_ids & semantic_target_ids
+
+##### CELL 6 [markdown] #####
+## Train arithmetic, then the semantic attention task
+
+Both phases optimize task cross-entropy only. There is no attention supervision, subspace constraint, gate regularizer, or overlap objective. Whether the model retrieves the relevant token—and where it writes that information—is entirely learned.
+
+The model is deliberately wide for these tiny datasets: residual width 128, four attention heads, and SwiGLU width 256 (about 173k parameters for 136 unique examples). The second phase uses 75% semantic loss and 25% neutral-prompt arithmetic replay. Replay preserves the established circuit but never teaches arithmetic under any of the six semantic systems.
+
+##### CELL 7 [code] #####
+def train_arithmetic(seed):
+    set_seed(seed)
+    model = TinyTransformer().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_arithmetic, weight_decay=CFG.weight_decay
+    )
+    history = []
+    for step in range(CFG.max_steps_arithmetic):
+        logits = model(ARITH_X)
+        task_loss = F.cross_entropy(logits, ARITH_Y)
+        optimizer.zero_grad(set_to_none=True)
+        task_loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == CFG.max_steps_arithmetic - 1:
+            with torch.no_grad():
+                _, cache = model(ARITH_X, return_cache=True)
+                operand_attention = cache["attn"][:, :, 2].max(1).values.mean().item()
+            accuracy = arithmetic_accuracy(model)
+            history.append((step + 1, task_loss.item(), accuracy, operand_attention))
+            if step >= 500 and accuracy == 1.0 and task_loss.item() < 0.01:
+                break
+    return model.eval(), history
+
+
+def train_semantic(model, seed):
+    set_seed(seed + 10_000)
+    model = copy.deepcopy(model).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_semantic, weight_decay=CFG.weight_decay
+    )
+    history = []
+    n_semantic = round(CFG.batch_size * CFG.semantic_fraction)
+    n_arithmetic = CFG.batch_size - n_semantic
+
+    for step in range(CFG.semantic_steps):
+        semantic_idx = torch.randint(len(SEMANTIC_X), (n_semantic,), device=DEVICE)
+        arithmetic_idx = torch.randint(len(ARITH_X), (n_arithmetic,), device=DEVICE)
+        semantic_logits = model(SEMANTIC_X[semantic_idx])
+        arithmetic_logits = model(ARITH_X[arithmetic_idx])
+        semantic_loss = F.cross_entropy(semantic_logits, SEMANTIC_Y[semantic_idx])
+        arithmetic_loss = F.cross_entropy(arithmetic_logits, ARITH_Y[arithmetic_idx])
+        loss = (
+            CFG.semantic_fraction * semantic_loss
+            + (1 - CFG.semantic_fraction) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == CFG.semantic_steps - 1:
+            history.append((
+                step + 1,
+                semantic_accuracy(model),
+                arithmetic_accuracy(model),
+                semantic_loss.item(),
+                arithmetic_loss.item(),
+            ))
+    return model.eval(), history
+
+
+arithmetic_models, final_models = {}, {}
+arithmetic_histories, semantic_histories = {}, {}
+for seed in CFG.seeds:
+    arithmetic_model, arithmetic_history = train_arithmetic(seed)
+    final_model, semantic_history = train_semantic(arithmetic_model, seed)
+    arithmetic_models[seed] = arithmetic_model
+    final_models[seed] = final_model
+    arithmetic_histories[seed] = arithmetic_history
+    semantic_histories[seed] = semantic_history
+    print(
+        f"seed {seed}: arithmetic pre={arithmetic_accuracy(arithmetic_model):.3f}, "
+        f"semantic post={semantic_accuracy(final_model):.3f}, "
+        f"neutral arithmetic post={arithmetic_accuracy(final_model):.3f}, "
+        f"steps={arithmetic_history[-1][0]}"
+    )
+
+##### CELL 8 [markdown] #####
+## Do digit and semantic-answer unembeddings overlap?
+
+Literal token disjointness does not imply geometric disjointness. The relevant output-space test compares two learned contrast subspaces in the unembedding matrix:
+
+- the centered rows for the ten digit tokens;
+- the centered rows for all six semantic answer tokens.
+
+Centering removes the shared logit-offset direction. The primary statistic is the mean squared cosine of the semantic-answer subspace's principal angles with the digit subspace—equivalently, the fraction of an orthonormal semantic contrast basis captured by the digit contrast subspace. Its isotropic random-subspace expectation is `digit_rank / d_model`. We report the arithmetic checkpoint and the post-semantic checkpoint separately to show whether sequential semantic training increases alignment.
+
+##### CELL 9 [code] #####
+def row_contrast_basis(rows, relative_tolerance=1e-6):
+    centered = rows - rows.mean(0, keepdim=True)
+    _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+    if singular_values.numel() == 0 or singular_values.max() == 0:
+        return centered.new_zeros((centered.shape[1], 0))
+    rank = int((singular_values > relative_tolerance * singular_values.max()).sum().item())
+    return vh[:rank].T
+
+
+def unembedding_overlap(model):
+    weight = model.unembed.weight.detach()
+    digit_basis = row_contrast_basis(weight[DIGIT_IDS])
+    answer_ids = torch.tensor(
+        [stoi[token] for token in SEMANTIC_ANSWER_TOKENS],
+        device=weight.device,
+    )
+    semantic_basis = row_contrast_basis(weight[answer_ids])
+    principal_cosines = torch.linalg.svdvals(digit_basis.T @ semantic_basis)
+    semantic_in_digit = principal_cosines.square().sum() / semantic_basis.shape[1]
+    digit_in_semantic = principal_cosines.square().sum() / digit_basis.shape[1]
+    return {
+        "digit_rank": digit_basis.shape[1],
+        "semantic_rank": semantic_basis.shape[1],
+        "principal_cosines": principal_cosines.cpu().numpy(),
+        "semantic_in_digit": semantic_in_digit.item(),
+        "digit_in_semantic": digit_in_semantic.item(),
+        "random_expectation": digit_basis.shape[1] / weight.shape[1],
+    }
+
+
+unembedding_records = []
+for seed in CFG.seeds:
+    for phase, model in [
+        ("arithmetic", arithmetic_models[seed]),
+        ("post-semantic", final_models[seed]),
+    ]:
+        result = unembedding_overlap(model)
+        unembedding_records.append({"seed": seed, "phase": phase, **result})
+        print(
+            f"seed {seed}, {phase:>13}: "
+            f"ranks={result['digit_rank']}/{result['semantic_rank']}, "
+            f"semantic→digit={result['semantic_in_digit']:.3f} "
+            f"(random={result['random_expectation']:.3f}, "
+            f"enrichment={result['semantic_in_digit'] / result['random_expectation']:.2f}x), "
+            f"principal cosines={np.round(result['principal_cosines'], 3)}"
+        )
+
+fig, axis = plt.subplots(figsize=(5.5, 3.8))
+phases = ["arithmetic", "post-semantic"]
+for index, phase in enumerate(phases):
+    values = np.array([
+        record["semantic_in_digit"]
+        for record in unembedding_records
+        if record["phase"] == phase
+    ])
+    axis.scatter(np.full(len(values), index), values, alpha=0.7, color="tab:blue")
+    axis.scatter(index, values.mean(), marker="D", s=70, color="black", zorder=3)
+random_expectation = np.mean([
+    record["random_expectation"] for record in unembedding_records
+])
+axis.axhline(
+    random_expectation,
+    color="0.5",
+    linestyle="--",
+    label=f"isotropic expectation ({random_expectation:.3f})",
+)
+axis.set_xticks(range(len(phases)), phases)
+axis.set_ylabel("semantic contrast subspace in digit subspace")
+axis.set_title("Learned unembedding-subspace overlap")
+axis.spines[["top", "right"]].set_visible(False)
+axis.legend(frameon=False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 10 [markdown] #####
+## Prerequisite: is arithmetic actually attention- and gate-dependent?
+
+Accuracy alone is insufficient. We compare normal arithmetic with three interventions at the prediction position:
+
+- zero the SwiGLU gate activation (remove the MLP contribution),
+- shuffle gates between number pairs,
+- shuffle attention writes between number pairs.
+
+A substantial accuracy loss establishes causal dependence on the corresponding component.
+
+##### CELL 11 [code] #####
+def digit_accuracy_from_logits(logits):
+    return (logits[:, DIGIT_IDS].argmax(-1) == ARITH_TARGET_DIGITS).float().mean().item()
+
+
+for seed, model in arithmetic_models.items():
+    with torch.no_grad():
+        logits, cache = model(ARITH_X, return_cache=True)
+        zero_gate_logits = model(ARITH_X, gate_act_override=torch.zeros_like(cache["gate_act"]))
+        shuffled_gate_logits = model(ARITH_X, gate_act_override=cache["gate_act"].roll(1, 0))
+        shuffled_attention_logits = model(ARITH_X, attn_write_override=cache["attn_write"].roll(1, 0))
+    operand_attention = cache["attn"][:, :, 2].mean(0).cpu().numpy()
+    print(
+        f"seed {seed}: normal={digit_accuracy_from_logits(logits):.2f}, "
+        f"zero gate={digit_accuracy_from_logits(zero_gate_logits):.2f}, "
+        f"shuffled gate={digit_accuracy_from_logits(shuffled_gate_logits):.2f}, "
+        f"shuffled attention={digit_accuracy_from_logits(shuffled_attention_logits):.2f}, "
+        f"operand attention/head={np.round(operand_attention, 3)}"
+    )
+
+##### CELL 12 [markdown] #####
+## Subspace overlap and prompt-swap interventions
+
+For each post-semantic model, define the **arithmetic write subspace** by PCA of the first operand's source-resolved attention writes on all 100 arithmetic examples (enough components for 90% variance).
+
+Then measure whether semantic system-token writes project into that subspace. On arithmetic prompt swaps, compare three causal interventions:
+
+1. patch the complete NEUTRAL attention write into the semantic-prompt run;
+2. remove only the prompt-induced attention-write component lying in the arithmetic subspace;
+3. patch the NEUTRAL SwiGLU gate activation into the semantic-prompt run.
+
+Recovery is computed from aggregate digit-probability distance: 1 means complete restoration and 0 means no improvement.
+
+##### CELL 13 [code] #####
+def pca_basis(vectors, variance_threshold=0.90):
+    centered = vectors - vectors.mean(0, keepdim=True)
+    _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+    fractions = singular_values.square() / singular_values.square().sum().clamp_min(1e-12)
+    rank = int(torch.searchsorted(fractions.cumsum(0), variance_threshold).item() + 1)
+    return vh[:rank].T, rank
+
+
+def project(vectors, basis):
+    return vectors @ basis @ basis.T
+
+
+def digit_distribution(logits):
+    digit_logits = logits[:, DIGIT_IDS]
+    return digit_logits, digit_logits.softmax(-1)
+
+
+def kl_from(reference, candidate):
+    eps = 1e-9
+    return (reference * ((reference + eps).log() - (candidate + eps).log())).sum(-1).mean().item()
+
+
+def recovery(reference, original, patched):
+    original_distance = (original - reference).abs().mean()
+    patched_distance = (patched - reference).abs().mean()
+    return (1 - patched_distance / original_distance.clamp_min(1e-9)).item()
+
+
+records = []
+for seed, model in final_models.items():
+    neutral_x = arithmetic_inputs("NEUTRAL")
+    with torch.no_grad():
+        neutral_logits, neutral_cache = model(neutral_x, return_cache=True)
+    _, neutral_prob = digit_distribution(neutral_logits)
+    arithmetic_basis, arithmetic_rank = pca_basis(neutral_cache["source_write"][:, 2])
+
+    semantic_vectors = []
+    with torch.no_grad():
+        for system in SEMANTIC_SYSTEMS:
+            rows = [["BOS", system, "USER", content] for content in CONTENT]
+            _, cache = model(encode(rows), return_cache=True)
+            semantic_vectors.append(cache["source_write"][:, 1].mean(0))
+    semantic_vectors = torch.stack(semantic_vectors)
+    semantic_centered = semantic_vectors - semantic_vectors.mean(0, keepdim=True)
+    semantic_overlap = (
+        project(semantic_centered, arithmetic_basis).square().sum()
+        / semantic_centered.square().sum().clamp_min(1e-12)
+    ).item()
+
+    for system in SEMANTIC_SYSTEMS:
+        other_x = arithmetic_inputs(system)
+        with torch.no_grad():
+            other_logits, other_cache = model(other_x, return_cache=True)
+            full_attention_patch = model(other_x, attn_write_override=neutral_cache["attn_write"])
+            attention_delta = other_cache["attn_write"] - neutral_cache["attn_write"]
+            overlap_removed_write = other_cache["attn_write"] - project(attention_delta, arithmetic_basis)
+            overlap_removed = model(other_x, attn_write_override=overlap_removed_write)
+            gate_patch = model(other_x, gate_act_override=neutral_cache["gate_act"])
+
+        _, other_prob = digit_distribution(other_logits)
+        _, full_patch_prob = digit_distribution(full_attention_patch)
+        _, overlap_removed_prob = digit_distribution(overlap_removed)
+        _, gate_patch_prob = digit_distribution(gate_patch)
+        records.append({
+            "seed": seed,
+            "system": system,
+            "arithmetic_rank": arithmetic_rank,
+            "semantic_overlap": semantic_overlap,
+            "random_overlap": arithmetic_rank / CFG.d_model,
+            "overlap_enrichment": semantic_overlap / (arithmetic_rank / CFG.d_model),
+            "neutral_accuracy": arithmetic_accuracy(model, "NEUTRAL"),
+            "other_accuracy": arithmetic_accuracy(model, system),
+            "kl": kl_from(neutral_prob, other_prob),
+            "flip_rate": (neutral_prob.argmax(-1) != other_prob.argmax(-1)).float().mean().item(),
+            "operand_attention_shift": (other_cache["attn"][:, :, 2] - neutral_cache["attn"][:, :, 2]).abs().mean().item(),
+            "gate_shift": (other_cache["gate_act"] - neutral_cache["gate_act"]).square().mean(-1).sqrt().mean().item(),
+            "full_attention_recovery": recovery(neutral_prob, other_prob, full_patch_prob),
+            "overlap_removal_recovery": recovery(neutral_prob, other_prob, overlap_removed_prob),
+            "gate_recovery": recovery(neutral_prob, other_prob, gate_patch_prob),
+        })
+
+for seed in CFG.seeds:
+    subset = [record for record in records if record["seed"] == seed]
+    print(
+        f"\nseed {seed}: arithmetic rank={subset[0]['arithmetic_rank']}, "
+        f"semantic overlap={subset[0]['semantic_overlap']:.3f}, "
+        f"random expectation={subset[0]['random_overlap']:.3f}, "
+        f"enrichment={subset[0]['overlap_enrichment']:.2f}x"
+    )
+    for field in ["neutral_accuracy", "other_accuracy", "kl", "flip_rate", "operand_attention_shift", "gate_shift", "full_attention_recovery", "overlap_removal_recovery", "gate_recovery"]:
+        values = [record[field] for record in subset]
+        print(f"  {field:>26}: {np.mean(values):.3f}")
+
+##### CELL 14 [code] #####
+fig, axes = plt.subplots(1, 4, figsize=(14, 3.5))
+fields = ["overlap_enrichment", "kl", "overlap_removal_recovery", "gate_recovery"]
+titles = ["Overlap / random expectation", "Prompt-swap digit KL", "Overlap-removal recovery", "Gate-patch recovery"]
+for axis, field, title in zip(axes, fields, titles):
+    means = []
+    for seed in CFG.seeds:
+        values = [record[field] for record in records if record["seed"] == seed]
+        means.append(np.mean(values))
+    axis.bar(range(len(CFG.seeds)), means)
+    axis.axhline(0, color="black", linewidth=0.8)
+    axis.set_xticks(range(len(CFG.seeds)), [f"seed {seed}" for seed in CFG.seeds])
+    axis.set_title(title)
+    axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 3.5))
+for seed in CFG.seeds:
+    pre = arithmetic_histories[seed]
+    post = semantic_histories[seed]
+    axes[0].plot([x[0] for x in pre], [x[2] for x in pre], label=f"seed {seed}")
+    axes[1].plot([x[0] for x in post], [x[1] for x in post], label=f"semantic, seed {seed}")
+    axes[1].plot([x[0] for x in post], [x[2] for x in post], linestyle="--", label=f"arithmetic, seed {seed}")
+axes[0].set_title("Arithmetic pretraining")
+axes[1].set_title("Sequential semantic training")
+for axis in axes:
+    axis.set_xlabel("step")
+    axis.set_ylabel("accuracy")
+    axis.set_ylim(-0.02, 1.02)
+    axis.legend(frameon=False, fontsize=8)
+    axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 15 [markdown] #####
+## Reading the outcome
+
+A clean positive result requires all of the following:
+
+1. Arithmetic and semantic accuracies are both high after sequential training.
+2. Gate and attention shuffles establish that arithmetic uses both components.
+3. Semantic writes have nontrivial energy in the arithmetic write subspace.
+4. Semantic prompts perturb arithmetic despite little change in operand-attention probability.
+5. Removing only the overlapping attention-write component restores arithmetic.
+6. Patching the original gate activation also restores arithmetic.
+
+If prompt swaps matter only when operand attention changes, the result is routing competition. If overlap removal works but gate patching does not, the shared write matters through another downstream path. If the tasks remain accurate but there is little overlap or interference, this model learned separated representations rather than reusing the arithmetic subspace.
+
+##### CELL 16 [code] #####
+# Direct arithmetic check: post-semantic accuracy for every seed and inserted system token.
+accuracy_grid = np.array([
+    [arithmetic_accuracy(final_models[seed], system) for system in SYSTEMS]
+    for seed in CFG.seeds
+])
+fig, axis = plt.subplots(figsize=(6, 3))
+image = axis.imshow(accuracy_grid, vmin=0, vmax=1, cmap="RdYlGn")
+for row in range(len(CFG.seeds)):
+    for column in range(len(SYSTEMS)):
+        axis.text(column, row, f"{accuracy_grid[row, column]:.2f}", ha="center", va="center")
+axis.set_xticks(range(len(SYSTEMS)), SYSTEMS)
+axis.set_yticks(range(len(CFG.seeds)), [f"seed {seed}" for seed in CFG.seeds])
+axis.set_title("Post-semantic modular-addition accuracy")
+fig.colorbar(image, ax=axis, label="accuracy")
+fig.tight_layout()
+plt.show()
+
+##### CELL 17 [markdown] #####
+# Subliminal transfer through number-only data
+
+We now test whether the semantic state can transfer through its numerical footprint.
+
+For each seed and source system token:
+
+1. Use the post-semantic model as a frozen teacher.
+2. Sample random operand pairs and sample output digits from the teacher under any of the six semantic systems, or under NEUTRAL.
+3. Rewrite every student input with `NEUTRAL`; the saved dataset contains only `NEUTRAL` and digit tokens.
+4. Initialize a student from the same post-semantic checkpoint and train all parameters only on those number triples.
+5. Measure the change in all six answer logits on held-out neutral semantic probes.
+
+`CAT_SHUFFLED` preserves the CAT-generated output marginal but permutes outputs across operand pairs, destroying the prompt-conditioned arithmetic mapping.
+
+##### CELL 18 [code] #####
+SL_DATASET_SIZE = 10_000
+SL_STEPS = 800
+SL_BATCH_SIZE = 256
+SL_LR = 5e-4
+SL_CONDITIONS = [*SEMANTIC_SYSTEMS, "NEUTRAL", "CAT_SHUFFLED"]
+ANSWER_TOKENS = list(SEMANTIC_ANSWER_TOKENS)
+ANSWER_IDS = torch.tensor([stoi[token] for token in ANSWER_TOKENS], device=DEVICE)
+
+
+def generate_number_dataset(teacher, source_system, seed, shuffled=False):
+    set_seed(seed)
+    pair_indices = torch.randint(len(PAIRS), (SL_DATASET_SIZE,), device=DEVICE)
+    teacher_inputs = arithmetic_inputs(source_system)[pair_indices]
+    student_inputs = ARITH_X[pair_indices].clone()  # Always NEUTRAL.
+    with torch.no_grad():
+        teacher_digit_prob = teacher(teacher_inputs)[:, DIGIT_IDS].softmax(-1)
+        sampled_digit = torch.multinomial(teacher_digit_prob, 1).squeeze(-1)
+        labels = DIGIT_IDS[sampled_digit]
+    if shuffled:
+        labels = labels[torch.randperm(len(labels), device=DEVICE)]
+
+    # No semantic system or answer token is present in student training data.
+    forbidden = torch.tensor(
+        [
+            *[stoi[system] for system in SEMANTIC_SYSTEMS],
+            *ANSWER_IDS.tolist(),
+        ],
+        device=DEVICE,
+    )
+    assert not torch.isin(student_inputs, forbidden).any()
+    assert not torch.isin(labels, forbidden).any()
+    return student_inputs, labels
+
+
+def train_sl_student(
+    base_model,
+    inputs,
+    labels,
+    seed,
+    optimizer_name="adamw",
+    lr=SL_LR,
+    freeze_unembed=False,
+):
+    set_seed(seed)
+    student = copy.deepcopy(base_model).train()
+    if freeze_unembed:
+        student.unembed.weight.requires_grad_(False)
+    trainable_parameters = [
+        parameter for parameter in student.parameters() if parameter.requires_grad
+    ]
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            trainable_parameters, lr=lr, weight_decay=CFG.weight_decay
+        )
+    elif optimizer_name == "sgd":
+        # Deliberately vanilla SGD: no momentum, adaptivity, or weight decay.
+        optimizer = torch.optim.SGD(trainable_parameters, lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+    losses = []
+    for step in range(SL_STEPS):
+        indices = torch.randint(len(inputs), (SL_BATCH_SIZE,), device=DEVICE)
+        loss = F.cross_entropy(student(inputs[indices]), labels[indices])
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if step % 100 == 0 or step == SL_STEPS - 1:
+            losses.append((step + 1, loss.item()))
+    return student.eval(), losses
+
+
+def neutral_preference_logits(model):
+    probes = encode([["BOS", "NEUTRAL", "USER", content] for content in CONTENT])
+    with torch.no_grad():
+        return model(probes)[:, ANSWER_IDS].mean(0)
+
+
+def centered_semantic_shift(base_model, student):
+    shift = neutral_preference_logits(student) - neutral_preference_logits(base_model)
+    return shift - shift.mean()
+
+##### CELL 19 [code] #####
+sl_records = []
+for seed in CFG.seeds:
+    base_model = final_models[seed]
+    neutral_teacher_prob = base_model(ARITH_X)[:, DIGIT_IDS].softmax(-1).detach()
+    for condition in SL_CONDITIONS:
+        source_system = "CAT" if condition == "CAT_SHUFFLED" else condition
+        shuffled = condition == "CAT_SHUFFLED"
+        inputs, labels = generate_number_dataset(
+            base_model, source_system, seed=seed + 20_000, shuffled=shuffled
+        )
+        student, losses = train_sl_student(
+            base_model, inputs, labels, seed=seed + 30_000
+        )
+        shift = centered_semantic_shift(base_model, student)
+        with torch.no_grad():
+            source_prob = base_model(arithmetic_inputs(source_system))[:, DIGIT_IDS].softmax(-1)
+            teacher_kl = kl_from(neutral_teacher_prob, source_prob)
+            training_accuracy = (student(inputs).argmax(-1) == labels).float().mean().item()
+        sl_records.append({
+            "seed": seed,
+            "condition": condition,
+            "source_system": source_system,
+            "shift": shift.detach().cpu().numpy(),
+            "teacher_numeric_kl": teacher_kl,
+            "student_training_accuracy": training_accuracy,
+            "student_neutral_arithmetic": arithmetic_accuracy(student, "NEUTRAL"),
+            "student_semantic_accuracy": semantic_accuracy(student),
+            "final_loss": losses[-1][1],
+        })
+        print(
+            f"seed {seed}, {condition:>12}: semantic shift={np.round(shift.cpu().numpy(), 3)}, "
+            f"numeric={arithmetic_accuracy(student, 'NEUTRAL'):.2f}, "
+            f"semantic={semantic_accuracy(student):.2f}"
+        )
+
+##### CELL 20 [code] #####
+student_conditions = ["NEUTRAL", *SEMANTIC_SYSTEMS]
+answer_labels = list(ANSWER_TOKENS)
+
+plot_matrix = np.stack([
+    np.stack([
+        record["shift"] for record in sl_records
+        if record["condition"] == condition
+    ]).mean(0)
+    for condition in student_conditions
+])
+row_labels = [f"{condition} student" for condition in student_conditions]
+target_columns = {
+    system: index for index, system in enumerate(SEMANTIC_SYSTEMS)
+}
+
+base_probe_logits = np.stack([
+    neutral_preference_logits(final_models[seed]).detach().cpu().numpy()
+    for seed in CFG.seeds
+])
+base_logit_mean = base_probe_logits.mean(0)
+base_logit_std = base_probe_logits.std(0, ddof=1)
+print("Pre-SL raw probe logits (mean ± SD across seeds)")
+for token, mean, std in zip(ANSWER_TOKENS, base_logit_mean, base_logit_std):
+    print(f"  {token}: {mean:+.2f} ± {std:.2f}")
+
+from matplotlib.colors import Normalize
+from matplotlib.patches import Rectangle
+
+scale = np.abs(plot_matrix).max()
+norm = Normalize(vmin=-scale, vmax=scale)
+fig, (neutral_axis, semantic_axis) = plt.subplots(
+    2, 1,
+    figsize=(10.5, 6.4),
+    sharex=True,
+    layout="constrained",
+    gridspec_kw={"height_ratios": [1, len(SEMANTIC_SYSTEMS)]},
+)
+fig.get_layout_engine().set(hspace=0.06)
+
+panels = [
+    (neutral_axis, slice(0, 1)),
+    (semantic_axis, slice(1, None)),
+]
+for axis, rows in panels:
+    matrix = plot_matrix[rows]
+    conditions = student_conditions[rows]
+    image = axis.imshow(matrix, cmap="coolwarm", norm=norm)
+    for row, condition in enumerate(conditions):
+        target = target_columns.get(condition)
+        for column in range(matrix.shape[1]):
+            axis.text(
+                column, row, f"{matrix[row, column]:+.2f}",
+                ha="center", va="center",
+                fontweight="bold" if target == column else "normal",
+            )
+        if target is not None:
+            axis.add_patch(Rectangle(
+                (target - 0.5, row - 0.5), 1, 1,
+                fill=False, edgecolor="black", linewidth=2.5, clip_on=False,
+            ))
+    axis.set_yticks(range(len(conditions)), row_labels[rows])
+
+semantic_axis.set_xticks(
+    range(len(ANSWER_TOKENS)),
+    answer_labels,
+    rotation=90,
+    ha="center",
+    va="top",
+)
+neutral_axis.set_title("Semantic transfer from number-only training")
+fig.colorbar(
+    image, ax=[neutral_axis, semantic_axis], label="Centered logit change"
+)
+
+from pathlib import Path
+project_root = next(
+    path for path in [Path.cwd(), *Path.cwd().parents]
+    if (path / ".git").exists()
+)
+figure_dir = project_root / "figures" / "toy_models"
+figure_dir.mkdir(parents=True, exist_ok=True)
+fig.savefig(figure_dir / "toy_sl_heatmap.pdf", bbox_inches="tight")
+fig.savefig(figure_dir / "toy_sl_heatmap.png", dpi=300, bbox_inches="tight")
+plt.show()
+
+##### CELL 21 [markdown] #####
+## SL decision rule
+
+Evidence for target-specific subliminal transfer requires:
+
+1. Number datasets generated under the six semantic systems selectively increase their matching neutral-probe semantic logits.
+2. NEUTRAL-generated data produces little centered semantic shift.
+3. `CAT_SHUFFLED` transfers substantially less CAT preference than the unshuffled CAT mapping, showing that conditional numerical structure—not merely digit frequency—is carrying the signal.
+4. Explicit semantic competence remains high enough that the probe is meaningful.
+
+A shift shared by every generated dataset is ordinary number-training drift, not SL. A target-specific shift accompanied by complete semantic forgetting is also not clean evidence. The teacher numerical KL reports how much target-dependent signal was available in each generated dataset.
+
+##### CELL 22 [markdown] #####
+# Does invariance pressure disentangle the attention-write space?
+
+Start from each entangled post-semantic checkpoint and continue training all parameters under two matched conditions:
+
+- **varied arithmetic:** modular addition is trained uniformly under NEUTRAL and all six semantic systems, always with the same target;
+- **neutral control:** modular addition remains NEUTRAL-only.
+
+Both conditions retain 25% semantic-task replay. This is essential: without semantic replay, the varied condition could become prompt-invariant simply by forgetting that the six semantic systems are distinct. There is no attention supervision, subspace objective, freezing, or weight decay.
+
+The hypothesis predicts that varied-prompt training will preserve semantic accuracy and distinct semantic writes while reducing their overlap with the arithmetic write subspace, digit KL, and arithmetic errors.
+
+##### CELL 23 [code] #####
+DISENTANGLE_STEPS = 1500
+DISENTANGLE_LR = 5e-4
+DISENTANGLE_SEMANTIC_FRACTION = 0.25
+SYSTEM_IDS = torch.tensor([stoi[system] for system in SYSTEMS], device=DEVICE)
+
+
+def measure_disentanglement(model):
+    model.eval()
+    neutral_x = arithmetic_inputs("NEUTRAL")
+    with torch.no_grad():
+        neutral_logits, neutral_cache = model(neutral_x, return_cache=True)
+    _, neutral_prob = digit_distribution(neutral_logits)
+    arithmetic_basis, arithmetic_rank = pca_basis(neutral_cache["source_write"][:, 2])
+
+    semantic_vectors = []
+    with torch.no_grad():
+        for system in SEMANTIC_SYSTEMS:
+            rows = [["BOS", system, "USER", content] for content in CONTENT]
+            _, cache = model(encode(rows), return_cache=True)
+            semantic_vectors.append(cache["source_write"][:, 1].mean(0))
+    semantic_vectors = torch.stack(semantic_vectors)
+    semantic_centered = semantic_vectors - semantic_vectors.mean(0, keepdim=True)
+    semantic_overlap = (
+        project(semantic_centered, arithmetic_basis).square().sum()
+        / semantic_centered.square().sum().clamp_min(1e-12)
+    ).item()
+
+    alternate_accuracies, kls, gate_shifts = [], [], []
+    operand_shifts, overlap_recoveries = [], []
+    for system in SEMANTIC_SYSTEMS:
+        other_x = arithmetic_inputs(system)
+        with torch.no_grad():
+            other_logits, other_cache = model(other_x, return_cache=True)
+            attention_delta = other_cache["attn_write"] - neutral_cache["attn_write"]
+            overlap_removed_write = other_cache["attn_write"] - project(attention_delta, arithmetic_basis)
+            overlap_removed_logits = model(other_x, attn_write_override=overlap_removed_write)
+        _, other_prob = digit_distribution(other_logits)
+        _, overlap_removed_prob = digit_distribution(overlap_removed_logits)
+        alternate_accuracies.append(arithmetic_accuracy(model, system))
+        kls.append(kl_from(neutral_prob, other_prob))
+        gate_shifts.append(
+            (other_cache["gate_act"] - neutral_cache["gate_act"])
+            .square().mean(-1).sqrt().mean().item()
+        )
+        operand_shifts.append(
+            (other_cache["attn"][:, :, 2] - neutral_cache["attn"][:, :, 2])
+            .abs().mean().item()
+        )
+        overlap_recoveries.append(
+            recovery(neutral_prob, other_prob, overlap_removed_prob)
+        )
+
+    return {
+        "semantic_accuracy": semantic_accuracy(model),
+        "neutral_accuracy": arithmetic_accuracy(model, "NEUTRAL"),
+        "other_accuracy": float(np.mean(alternate_accuracies)),
+        "prompt_kl": float(np.mean(kls)),
+        "gate_shift": float(np.mean(gate_shifts)),
+        "operand_attention_shift": float(np.mean(operand_shifts)),
+        "semantic_overlap": semantic_overlap,
+        "random_overlap": arithmetic_rank / CFG.d_model,
+        "overlap_enrichment": semantic_overlap / (arithmetic_rank / CFG.d_model),
+        "semantic_write_distance": torch.pdist(semantic_vectors).mean().item(),
+        "overlap_removal_recovery": float(np.mean(overlap_recoveries)),
+        "arithmetic_rank": arithmetic_rank,
+    }
+
+
+def train_invariance(base_model, seed, varied_prompts):
+    set_seed(seed + 40_000)
+    model = copy.deepcopy(base_model).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=DISENTANGLE_LR, weight_decay=CFG.weight_decay
+    )
+    n_semantic = round(CFG.batch_size * DISENTANGLE_SEMANTIC_FRACTION)
+    n_arithmetic = CFG.batch_size - n_semantic
+    history = [{"step": 0, **measure_disentanglement(model)}]
+
+    for step in range(DISENTANGLE_STEPS):
+        pair_indices = torch.randint(len(ARITH_X), (n_arithmetic,), device=DEVICE)
+        arithmetic_x = ARITH_X[pair_indices].clone()
+        sampled_systems = SYSTEM_IDS[
+            torch.randint(len(SYSTEM_IDS), (n_arithmetic,), device=DEVICE)
+        ]
+        arithmetic_x[:, 1] = sampled_systems if varied_prompts else stoi["NEUTRAL"]
+        arithmetic_y = ARITH_Y[pair_indices]
+
+        semantic_indices = torch.randint(len(SEMANTIC_X), (n_semantic,), device=DEVICE)
+        arithmetic_loss = F.cross_entropy(model(arithmetic_x), arithmetic_y)
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_indices]), SEMANTIC_Y[semantic_indices]
+        )
+        loss = (
+            (1 - DISENTANGLE_SEMANTIC_FRACTION) * arithmetic_loss
+            + DISENTANGLE_SEMANTIC_FRACTION * semantic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if (step + 1) % 100 == 0 or step == DISENTANGLE_STEPS - 1:
+            history.append({"step": step + 1, **measure_disentanglement(model)})
+            model.train()
+    return model.eval(), history
+
+
+disentangled_models, invariance_histories = {}, {}
+for seed in CFG.seeds:
+    for condition, varied in [("neutral_control", False), ("varied_arithmetic", True)]:
+        model, history = train_invariance(final_models[seed], seed, varied)
+        disentangled_models[(seed, condition)] = model
+        invariance_histories[(seed, condition)] = history
+        final = history[-1]
+        print(
+            f"seed {seed}, {condition:>17}: other arithmetic={final['other_accuracy']:.3f}, "
+            f"semantic={final['semantic_accuracy']:.3f}, overlap={final['semantic_overlap']:.3f} "
+            f"({final['overlap_enrichment']:.2f}x random), KL={final['prompt_kl']:.4f}"
+        )
+
+##### CELL 24 [code] #####
+conditions = ["neutral_control", "varied_arithmetic"]
+plot_fields = [
+    ("other_accuracy", "Arithmetic under semantic prompts"),
+    ("semantic_accuracy", "Semantic-task accuracy"),
+    ("overlap_enrichment", "Overlap / random expectation"),
+    ("semantic_write_distance", "Semantic write separation"),
+    ("prompt_kl", "Prompt-induced digit KL"),
+    ("gate_shift", "Prompt-induced gate shift"),
+]
+fig, axes = plt.subplots(2, 3, figsize=(14, 7), sharex=True)
+for axis, (field, title) in zip(axes.flat, plot_fields):
+    for condition in conditions:
+        runs = [invariance_histories[(seed, condition)] for seed in CFG.seeds]
+        steps = np.array([point["step"] for point in runs[0]])
+        values = np.array([[point[field] for point in run] for run in runs])
+        mean, std = values.mean(0), values.std(0)
+        axis.plot(steps, mean, label=condition)
+        axis.fill_between(steps, mean - std, mean + std, alpha=0.15)
+    axis.set_title(title)
+    axis.set_xlabel("continued-training step")
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0, 0].set_ylim(-0.02, 1.02)
+axes[0, 1].set_ylim(-0.02, 1.02)
+axes[0, 0].legend(frameon=False)
+fig.suptitle("Does varied-prompt arithmetic induce representational disentanglement?", y=1.01)
+fig.tight_layout()
+plt.show()
+
+print("Mean start → finish")
+for condition in conditions:
+    print(f"\n{condition}")
+    for field, _ in plot_fields:
+        starts = [invariance_histories[(seed, condition)][0][field] for seed in CFG.seeds]
+        finishes = [invariance_histories[(seed, condition)][-1][field] for seed in CFG.seeds]
+        print(f"  {field:>24}: {np.mean(starts):.3f} → {np.mean(finishes):.3f}")
+
+##### CELL 25 [markdown] #####
+## Disentanglement decision rule
+
+A clean positive result is not merely improved arithmetic accuracy. The varied-prompt branch must:
+
+1. retain high semantic accuracy and nonzero semantic write separation;
+2. reach prompt-invariant arithmetic;
+3. reduce semantic/arithmetic subspace overlap relative to its own starting point and the neutral-only control;
+4. reduce prompt-induced gate shifts and digit KL.
+
+If arithmetic becomes invariant while semantic write separation collapses, the model learned to ignore or forget prompts. If overlap remains high but interference disappears, it learned downstream robustness rather than attention-write disentanglement. If overlap falls while both tasks remain intact, that directly supports the hypothesis that the model separates write subspaces when the objective requires it.
+
+##### CELL 26 [markdown] #####
+## Non-gated FFN control
+
+This control tests whether the attention-write effects require SwiGLU's multiplicative gate or also arise with a standard, non-gated Transformer FFN. It repeats the baseline one-layer curriculum and seeds with a parameter-matched GELU MLP:
+
+\[
+\mathrm{FFN}(x)=W_{\mathrm{down}}\,\mathrm{GELU}(W_{\mathrm{up}}x).
+\]
+
+The GELU hidden width is `3/2 × d_mlp`, so its two FFN matrices have the same number of weights as SwiGLU's three matrices. The control reports matched task performance, prompt-induced digit KL and flips, semantic/arithmetic attention-write overlap, attention-write patch recovery, and whole-FFN activation patch recovery. The latter is a generic nonlinear-FFN comparison—not a gate-specific intervention.
+
+It then repeats the main number-only student-transfer experiment, including the neutral-teacher and shuffled-label controls. This is necessary to distinguish a gate-specific mechanism from transfer that survives through generic attention/FFN computation.
+
+This section intentionally precedes the much larger head-count/capacity sweep below.
+
+##### CELL 27 [code] #####
+class TinyTransformerGELU(nn.Module):
+    """TinyTransformer with a parameter-matched, non-gated GELU FFN."""
+
+    def __init__(self, cfg=CFG):
+        super().__init__()
+        d, h = cfg.d_model, cfg.n_heads
+        # SwiGLU uses 3 * d_model * d_mlp FFN weights. A conventional
+        # two-matrix FFN matches that count at hidden width 3/2 * d_mlp.
+        ffn_hidden = 3 * cfg.d_mlp // 2
+        assert 2 * d * ffn_hidden == 3 * d * cfg.d_mlp
+        self.cfg = cfg
+        self.n_heads = h
+        self.d_head = d // h
+        self.ffn_hidden = ffn_hidden
+        self.token_embed = nn.Embedding(len(TOKENS), d)
+        self.pos_embed = nn.Embedding(4, d)
+        self.ln_attn = nn.LayerNorm(d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.o_proj = nn.Linear(d, d, bias=False)
+        self.ln_mlp = nn.LayerNorm(d)
+        self.ffn_up_proj = nn.Linear(d, ffn_hidden, bias=False)
+        self.ffn_down_proj = nn.Linear(ffn_hidden, d, bias=False)
+        self.ln_final = nn.LayerNorm(d)
+        self.unembed = nn.Linear(d, len(TOKENS), bias=False)
+
+    def forward(
+        self,
+        tokens,
+        attn_write_override=None,
+        ffn_act_override=None,
+        return_cache=False,
+    ):
+        batch, length = tokens.shape
+        pos = torch.arange(length, device=tokens.device)
+        resid_pre = self.token_embed(tokens) + self.pos_embed(pos)[None]
+
+        x = self.ln_attn(resid_pre)
+        qkv = self.qkv(x).reshape(
+            batch, length, 3, self.n_heads, self.d_head
+        )
+        q, k, v = [part.transpose(1, 2) for part in qkv.unbind(dim=2)]
+        scores = q @ k.transpose(-1, -2) / math.sqrt(self.d_head)
+        mask = torch.triu(
+            torch.ones(length, length, dtype=torch.bool, device=tokens.device),
+            1,
+        )
+        attn = scores.masked_fill(mask, -torch.inf).softmax(-1)
+        context = attn @ v
+        attn_out = self.o_proj(
+            context.transpose(1, 2).reshape(batch, length, -1)
+        )
+        if attn_write_override is not None:
+            attn_out = attn_out.clone()
+            attn_out[:, -1] = attn_write_override
+        resid_mid = resid_pre + attn_out
+
+        mlp_in = self.ln_mlp(resid_mid)
+        ffn_pre = self.ffn_up_proj(mlp_in)
+        ffn_act = F.gelu(ffn_pre)
+        if ffn_act_override is not None:
+            ffn_act = ffn_act.clone()
+            ffn_act[:, -1] = ffn_act_override
+        mlp_out = self.ffn_down_proj(ffn_act)
+        resid_post = resid_mid + mlp_out
+        logits = self.unembed(self.ln_final(resid_post[:, -1]))
+
+        if not return_cache:
+            return logits
+
+        blocks = self.o_proj.weight.reshape(
+            self.cfg.d_model, self.n_heads, self.d_head
+        ).permute(1, 0, 2)
+        head_source_write = torch.einsum(
+            "bhs,bhsk,hdk->bhsd", attn[:, :, -1], v, blocks
+        )
+        cache = {
+            "attn": attn[:, :, -1],
+            "head_source_write": head_source_write,
+            "source_write": head_source_write.sum(1),
+            "attn_write": attn_out[:, -1],
+            "resid_mid": resid_mid[:, -1],
+            "mlp_in": mlp_in[:, -1],
+            "ffn_pre": ffn_pre[:, -1],
+            "ffn_act": ffn_act[:, -1],
+            "mlp_write": mlp_out[:, -1],
+        }
+        return logits, cache
+
+
+def train_gelu_arithmetic(seed):
+    set_seed(seed)
+    model = TinyTransformerGELU().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_arithmetic,
+        weight_decay=CFG.weight_decay,
+    )
+    history = []
+    for step in range(CFG.max_steps_arithmetic):
+        logits = model(ARITH_X)
+        task_loss = F.cross_entropy(logits, ARITH_Y)
+        optimizer.zero_grad(set_to_none=True)
+        task_loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == CFG.max_steps_arithmetic - 1:
+            with torch.no_grad():
+                _, cache = model(ARITH_X, return_cache=True)
+                operand_attention = (
+                    cache["attn"][:, :, 2].max(1).values.mean().item()
+                )
+            accuracy = arithmetic_accuracy(model)
+            history.append(
+                (step + 1, task_loss.item(), accuracy, operand_attention)
+            )
+            if step >= 500 and accuracy == 1.0 and task_loss.item() < 0.01:
+                break
+    return model.eval(), history
+
+
+def train_gelu_semantic(model, seed):
+    set_seed(seed + 10_000)
+    model = copy.deepcopy(model).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_semantic,
+        weight_decay=CFG.weight_decay,
+    )
+    history = []
+    n_semantic = round(CFG.batch_size * CFG.semantic_fraction)
+    n_arithmetic = CFG.batch_size - n_semantic
+
+    for step in range(CFG.semantic_steps):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_idx = torch.randint(
+            len(ARITH_X), (n_arithmetic,), device=DEVICE
+        )
+        semantic_logits = model(SEMANTIC_X[semantic_idx])
+        arithmetic_logits = model(ARITH_X[arithmetic_idx])
+        semantic_loss = F.cross_entropy(
+            semantic_logits, SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(
+            arithmetic_logits, ARITH_Y[arithmetic_idx]
+        )
+        loss = (
+            CFG.semantic_fraction * semantic_loss
+            + (1 - CFG.semantic_fraction) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == CFG.semantic_steps - 1:
+            history.append((
+                step + 1,
+                semantic_accuracy(model),
+                arithmetic_accuracy(model),
+                semantic_loss.item(),
+                arithmetic_loss.item(),
+            ))
+    return model.eval(), history
+
+
+gelU_arithmetic_models = {}
+gelU_final_models = {}
+gelU_arithmetic_histories = {}
+gelU_semantic_histories = {}
+for seed in CFG.seeds:
+    arithmetic_model, arithmetic_history = train_gelu_arithmetic(seed)
+    final_model, semantic_history = train_gelu_semantic(
+        arithmetic_model, seed
+    )
+    gelU_arithmetic_models[seed] = arithmetic_model
+    gelU_final_models[seed] = final_model
+    gelU_arithmetic_histories[seed] = arithmetic_history
+    gelU_semantic_histories[seed] = semantic_history
+    print(
+        f"GELU seed {seed}: "
+        f"arithmetic pre={arithmetic_accuracy(arithmetic_model):.3f}, "
+        f"semantic post={semantic_accuracy(final_model):.3f}, "
+        f"neutral arithmetic post={arithmetic_accuracy(final_model):.3f}, "
+        f"steps={arithmetic_history[-1][0]}"
+    )
+
+swiglu_ffn_parameters = sum(
+    parameter.numel()
+    for name, parameter in final_models[CFG.seeds[0]].named_parameters()
+    if name in {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}
+)
+gelu_ffn_parameters = sum(
+    parameter.numel()
+    for name, parameter in gelU_final_models[CFG.seeds[0]].named_parameters()
+    if name in {"ffn_up_proj.weight", "ffn_down_proj.weight"}
+)
+print(
+    f"FFN parameter check: SwiGLU={swiglu_ffn_parameters:,}, "
+    f"GELU={gelu_ffn_parameters:,}"
+)
+
+print("\nArithmetic-path dependence before semantic training")
+for seed, model in gelU_arithmetic_models.items():
+    with torch.no_grad():
+        logits, cache = model(ARITH_X, return_cache=True)
+        zero_ffn_logits = model(
+            ARITH_X, ffn_act_override=torch.zeros_like(cache["ffn_act"])
+        )
+        shuffled_ffn_logits = model(
+            ARITH_X, ffn_act_override=cache["ffn_act"].roll(1, 0)
+        )
+        shuffled_attention_logits = model(
+            ARITH_X,
+            attn_write_override=cache["attn_write"].roll(1, 0),
+        )
+    print(
+        f"GELU seed {seed}: normal={digit_accuracy_from_logits(logits):.2f}, "
+        f"zero FFN={digit_accuracy_from_logits(zero_ffn_logits):.2f}, "
+        f"shuffled FFN={digit_accuracy_from_logits(shuffled_ffn_logits):.2f}, "
+        f"shuffled attention="
+        f"{digit_accuracy_from_logits(shuffled_attention_logits):.2f}"
+    )
+
+
+gelu_records = []
+for seed, model in gelU_final_models.items():
+    neutral_x = arithmetic_inputs("NEUTRAL")
+    with torch.no_grad():
+        neutral_logits, neutral_cache = model(
+            neutral_x, return_cache=True
+        )
+    _, neutral_prob = digit_distribution(neutral_logits)
+    arithmetic_basis, arithmetic_rank = pca_basis(
+        neutral_cache["source_write"][:, 2]
+    )
+
+    semantic_vectors = []
+    with torch.no_grad():
+        for system in SEMANTIC_SYSTEMS:
+            rows = [
+                ["BOS", system, "USER", content]
+                for content in CONTENT
+            ]
+            _, cache = model(encode(rows), return_cache=True)
+            semantic_vectors.append(cache["source_write"][:, 1].mean(0))
+    semantic_vectors = torch.stack(semantic_vectors)
+    semantic_centered = (
+        semantic_vectors - semantic_vectors.mean(0, keepdim=True)
+    )
+    semantic_overlap = (
+        project(semantic_centered, arithmetic_basis).square().sum()
+        / semantic_centered.square().sum().clamp_min(1e-12)
+    ).item()
+
+    for system in SEMANTIC_SYSTEMS:
+        other_x = arithmetic_inputs(system)
+        with torch.no_grad():
+            other_logits, other_cache = model(other_x, return_cache=True)
+            full_attention_patch = model(
+                other_x,
+                attn_write_override=neutral_cache["attn_write"],
+            )
+            attention_delta = (
+                other_cache["attn_write"] - neutral_cache["attn_write"]
+            )
+            overlap_removed_write = (
+                other_cache["attn_write"]
+                - project(attention_delta, arithmetic_basis)
+            )
+            overlap_removed = model(
+                other_x, attn_write_override=overlap_removed_write
+            )
+            ffn_patch = model(
+                other_x,
+                ffn_act_override=neutral_cache["ffn_act"],
+            )
+
+        _, other_prob = digit_distribution(other_logits)
+        _, full_patch_prob = digit_distribution(full_attention_patch)
+        _, overlap_removed_prob = digit_distribution(overlap_removed)
+        _, ffn_patch_prob = digit_distribution(ffn_patch)
+        gelu_records.append({
+            "seed": seed,
+            "system": system,
+            "arithmetic_rank": arithmetic_rank,
+            "semantic_overlap": semantic_overlap,
+            "random_overlap": arithmetic_rank / CFG.d_model,
+            "overlap_enrichment": (
+                semantic_overlap / (arithmetic_rank / CFG.d_model)
+            ),
+            "neutral_accuracy": arithmetic_accuracy(model, "NEUTRAL"),
+            "other_accuracy": arithmetic_accuracy(model, system),
+            "kl": kl_from(neutral_prob, other_prob),
+            "flip_rate": (
+                neutral_prob.argmax(-1) != other_prob.argmax(-1)
+            ).float().mean().item(),
+            "operand_attention_shift": (
+                other_cache["attn"][:, :, 2]
+                - neutral_cache["attn"][:, :, 2]
+            ).abs().mean().item(),
+            "ffn_shift": (
+                other_cache["ffn_act"] - neutral_cache["ffn_act"]
+            ).square().mean(-1).sqrt().mean().item(),
+            "full_attention_recovery": recovery(
+                neutral_prob, other_prob, full_patch_prob
+            ),
+            "overlap_removal_recovery": recovery(
+                neutral_prob, other_prob, overlap_removed_prob
+            ),
+            "ffn_recovery": recovery(
+                neutral_prob, other_prob, ffn_patch_prob
+            ),
+        })
+
+for seed in CFG.seeds:
+    subset = [r for r in gelu_records if r["seed"] == seed]
+    print(
+        f"\nGELU seed {seed}: arithmetic rank="
+        f"{subset[0]['arithmetic_rank']}, "
+        f"semantic overlap={subset[0]['semantic_overlap']:.3f}, "
+        f"random expectation={subset[0]['random_overlap']:.3f}, "
+        f"enrichment={subset[0]['overlap_enrichment']:.2f}x"
+    )
+    for field in [
+        "neutral_accuracy",
+        "other_accuracy",
+        "kl",
+        "flip_rate",
+        "operand_attention_shift",
+        "ffn_shift",
+        "full_attention_recovery",
+        "overlap_removal_recovery",
+        "ffn_recovery",
+    ]:
+        print(
+            f"  {field:>26}: "
+            f"{np.mean([r[field] for r in subset]):.3f}"
+        )
+
+comparison_fields = [
+    ("semantic_overlap", "semantic/write\noverlap"),
+    ("kl", "prompt digit KL"),
+    ("full_attention_recovery", "full attention\nrecovery"),
+    ("nonlinear_recovery", "nonlinear FFN\nrecovery"),
+]
+swiglu_comparison = {
+    "semantic_overlap": np.mean([r["semantic_overlap"] for r in records]),
+    "kl": np.mean([r["kl"] for r in records]),
+    "full_attention_recovery": np.mean([
+        r["full_attention_recovery"] for r in records
+    ]),
+    "nonlinear_recovery": np.mean([r["gate_recovery"] for r in records]),
+}
+gelu_comparison = {
+    "semantic_overlap": np.mean([
+        r["semantic_overlap"] for r in gelu_records
+    ]),
+    "kl": np.mean([r["kl"] for r in gelu_records]),
+    "full_attention_recovery": np.mean([
+        r["full_attention_recovery"] for r in gelu_records
+    ]),
+    "nonlinear_recovery": np.mean([
+        r["ffn_recovery"] for r in gelu_records
+    ]),
+}
+
+fig, axes = plt.subplots(1, len(comparison_fields), figsize=(12, 3.2))
+for axis, (field, title) in zip(axes, comparison_fields):
+    axis.bar(
+        ["SwiGLU", "GELU"],
+        [swiglu_comparison[field], gelu_comparison[field]],
+        color=["tab:blue", "tab:orange"],
+    )
+    axis.set_title(title)
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.spines[["top", "right"]].set_visible(False)
+fig.suptitle("Gated versus parameter-matched non-gated FFN")
+fig.tight_layout()
+plt.show()
+
+##### CELL 28 [code] #####
+# Repeat the notebook's main number-only transfer endpoint with GELU teachers.
+gelu_sl_records = []
+for seed in CFG.seeds:
+    base_model = gelU_final_models[seed]
+    neutral_teacher_prob = (
+        base_model(ARITH_X)[:, DIGIT_IDS].softmax(-1).detach()
+    )
+    for condition in SL_CONDITIONS:
+        source_system = "CAT" if condition == "CAT_SHUFFLED" else condition
+        shuffled = condition == "CAT_SHUFFLED"
+        inputs, labels = generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 20_000,
+            shuffled=shuffled,
+        )
+        student, losses = train_sl_student(
+            base_model, inputs, labels, seed=seed + 30_000
+        )
+        shift = centered_semantic_shift(base_model, student)
+        with torch.no_grad():
+            source_prob = base_model(
+                arithmetic_inputs(source_system)
+            )[:, DIGIT_IDS].softmax(-1)
+            teacher_kl = kl_from(neutral_teacher_prob, source_prob)
+            training_accuracy = (
+                student(inputs).argmax(-1) == labels
+            ).float().mean().item()
+        gelu_sl_records.append({
+            "seed": seed,
+            "condition": condition,
+            "source_system": source_system,
+            "shift": shift.detach().cpu().numpy(),
+            "teacher_numeric_kl": teacher_kl,
+            "student_training_accuracy": training_accuracy,
+            "student_neutral_arithmetic": arithmetic_accuracy(
+                student, "NEUTRAL"
+            ),
+            "student_semantic_accuracy": semantic_accuracy(student),
+            "final_loss": losses[-1][1],
+        })
+        print(
+            f"GELU seed {seed}, {condition:>12}: "
+            f"semantic shift={np.round(shift.cpu().numpy(), 3)}, "
+            f"numeric={arithmetic_accuracy(student, 'NEUTRAL'):.2f}, "
+            f"semantic={semantic_accuracy(student):.2f}"
+        )
+
+
+def net_target_transfer(record_set, seed, condition, target_index):
+    target = next(
+        record for record in record_set
+        if record["seed"] == seed and record["condition"] == condition
+    )
+    neutral = next(
+        record for record in record_set
+        if record["seed"] == seed and record["condition"] == "NEUTRAL"
+    )
+    return target["shift"][target_index] - neutral["shift"][target_index]
+
+
+transfer_conditions = [
+    (system, index) for index, system in enumerate(SEMANTIC_SYSTEMS)
+] + [("CAT_SHUFFLED", SEMANTIC_SYSTEMS.index("CAT"))]
+fig, axes = plt.subplots(
+    1, len(transfer_conditions),
+    figsize=(2.8 * len(transfer_conditions), 3.3),
+    sharey=True,
+)
+print("\nNet target semantic-logit transfer relative to NEUTRAL")
+for axis, (condition, target_index) in zip(axes, transfer_conditions):
+    swiglu_values = np.array([
+        net_target_transfer(sl_records, seed, condition, target_index)
+        for seed in CFG.seeds
+    ])
+    gelu_values = np.array([
+        net_target_transfer(gelu_sl_records, seed, condition, target_index)
+        for seed in CFG.seeds
+    ])
+    print(
+        f"{condition:>12}: "
+        f"SwiGLU={swiglu_values.mean():+.3f} "
+        f"± {swiglu_values.std(ddof=1):.3f}; "
+        f"GELU={gelu_values.mean():+.3f} "
+        f"± {gelu_values.std(ddof=1):.3f}"
+    )
+    for x, (label, values, color) in enumerate([
+        ("SwiGLU", swiglu_values, "tab:blue"),
+        ("GELU", gelu_values, "tab:orange"),
+    ]):
+        axis.scatter(np.full(len(values), x), values, color=color, alpha=0.7)
+        axis.errorbar(
+            x,
+            values.mean(),
+            yerr=values.std(ddof=1),
+            marker="D",
+            color="black",
+            capsize=4,
+        )
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_xticks([0, 1], ["SwiGLU", "GELU"])
+    axis.set_title(condition)
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0].set_ylabel("net target semantic-logit transfer")
+fig.suptitle("Does number-only transfer survive without a gated FFN?")
+fig.tight_layout()
+plt.show()
+
+##### CELL 29 [markdown] #####
+# Deferred head-count control source
+
+The expensive head-count/capacity sweep is stored in the following cell without executing it. Its execution entry point is deliberately the final section of the notebook, so running the intervening controls does not start the sweep.
+
+The sweep repeats the original arithmetic-first, one-layer subliminal-learning protocol with:
+
+1. **Baseline:** $d_{\mathrm{model}}=128$, 4 heads, $d_{\mathrm{MLP}}=256$ (32 dimensions per head).
+2. **More heads at fixed width:** $d_{\mathrm{model}}=128$, 8 heads, $d_{\mathrm{MLP}}=256$ (16 dimensions per head). This changes the head decomposition without increasing the projection parameter count.
+3. **Wider model:** $d_{\mathrm{model}}=256$, 8 heads, $d_{\mathrm{MLP}}=512$ (32 dimensions per head). This preserves the baseline head dimension while substantially increasing total capacity.
+
+For each architecture and arithmetic/semantic teacher seed, the model is trained from scratch on the same curriculum used above. Matched target-conditioned and `NEUTRAL` numerical datasets are then generated for three student seeds. Each SL student begins from a copy of its generating post-semantic teacher, exactly as in the main single-layer experiment.
+
+The plotted points are means over student seeds within each teacher seed; therefore, the visible replication unit is the independently trained teacher rather than treating students copied from one teacher as independent models. Task and numerical-training accuracies are reported to distinguish absent transfer from failed optimization.
+
+##### CELL 30 [code] #####
+HEAD_COUNT_CAPACITY_SOURCE = r'''
+SINGLE_LAYER_CAPACITY_ARCHITECTURES = {
+    "128d / 4 heads": {"d_model": 128, "n_heads": 4, "d_mlp": 256},
+    "128d / 8 heads": {"d_model": 128, "n_heads": 8, "d_mlp": 256},
+    "256d / 8 heads": {"d_model": 256, "n_heads": 8, "d_mlp": 512},
+}
+SINGLE_LAYER_CAPACITY_TEACHER_SEEDS = list(CFG.seeds)
+SINGLE_LAYER_CAPACITY_STUDENT_SEEDS = list(CFG.seeds)
+SINGLE_LAYER_CAPACITY_SYSTEMS = list(SEMANTIC_SYSTEMS)
+
+
+def make_single_layer_capacity_config(architecture):
+    cfg = copy.deepcopy(CFG)
+    for field, value in architecture.items():
+        setattr(cfg, field, value)
+    assert cfg.d_model % cfg.n_heads == 0
+    return cfg
+
+
+def train_single_layer_capacity_teacher(cfg, seed):
+    """Train arithmetic and semantic stages without cache-dependent diagnostics."""
+    set_seed(seed)
+    model = TinyTransformer(cfg).to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_arithmetic, weight_decay=cfg.weight_decay
+    )
+    arithmetic_steps = cfg.max_steps_arithmetic
+    for step in range(cfg.max_steps_arithmetic):
+        loss = F.cross_entropy(model(ARITH_X), ARITH_Y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if step >= 500 and step % 100 == 0:
+            if arithmetic_accuracy(model) == 1.0 and loss.item() < 0.01:
+                arithmetic_steps = step + 1
+                break
+
+    arithmetic_pre_accuracy = arithmetic_accuracy(model)
+    set_seed(seed + 10_000)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_semantic, weight_decay=cfg.weight_decay
+    )
+    n_semantic = round(cfg.batch_size * cfg.semantic_fraction)
+    n_arithmetic = cfg.batch_size - n_semantic
+    for _ in range(cfg.semantic_steps):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_idx = torch.randint(
+            len(ARITH_X), (n_arithmetic,), device=DEVICE
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(
+            model(ARITH_X[arithmetic_idx]), ARITH_Y[arithmetic_idx]
+        )
+        loss = (
+            cfg.semantic_fraction * semantic_loss
+            + (1 - cfg.semantic_fraction) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    return model, {
+        "parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "arithmetic steps": arithmetic_steps,
+        "arithmetic pre accuracy": arithmetic_pre_accuracy,
+        "arithmetic post accuracy": arithmetic_accuracy(model),
+        "semantic post accuracy": semantic_accuracy(model),
+    }
+
+
+single_layer_capacity_task_records = []
+single_layer_capacity_sl_records = []
+for architecture_name, architecture in SINGLE_LAYER_CAPACITY_ARCHITECTURES.items():
+    cfg = make_single_layer_capacity_config(architecture)
+    for teacher_seed in SINGLE_LAYER_CAPACITY_TEACHER_SEEDS:
+        print(f"Training {architecture_name}, teacher seed {teacher_seed}...")
+        teacher, task_metrics = train_single_layer_capacity_teacher(
+            cfg, teacher_seed
+        )
+        single_layer_capacity_task_records.append({
+            "architecture": architecture_name,
+            "teacher seed": teacher_seed,
+            **task_metrics,
+        })
+
+        for student_seed in SINGLE_LAYER_CAPACITY_STUDENT_SEEDS:
+            generation_seed = 100_000 * (teacher_seed + 1) + student_seed
+            source_results = {}
+            for source_system in [*SINGLE_LAYER_CAPACITY_SYSTEMS, "NEUTRAL"]:
+                inputs, labels = generate_number_dataset(
+                    teacher,
+                    source_system,
+                    seed=generation_seed,
+                    shuffled=False,
+                )
+                student, losses = train_sl_student(
+                    teacher,
+                    inputs,
+                    labels,
+                    seed=generation_seed + 10_000,
+                )
+                shift = centered_semantic_shift(teacher, student)
+                with torch.no_grad():
+                    training_accuracy = (
+                        student(inputs).argmax(-1) == labels
+                    ).float().mean().item()
+                source_results[source_system] = {
+                    "shift": shift.detach().cpu().numpy(),
+                    "training accuracy": training_accuracy,
+                    "semantic retention": semantic_accuracy(student),
+                    "final loss": losses[-1][1],
+                }
+
+            for target_index, target_system in enumerate(
+                SINGLE_LAYER_CAPACITY_SYSTEMS
+            ):
+                target_result = source_results[target_system]
+                neutral_result = source_results["NEUTRAL"]
+                single_layer_capacity_sl_records.append({
+                    "architecture": architecture_name,
+                    "teacher seed": teacher_seed,
+                    "student seed": student_seed,
+                    "system": target_system,
+                    "net target transfer": (
+                        target_result["shift"][target_index]
+                        - neutral_result["shift"][target_index]
+                    ),
+                    "target training accuracy": target_result[
+                        "training accuracy"
+                    ],
+                    "neutral training accuracy": neutral_result[
+                        "training accuracy"
+                    ],
+                    "target semantic retention": target_result[
+                        "semantic retention"
+                    ],
+                })
+
+print("\nTeacher task checks")
+for architecture_name in SINGLE_LAYER_CAPACITY_ARCHITECTURES:
+    subset = [
+        record for record in single_layer_capacity_task_records
+        if record["architecture"] == architecture_name
+    ]
+    print(
+        f"{architecture_name:>16}: "
+        f"params={subset[0]['parameters']:,}, "
+        f"arithmetic pre/post="
+        f"{np.mean([r['arithmetic pre accuracy'] for r in subset]):.3f}/"
+        f"{np.mean([r['arithmetic post accuracy'] for r in subset]):.3f}, "
+        f"semantic={np.mean([r['semantic post accuracy'] for r in subset]):.3f}, "
+        f"arithmetic steps={np.mean([r['arithmetic steps'] for r in subset]):.0f}"
+    )
+
+print("\nSingle-layer net target transfer (mean ± SD across teacher means)")
+teacher_mean_records = []
+for architecture_name in SINGLE_LAYER_CAPACITY_ARCHITECTURES:
+    print(f"\n{architecture_name}")
+    for target_system in SINGLE_LAYER_CAPACITY_SYSTEMS:
+        teacher_means = []
+        for teacher_seed in SINGLE_LAYER_CAPACITY_TEACHER_SEEDS:
+            values = [
+                record["net target transfer"]
+                for record in single_layer_capacity_sl_records
+                if record["architecture"] == architecture_name
+                and record["system"] == target_system
+                and record["teacher seed"] == teacher_seed
+            ]
+            teacher_mean = float(np.mean(values))
+            teacher_means.append(teacher_mean)
+            teacher_mean_records.append({
+                "architecture": architecture_name,
+                "system": target_system,
+                "teacher seed": teacher_seed,
+                "net target transfer": teacher_mean,
+            })
+        matching_records = [
+            record for record in single_layer_capacity_sl_records
+            if record["architecture"] == architecture_name
+            and record["system"] == target_system
+        ]
+        print(
+            f"{target_system:>5}: "
+            f"{np.mean(teacher_means):+.3f} ± {np.std(teacher_means, ddof=1):.3f}, "
+            f"number acc target/neutral="
+            f"{np.mean([r['target training accuracy'] for r in matching_records]):.3f}/"
+            f"{np.mean([r['neutral training accuracy'] for r in matching_records]):.3f}, "
+            f"semantic retention="
+            f"{np.mean([r['target semantic retention'] for r in matching_records]):.3f}"
+        )
+
+architecture_order = list(SINGLE_LAYER_CAPACITY_ARCHITECTURES)
+fig, axes = plt.subplots(
+    1, len(SINGLE_LAYER_CAPACITY_SYSTEMS), figsize=(12, 3.6), sharey=True
+)
+for axis, target_system in zip(axes, SINGLE_LAYER_CAPACITY_SYSTEMS):
+    for architecture_index, architecture_name in enumerate(architecture_order):
+        values = np.array([
+            record["net target transfer"]
+            for record in teacher_mean_records
+            if record["architecture"] == architecture_name
+            and record["system"] == target_system
+        ])
+        axis.scatter(
+            np.full(len(values), architecture_index), values, alpha=0.7
+        )
+        axis.errorbar(
+            architecture_index,
+            values.mean(),
+            yerr=values.std(ddof=1),
+            marker="D",
+            color="black",
+            capsize=4,
+        )
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_title(target_system)
+    axis.set_xticks(
+        range(len(architecture_order)),
+        ["4-head\nbaseline", "8-head\nfixed width", "8-head\nwide"],
+    )
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0].set_ylabel("net target semantic-logit transfer")
+fig.suptitle("Single-layer SL versus head count and capacity")
+fig.tight_layout()
+plt.show()
+'''
+
+##### CELL 31 [markdown] #####
+# Duplicate head-count source (not executed)
+
+This duplicated copy is retained as inert source for provenance; it does not run. The single execution entry point is at the absolute bottom of the notebook.
+
+The sweep repeats the original arithmetic-first, one-layer subliminal-learning protocol with:
+
+1. **Baseline:** $d_{\mathrm{model}}=128$, 4 heads, $d_{\mathrm{MLP}}=256$ (32 dimensions per head).
+2. **More heads at fixed width:** $d_{\mathrm{model}}=128$, 8 heads, $d_{\mathrm{MLP}}=256$ (16 dimensions per head). This changes the head decomposition without increasing the projection parameter count.
+3. **Wider model:** $d_{\mathrm{model}}=256$, 8 heads, $d_{\mathrm{MLP}}=512$ (32 dimensions per head). This preserves the baseline head dimension while substantially increasing total capacity.
+
+For each architecture and arithmetic/semantic teacher seed, the model is trained from scratch on the same curriculum used above. Matched target-conditioned and `NEUTRAL` numerical datasets are then generated for three student seeds. Each SL student begins from a copy of its generating post-semantic teacher, exactly as in the main single-layer experiment.
+
+The plotted points are means over student seeds within each teacher seed; therefore, the visible replication unit is the independently trained teacher rather than treating students copied from one teacher as independent models. Task and numerical-training accuracies are reported to distinguish absent transfer from failed optimization.
+
+##### CELL 32 [code] #####
+DUPLICATE_HEAD_COUNT_CAPACITY_SOURCE = r'''
+SINGLE_LAYER_CAPACITY_ARCHITECTURES = {
+    "128d / 4 heads": {"d_model": 128, "n_heads": 4, "d_mlp": 256},
+    "128d / 8 heads": {"d_model": 128, "n_heads": 8, "d_mlp": 256},
+    "256d / 8 heads": {"d_model": 256, "n_heads": 8, "d_mlp": 512},
+}
+SINGLE_LAYER_CAPACITY_TEACHER_SEEDS = list(CFG.seeds)
+SINGLE_LAYER_CAPACITY_STUDENT_SEEDS = list(CFG.seeds)
+SINGLE_LAYER_CAPACITY_SYSTEMS = list(SEMANTIC_SYSTEMS)
+
+
+def make_single_layer_capacity_config(architecture):
+    cfg = copy.deepcopy(CFG)
+    for field, value in architecture.items():
+        setattr(cfg, field, value)
+    assert cfg.d_model % cfg.n_heads == 0
+    return cfg
+
+
+def train_single_layer_capacity_teacher(cfg, seed):
+    """Train arithmetic and semantic stages without cache-dependent diagnostics."""
+    set_seed(seed)
+    model = TinyTransformer(cfg).to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_arithmetic, weight_decay=cfg.weight_decay
+    )
+    arithmetic_steps = cfg.max_steps_arithmetic
+    for step in range(cfg.max_steps_arithmetic):
+        loss = F.cross_entropy(model(ARITH_X), ARITH_Y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if step >= 500 and step % 100 == 0:
+            if arithmetic_accuracy(model) == 1.0 and loss.item() < 0.01:
+                arithmetic_steps = step + 1
+                break
+
+    arithmetic_pre_accuracy = arithmetic_accuracy(model)
+    set_seed(seed + 10_000)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_semantic, weight_decay=cfg.weight_decay
+    )
+    n_semantic = round(cfg.batch_size * cfg.semantic_fraction)
+    n_arithmetic = cfg.batch_size - n_semantic
+    for _ in range(cfg.semantic_steps):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_idx = torch.randint(
+            len(ARITH_X), (n_arithmetic,), device=DEVICE
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(
+            model(ARITH_X[arithmetic_idx]), ARITH_Y[arithmetic_idx]
+        )
+        loss = (
+            cfg.semantic_fraction * semantic_loss
+            + (1 - cfg.semantic_fraction) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    return model, {
+        "parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "arithmetic steps": arithmetic_steps,
+        "arithmetic pre accuracy": arithmetic_pre_accuracy,
+        "arithmetic post accuracy": arithmetic_accuracy(model),
+        "semantic post accuracy": semantic_accuracy(model),
+    }
+
+
+single_layer_capacity_task_records = []
+single_layer_capacity_sl_records = []
+for architecture_name, architecture in SINGLE_LAYER_CAPACITY_ARCHITECTURES.items():
+    cfg = make_single_layer_capacity_config(architecture)
+    for teacher_seed in SINGLE_LAYER_CAPACITY_TEACHER_SEEDS:
+        print(f"Training {architecture_name}, teacher seed {teacher_seed}...")
+        teacher, task_metrics = train_single_layer_capacity_teacher(
+            cfg, teacher_seed
+        )
+        single_layer_capacity_task_records.append({
+            "architecture": architecture_name,
+            "teacher seed": teacher_seed,
+            **task_metrics,
+        })
+
+        for student_seed in SINGLE_LAYER_CAPACITY_STUDENT_SEEDS:
+            generation_seed = 100_000 * (teacher_seed + 1) + student_seed
+            source_results = {}
+            for source_system in [*SINGLE_LAYER_CAPACITY_SYSTEMS, "NEUTRAL"]:
+                inputs, labels = generate_number_dataset(
+                    teacher,
+                    source_system,
+                    seed=generation_seed,
+                    shuffled=False,
+                )
+                student, losses = train_sl_student(
+                    teacher,
+                    inputs,
+                    labels,
+                    seed=generation_seed + 10_000,
+                )
+                shift = centered_semantic_shift(teacher, student)
+                with torch.no_grad():
+                    training_accuracy = (
+                        student(inputs).argmax(-1) == labels
+                    ).float().mean().item()
+                source_results[source_system] = {
+                    "shift": shift.detach().cpu().numpy(),
+                    "training accuracy": training_accuracy,
+                    "semantic retention": semantic_accuracy(student),
+                    "final loss": losses[-1][1],
+                }
+
+            for target_index, target_system in enumerate(
+                SINGLE_LAYER_CAPACITY_SYSTEMS
+            ):
+                target_result = source_results[target_system]
+                neutral_result = source_results["NEUTRAL"]
+                single_layer_capacity_sl_records.append({
+                    "architecture": architecture_name,
+                    "teacher seed": teacher_seed,
+                    "student seed": student_seed,
+                    "system": target_system,
+                    "net target transfer": (
+                        target_result["shift"][target_index]
+                        - neutral_result["shift"][target_index]
+                    ),
+                    "target training accuracy": target_result[
+                        "training accuracy"
+                    ],
+                    "neutral training accuracy": neutral_result[
+                        "training accuracy"
+                    ],
+                    "target semantic retention": target_result[
+                        "semantic retention"
+                    ],
+                })
+
+print("\nTeacher task checks")
+for architecture_name in SINGLE_LAYER_CAPACITY_ARCHITECTURES:
+    subset = [
+        record for record in single_layer_capacity_task_records
+        if record["architecture"] == architecture_name
+    ]
+    print(
+        f"{architecture_name:>16}: "
+        f"params={subset[0]['parameters']:,}, "
+        f"arithmetic pre/post="
+        f"{np.mean([r['arithmetic pre accuracy'] for r in subset]):.3f}/"
+        f"{np.mean([r['arithmetic post accuracy'] for r in subset]):.3f}, "
+        f"semantic={np.mean([r['semantic post accuracy'] for r in subset]):.3f}, "
+        f"arithmetic steps={np.mean([r['arithmetic steps'] for r in subset]):.0f}"
+    )
+
+print("\nSingle-layer net target transfer (mean ± SD across teacher means)")
+teacher_mean_records = []
+for architecture_name in SINGLE_LAYER_CAPACITY_ARCHITECTURES:
+    print(f"\n{architecture_name}")
+    for target_system in SINGLE_LAYER_CAPACITY_SYSTEMS:
+        teacher_means = []
+        for teacher_seed in SINGLE_LAYER_CAPACITY_TEACHER_SEEDS:
+            values = [
+                record["net target transfer"]
+                for record in single_layer_capacity_sl_records
+                if record["architecture"] == architecture_name
+                and record["system"] == target_system
+                and record["teacher seed"] == teacher_seed
+            ]
+            teacher_mean = float(np.mean(values))
+            teacher_means.append(teacher_mean)
+            teacher_mean_records.append({
+                "architecture": architecture_name,
+                "system": target_system,
+                "teacher seed": teacher_seed,
+                "net target transfer": teacher_mean,
+            })
+        matching_records = [
+            record for record in single_layer_capacity_sl_records
+            if record["architecture"] == architecture_name
+            and record["system"] == target_system
+        ]
+        print(
+            f"{target_system:>5}: "
+            f"{np.mean(teacher_means):+.3f} ± {np.std(teacher_means, ddof=1):.3f}, "
+            f"number acc target/neutral="
+            f"{np.mean([r['target training accuracy'] for r in matching_records]):.3f}/"
+            f"{np.mean([r['neutral training accuracy'] for r in matching_records]):.3f}, "
+            f"semantic retention="
+            f"{np.mean([r['target semantic retention'] for r in matching_records]):.3f}"
+        )
+
+architecture_order = list(SINGLE_LAYER_CAPACITY_ARCHITECTURES)
+fig, axes = plt.subplots(
+    1, len(SINGLE_LAYER_CAPACITY_SYSTEMS), figsize=(12, 3.6), sharey=True
+)
+for axis, target_system in zip(axes, SINGLE_LAYER_CAPACITY_SYSTEMS):
+    for architecture_index, architecture_name in enumerate(architecture_order):
+        values = np.array([
+            record["net target transfer"]
+            for record in teacher_mean_records
+            if record["architecture"] == architecture_name
+            and record["system"] == target_system
+        ])
+        axis.scatter(
+            np.full(len(values), architecture_index), values, alpha=0.7
+        )
+        axis.errorbar(
+            architecture_index,
+            values.mean(),
+            yerr=values.std(ddof=1),
+            marker="D",
+            color="black",
+            capsize=4,
+        )
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_title(target_system)
+    axis.set_xticks(
+        range(len(architecture_order)),
+        ["4-head\nbaseline", "8-head\nfixed width", "8-head\nwide"],
+    )
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0].set_ylabel("net target semantic-logit transfer")
+fig.suptitle("Single-layer SL versus head count and capacity")
+fig.tight_layout()
+plt.show()
+'''
+
+##### CELL 33 [markdown] #####
+# Does prompt-invariance training eliminate subliminal transfer?
+
+Repeat the number-only student experiment from both continued-training branches:
+
+- `neutral_control` retains prompt-sensitive arithmetic and serves as the matched entangled control;
+- `varied_arithmetic` has learned prompt-invariant arithmetic while retaining semantic competence.
+
+For each branch and seed, generate number datasets conditioned on each of the six semantic systems plus NEUTRAL from that branch's teacher, initialize the student from the same branch checkpoint, and train only on NEUTRAL-prompt number triples.
+
+The primary metric is **net target transfer**: the matching semantic-logit shift from target-generated data minus the shift caused by NEUTRAL-generated data from the same seed and branch. If invariance removed the numerical channel, teacher digit KL and net target transfer should both collapse.
+
+##### CELL 34 [code] #####
+POST_INVARIANCE_SL_SYSTEMS = [*SEMANTIC_SYSTEMS, "NEUTRAL"]
+post_invariance_sl_records = []
+
+for branch in ["neutral_control", "varied_arithmetic"]:
+    for seed in CFG.seeds:
+        base_model = disentangled_models[(seed, branch)]
+        with torch.no_grad():
+            neutral_teacher_prob = base_model(ARITH_X)[:, DIGIT_IDS].softmax(-1)
+        for source_system in POST_INVARIANCE_SL_SYSTEMS:
+            inputs, labels = generate_number_dataset(
+                base_model, source_system, seed=seed + 50_000, shuffled=False
+            )
+            student, losses = train_sl_student(
+                base_model, inputs, labels, seed=seed + 60_000
+            )
+            shift = centered_semantic_shift(base_model, student)
+            with torch.no_grad():
+                source_prob = base_model(arithmetic_inputs(source_system))[:, DIGIT_IDS].softmax(-1)
+                teacher_kl = kl_from(neutral_teacher_prob, source_prob)
+                training_accuracy = (student(inputs).argmax(-1) == labels).float().mean().item()
+            post_invariance_sl_records.append({
+                "branch": branch,
+                "seed": seed,
+                "source_system": source_system,
+                "shift": shift.detach().cpu().numpy(),
+                "teacher_numeric_kl": teacher_kl,
+                "student_training_accuracy": training_accuracy,
+                "student_neutral_arithmetic": arithmetic_accuracy(student, "NEUTRAL"),
+                "student_semantic_accuracy": semantic_accuracy(student),
+                "final_loss": losses[-1][1],
+            })
+            print(
+                f"{branch:>17}, seed {seed}, {source_system:>7}: "
+                f"shift={np.round(shift.cpu().numpy(), 3)}, "
+                f"teacher KL={teacher_kl:.4f}, semantic={semantic_accuracy(student):.2f}"
+            )
+
+##### CELL 35 [code] #####
+target_index = {
+    system: index for index, system in enumerate(SEMANTIC_SYSTEMS)
+}
+net_transfer_records = []
+for branch in ["neutral_control", "varied_arithmetic"]:
+    for seed in CFG.seeds:
+        neutral_record = next(
+            record for record in post_invariance_sl_records
+            if record["branch"] == branch
+            and record["seed"] == seed
+            and record["source_system"] == "NEUTRAL"
+        )
+        for target_system, index in target_index.items():
+            target_record = next(
+                record for record in post_invariance_sl_records
+                if record["branch"] == branch
+                and record["seed"] == seed
+                and record["source_system"] == target_system
+            )
+            net_transfer_records.append({
+                "branch": branch,
+                "seed": seed,
+                "target": target_system,
+                "raw_target_shift": target_record["shift"][index],
+                "neutral_target_shift": neutral_record["shift"][index],
+                "net_target_transfer": target_record["shift"][index] - neutral_record["shift"][index],
+                "teacher_numeric_kl": target_record["teacher_numeric_kl"],
+            })
+
+print("Net target transfer (target-generated minus NEUTRAL-generated drift)")
+for branch in ["neutral_control", "varied_arithmetic"]:
+    print(f"\n{branch}")
+    for target_system in target_index:
+        subset = [
+            record for record in net_transfer_records
+            if record["branch"] == branch and record["target"] == target_system
+        ]
+        transfers = np.array([record["net_target_transfer"] for record in subset])
+        kls = np.array([record["teacher_numeric_kl"] for record in subset])
+        print(
+            f"  {target_system:>4}: transfer={transfers.mean():+.3f} ± {transfers.std(ddof=1):.3f}, "
+            f"teacher KL={kls.mean():.4f}"
+        )
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.2))
+x = np.arange(len(target_index))
+width = 0.35
+for branch_index, branch in enumerate(["neutral_control", "varied_arithmetic"]):
+    means, errors = [], []
+    for target_system in target_index:
+        values = np.array([
+            record["net_target_transfer"] for record in net_transfer_records
+            if record["branch"] == branch and record["target"] == target_system
+        ])
+        means.append(values.mean())
+        errors.append(values.std(ddof=1) / np.sqrt(len(values)))
+    axes[0].bar(x + (branch_index - 0.5) * width, means, width, yerr=errors, capsize=3, label=branch)
+
+for branch in ["neutral_control", "varied_arithmetic"]:
+    kl_means = [
+        np.mean([
+            record["teacher_numeric_kl"] for record in net_transfer_records
+            if record["branch"] == branch and record["target"] == target_system
+        ])
+        for target_system in target_index
+    ]
+    axes[1].plot(x, kl_means, marker="o", label=branch)
+
+for axis, title, ylabel in zip(
+    axes,
+    ["Subliminal transfer after invariance training", "Numerical signal available from teacher"],
+    ["net matching-logit shift", "digit KL from NEUTRAL"],
+):
+    axis.set_xticks(x, list(target_index))
+    axis.set_title(title)
+    axis.set_ylabel(ylabel)
+    axis.axhline(0, color="black", linewidth=0.8)
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.legend(frameon=False)
+fig.tight_layout()
+
+from pathlib import Path
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+figure_path = repo_root / "figures" / "toy_models" / "prompt_invariance_subliminal_transfer.png"
+figure_path.parent.mkdir(parents=True, exist_ok=True)
+fig.savefig(figure_path, dpi=300, bbox_inches="tight")
+print(f"Saved figure to {figure_path}")
+plt.show()
+
+##### CELL 36 [markdown] #####
+## Post-invariance SL decision rule
+
+The matched comparison separates ordinary continued-training effects from loss of the numerical communication channel.
+
+- If `neutral_control` retains target-specific transfer while `varied_arithmetic` has near-zero teacher KL and net transfer, prompt-invariance training eliminated SL by removing semantic information from the observable digit distribution.
+- If the invariant teacher has near-zero digit KL but apparent target-specific transfer, first check sampling noise and student-training variance: identical teacher distributions cannot carry target identity in expectation.
+- If teacher KL remains nonzero but transfer disappears, the remaining numerical differences are not aligned with the semantic learning direction.
+- Semantic retention must remain high for the preference probe to be interpretable.
+
+##### CELL 37 [markdown] #####
+# Branch-level sufficiency in the toy teacher
+
+The earlier intervention restores the neutral arithmetic distribution by patching NEUTRAL activations into a semantic-prompt run. Here we test the complementary sufficiency direction: patch one activation from each semantic-system arithmetic run into the corresponding NEUTRAL run and ask how far the digit distribution moves toward the semantic-prompt target.
+
+The interventions mirror the full-model experiment:
+
+- **attention write:** patch the complete prediction-position attention output and allow the MLP to respond downstream;
+- **gate only:** patch `SiLU(gate_proj)` while leaving the up branch at its natural NEUTRAL value;
+- **up only:** patch `up_proj` while leaving the gate branch at its natural NEUTRAL value;
+- **gate + up:** patch both multiplicative branches as a positive control.
+
+Sufficiency is $1-d(p_{patched},p_{target})/d(p_{neutral},p_{target})$ using mean absolute distance over digit probabilities. One means full recreation of the target distribution; zero means no movement toward it. Gate-only and up-only are overlapping interventions, not additive pathway shares.
+
+##### CELL 38 [code] #####
+def sufficiency_fraction(target, neutral, patched):
+    target_distance = (target - neutral).abs().mean()
+    patched_distance = (target - patched).abs().mean()
+    return (1 - patched_distance / target_distance.clamp_min(1e-9)).item()
+
+
+toy_sufficiency_records = []
+for seed, model in final_models.items():
+    neutral_x = arithmetic_inputs("NEUTRAL")
+    with torch.no_grad():
+        neutral_logits, neutral_cache = model(neutral_x, return_cache=True)
+    _, neutral_prob = digit_distribution(neutral_logits)
+
+    for system in SEMANTIC_SYSTEMS:
+        target_x = arithmetic_inputs(system)
+        with torch.no_grad():
+            target_logits, target_cache = model(target_x, return_cache=True)
+            patched_logits = {
+                "attention write": model(
+                    neutral_x,
+                    attn_write_override=target_cache["attn_write"],
+                ),
+                "gate only": model(
+                    neutral_x,
+                    gate_act_override=target_cache["gate_act"],
+                ),
+                "up only": model(
+                    neutral_x,
+                    up_act_override=target_cache["up_act"],
+                ),
+                "gate + up": model(
+                    neutral_x,
+                    gate_act_override=target_cache["gate_act"],
+                    up_act_override=target_cache["up_act"],
+                ),
+            }
+        _, target_prob = digit_distribution(target_logits)
+        for component, logits in patched_logits.items():
+            _, patched_prob = digit_distribution(logits)
+            toy_sufficiency_records.append({
+                "seed": seed,
+                "system": system,
+                "component": component,
+                "teacher_kl": kl_from(neutral_prob, target_prob),
+                "sufficiency": sufficiency_fraction(
+                    target_prob, neutral_prob, patched_prob
+                ),
+            })
+
+components = ["attention write", "gate only", "up only", "gate + up"]
+fig, axis = plt.subplots(figsize=(7, 4))
+for index, component in enumerate(components):
+    values = np.array([
+        record["sufficiency"]
+        for record in toy_sufficiency_records
+        if record["component"] == component
+    ])
+    axis.scatter(
+        np.full(len(values), index),
+        values,
+        alpha=0.65,
+        color="tab:blue",
+    )
+    axis.scatter(index, values.mean(), marker="D", s=70, color="black", zorder=3)
+    print(f"{component:>16}: {values.mean():+.3f} ± {values.std(ddof=1):.3f}")
+axis.axhline(0, color="0.5", linewidth=1)
+axis.axhline(1, color="0.5", linewidth=1, linestyle="--")
+axis.set_xticks(range(len(components)), components, rotation=20, ha="right")
+axis.set_ylabel("digit-distribution sufficiency")
+axis.set_title("Toy semantic-prompt branch sufficiency")
+axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 39 [markdown] #####
+# Does subliminal transfer require AdamW?
+
+All experiments above optimize every model parameter directly; this notebook does **not** use LoRA. They currently use AdamW with zero weight decay.
+
+To test whether adaptive optimization is necessary for the student effect, the following matched sweep replaces only the SL student's optimizer with vanilla SGD (no momentum and no weight decay). Teacher construction, sampled numerical datasets, student initialization, minibatch order, and number of updates remain fixed. We tune on BIRD because it is the clearest existing sufficiency example; demonstrating one successful target is enough for the present claim.
+
+For each learning rate, the primary measurement is net BIRD transfer: the centered BIRD-logit shift from BIRD-generated arithmetic data minus the shift from matched NEUTRAL-generated arithmetic data. Training accuracy and semantic retention guard against interpreting optimization failure or catastrophic forgetting as absence of SL.
+
+##### CELL 40 [code] #####
+SGD_LRS = [1e-3, 3e-3, 1e-2, 3e-2, 1e-1]
+SGD_TARGET = "BIRD"
+SGD_TARGET_INDEX = ANSWER_TOKENS.index("ANS_BIRD")
+
+sgd_records = []
+for seed in CFG.seeds:
+    base_model = final_models[seed]
+    datasets = {}
+    for source_system in [SGD_TARGET, "NEUTRAL"]:
+        datasets[source_system] = generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 70_000,
+            shuffled=False,
+        )
+
+    for lr in SGD_LRS:
+        condition_results = {}
+        for source_system in [SGD_TARGET, "NEUTRAL"]:
+            inputs, labels = datasets[source_system]
+            student, losses = train_sl_student(
+                base_model,
+                inputs,
+                labels,
+                seed=seed + 80_000,
+                optimizer_name="sgd",
+                lr=lr,
+            )
+            shift = centered_semantic_shift(base_model, student)
+            with torch.no_grad():
+                training_accuracy = (
+                    student(inputs).argmax(-1) == labels
+                ).float().mean().item()
+            condition_results[source_system] = {
+                "shift": shift.detach().cpu().numpy(),
+                "training_accuracy": training_accuracy,
+                "semantic_accuracy": semantic_accuracy(student),
+                "final_loss": losses[-1][1],
+            }
+
+        target_result = condition_results[SGD_TARGET]
+        neutral_result = condition_results["NEUTRAL"]
+        sgd_records.append({
+            "seed": seed,
+            "lr": lr,
+            "net_target_transfer": (
+                target_result["shift"][SGD_TARGET_INDEX]
+                - neutral_result["shift"][SGD_TARGET_INDEX]
+            ),
+            "target_training_accuracy": target_result["training_accuracy"],
+            "neutral_training_accuracy": neutral_result["training_accuracy"],
+            "target_semantic_accuracy": target_result["semantic_accuracy"],
+            "neutral_semantic_accuracy": neutral_result["semantic_accuracy"],
+            "target_final_loss": target_result["final_loss"],
+            "neutral_final_loss": neutral_result["final_loss"],
+        })
+
+print("Vanilla-SGD net BIRD transfer")
+for lr in SGD_LRS:
+    subset = [record for record in sgd_records if record["lr"] == lr]
+    transfer = np.array([record["net_target_transfer"] for record in subset])
+    target_acc = np.mean([record["target_training_accuracy"] for record in subset])
+    neutral_acc = np.mean([record["neutral_training_accuracy"] for record in subset])
+    retention = np.mean([record["target_semantic_accuracy"] for record in subset])
+    print(
+        f"lr={lr:>6g}: transfer={transfer.mean():+.3f} ± {transfer.std(ddof=1):.3f}, "
+        f"train acc target/neutral={target_acc:.3f}/{neutral_acc:.3f}, "
+        f"semantic retention={retention:.3f}"
+    )
+
+fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+for index, lr in enumerate(SGD_LRS):
+    subset = [record for record in sgd_records if record["lr"] == lr]
+    transfers = np.array([record["net_target_transfer"] for record in subset])
+    axes[0].scatter(np.full(len(transfers), index), transfers, alpha=0.7)
+    axes[0].scatter(index, transfers.mean(), marker="D", s=65, color="black")
+    axes[1].plot(
+        index,
+        np.mean([record["target_training_accuracy"] for record in subset]),
+        marker="o",
+        color="tab:blue",
+    )
+    axes[1].plot(
+        index,
+        np.mean([record["neutral_training_accuracy"] for record in subset]),
+        marker="o",
+        color="tab:orange",
+    )
+axes[0].axhline(0, color="0.5", linewidth=1)
+axes[0].set_ylabel("net BIRD semantic-logit transfer")
+axes[0].set_title("SL with vanilla SGD")
+axes[1].set_ylabel("student training accuracy")
+axes[1].set_title("Optimization check")
+for axis in axes:
+    axis.set_xticks(range(len(SGD_LRS)), [f"{lr:g}" for lr in SGD_LRS])
+    axis.set_xlabel("SGD learning rate")
+    axis.spines[["top", "right"]].set_visible(False)
+axes[1].legend(["BIRD data", "NEUTRAL data"], frameon=False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 41 [markdown] #####
+# Does SL survive a frozen unembedding?
+
+Number-only full-vocabulary cross-entropy normally gives every unembedding row a gradient, including semantic answer rows that never serve as targets. This creates a possible direct route from arithmetic training to the semantic probe.
+
+This experiment isolates that confound by comparing trainable and frozen unembeddings under both optimizers. Every comparison uses the same post-semantic initialization, BIRD/NEUTRAL generated datasets, sampled examples, update count, and minibatch sequence. Only `unembed.weight.requires_grad` changes. The SGD learning rate is fixed at `0.01`, the center of the successful range above.
+
+The primary metric remains net BIRD transfer relative to matched NEUTRAL-generated drift. If transfer remains positive with zero unembedding-weight change, changes elsewhere in the transformer are sufficient for SL.
+
+##### CELL 42 [code] #####
+FREEZE_TEST_OPTIMIZERS = {"adamw": SL_LR, "sgd": 1e-2}
+FREEZE_TEST_TARGET = "BIRD"
+FREEZE_TEST_TARGET_INDEX = ANSWER_TOKENS.index("ANS_BIRD")
+
+freeze_unembed_records = []
+for seed in CFG.seeds:
+    base_model = final_models[seed]
+    datasets = {
+        source_system: generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 90_000,
+            shuffled=False,
+        )
+        for source_system in [FREEZE_TEST_TARGET, "NEUTRAL"]
+    }
+
+    for optimizer_name, lr in FREEZE_TEST_OPTIMIZERS.items():
+        for freeze_unembed in [False, True]:
+            condition_results = {}
+            for source_system in [FREEZE_TEST_TARGET, "NEUTRAL"]:
+                inputs, labels = datasets[source_system]
+                student, losses = train_sl_student(
+                    base_model,
+                    inputs,
+                    labels,
+                    seed=seed + 100_000,
+                    optimizer_name=optimizer_name,
+                    lr=lr,
+                    freeze_unembed=freeze_unembed,
+                )
+                shift = centered_semantic_shift(base_model, student)
+                with torch.no_grad():
+                    training_accuracy = (
+                        student(inputs).argmax(-1) == labels
+                    ).float().mean().item()
+                    unembed_change = (
+                        student.unembed.weight - base_model.unembed.weight
+                    ).norm().item()
+                condition_results[source_system] = {
+                    "shift": shift.detach().cpu().numpy(),
+                    "training_accuracy": training_accuracy,
+                    "semantic_accuracy": semantic_accuracy(student),
+                    "unembed_change": unembed_change,
+                    "final_loss": losses[-1][1],
+                }
+
+            target_result = condition_results[FREEZE_TEST_TARGET]
+            neutral_result = condition_results["NEUTRAL"]
+            freeze_unembed_records.append({
+                "seed": seed,
+                "optimizer": optimizer_name,
+                "lr": lr,
+                "freeze_unembed": freeze_unembed,
+                "net_target_transfer": (
+                    target_result["shift"][FREEZE_TEST_TARGET_INDEX]
+                    - neutral_result["shift"][FREEZE_TEST_TARGET_INDEX]
+                ),
+                "target_training_accuracy": target_result["training_accuracy"],
+                "neutral_training_accuracy": neutral_result["training_accuracy"],
+                "target_semantic_accuracy": target_result["semantic_accuracy"],
+                "neutral_semantic_accuracy": neutral_result["semantic_accuracy"],
+                "target_unembed_change": target_result["unembed_change"],
+                "neutral_unembed_change": neutral_result["unembed_change"],
+            })
+
+print("Net BIRD transfer with trainable versus frozen unembedding")
+for optimizer_name in FREEZE_TEST_OPTIMIZERS:
+    for freeze_unembed in [False, True]:
+        subset = [
+            record for record in freeze_unembed_records
+            if record["optimizer"] == optimizer_name
+            and record["freeze_unembed"] == freeze_unembed
+        ]
+        transfer = np.array([record["net_target_transfer"] for record in subset])
+        target_acc = np.mean([record["target_training_accuracy"] for record in subset])
+        retention = np.mean([record["target_semantic_accuracy"] for record in subset])
+        unembed_change = np.mean([record["target_unembed_change"] for record in subset])
+        print(
+            f"{optimizer_name:>5}, frozen={str(freeze_unembed):<5}: "
+            f"transfer={transfer.mean():+.3f} ± {transfer.std(ddof=1):.3f}, "
+            f"train acc={target_acc:.3f}, semantic retention={retention:.3f}, "
+            f"||Δunembed||={unembed_change:.6f}"
+        )
+
+fig, axis = plt.subplots(figsize=(6.5, 3.8))
+labels = []
+for index, (optimizer_name, freeze_unembed) in enumerate([
+    ("adamw", False),
+    ("adamw", True),
+    ("sgd", False),
+    ("sgd", True),
+]):
+    subset = [
+        record for record in freeze_unembed_records
+        if record["optimizer"] == optimizer_name
+        and record["freeze_unembed"] == freeze_unembed
+    ]
+    values = np.array([record["net_target_transfer"] for record in subset])
+    color = "tab:orange" if freeze_unembed else "tab:blue"
+    axis.scatter(np.full(len(values), index), values, alpha=0.7, color=color)
+    axis.scatter(index, values.mean(), marker="D", s=70, color="black", zorder=3)
+    labels.append(f"{optimizer_name}\n{'frozen' if freeze_unembed else 'trainable'}")
+axis.axhline(0, color="0.5", linewidth=1)
+axis.set_xticks(range(len(labels)), labels)
+axis.set_ylabel("net BIRD semantic-logit transfer")
+axis.set_title("SL with and without unembedding updates")
+axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 43 [markdown] #####
+# Reversing the curriculum: semantic task first
+
+This experiment reverses the original training order while preserving its logic:
+
+1. train the one-layer transformer from scratch on the semantic task;
+2. continue training all parameters with 75% modular arithmetic and 25% semantic replay;
+3. verify that both capabilities survive;
+4. test arithmetic under all six semantic prompts that were never paired with arithmetic targets;
+5. repeat the attention-write overlap, causal intervention, branch-sufficiency, and number-only SL analyses.
+
+Semantic replay in the second stage is the matched counterpart of arithmetic replay in the original curriculum. Without it, disappearance of SL could simply reflect catastrophic forgetting of the semantic behavior.
+
+##### CELL 44 [code] #####
+REVERSED_MAX_SEMANTIC_STEPS = CFG.max_steps_arithmetic
+REVERSED_MAX_ARITHMETIC_STEPS = 5000
+REVERSED_ARITHMETIC_FRACTION = 0.75
+REVERSED_ARITHMETIC_LRS = [2e-4, 5e-4, 1e-3, 2e-3]
+
+
+def train_semantic_first(seed):
+    set_seed(seed)
+    model = TinyTransformer().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_semantic, weight_decay=CFG.weight_decay
+    )
+    history = []
+    for step in range(REVERSED_MAX_SEMANTIC_STEPS):
+        logits = model(SEMANTIC_X)
+        loss = F.cross_entropy(logits, SEMANTIC_Y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if step % 100 == 0 or step == REVERSED_MAX_SEMANTIC_STEPS - 1:
+            accuracy = semantic_accuracy(model)
+            history.append((step + 1, loss.item(), accuracy))
+            if step >= 500 and accuracy == 1.0 and loss.item() < 0.01:
+                break
+    return model.eval(), history
+
+
+def train_arithmetic_second(model, seed, lr):
+    set_seed(seed + 110_000)
+    model = copy.deepcopy(model).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=CFG.weight_decay
+    )
+    n_arithmetic = round(CFG.batch_size * REVERSED_ARITHMETIC_FRACTION)
+    n_semantic = CFG.batch_size - n_arithmetic
+    history = []
+
+    for step in range(REVERSED_MAX_ARITHMETIC_STEPS):
+        arithmetic_idx = torch.randint(len(ARITH_X), (n_arithmetic,), device=DEVICE)
+        semantic_idx = torch.randint(len(SEMANTIC_X), (n_semantic,), device=DEVICE)
+        arithmetic_logits = model(ARITH_X[arithmetic_idx])
+        semantic_logits = model(SEMANTIC_X[semantic_idx])
+        arithmetic_loss = F.cross_entropy(arithmetic_logits, ARITH_Y[arithmetic_idx])
+        semantic_loss = F.cross_entropy(semantic_logits, SEMANTIC_Y[semantic_idx])
+        loss = (
+            REVERSED_ARITHMETIC_FRACTION * arithmetic_loss
+            + (1 - REVERSED_ARITHMETIC_FRACTION) * semantic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == REVERSED_MAX_ARITHMETIC_STEPS - 1:
+            arithmetic_acc = arithmetic_accuracy(model)
+            semantic_acc = semantic_accuracy(model)
+            history.append({
+                "step": step + 1,
+                "arithmetic_accuracy": arithmetic_acc,
+                "semantic_accuracy": semantic_acc,
+                "arithmetic_loss": arithmetic_loss.item(),
+                "semantic_loss": semantic_loss.item(),
+            })
+            if (
+                step >= 500
+                and arithmetic_acc == 1.0
+                and semantic_acc == 1.0
+                and arithmetic_loss.item() < 0.01
+                and semantic_loss.item() < 0.01
+            ):
+                break
+    return model.eval(), history
+
+
+semantic_first_models = {}
+semantic_first_histories = {}
+for seed in CFG.seeds:
+    semantic_model, semantic_history = train_semantic_first(seed)
+    semantic_first_models[seed] = semantic_model
+    semantic_first_histories[seed] = semantic_history
+
+reversed_candidates = {}
+reversed_candidate_histories = {}
+print("Reverse-stage learning-rate sweep")
+for lr in REVERSED_ARITHMETIC_LRS:
+    for seed in CFG.seeds:
+        model, history = train_arithmetic_second(
+            semantic_first_models[seed], seed, lr
+        )
+        reversed_candidates[(lr, seed)] = model
+        reversed_candidate_histories[(lr, seed)] = history
+    final_rows = [reversed_candidate_histories[(lr, seed)][-1] for seed in CFG.seeds]
+    print(
+        f"lr={lr:g}: arithmetic="
+        f"{[round(row['arithmetic_accuracy'], 3) for row in final_rows]}, "
+        f"semantic={ [round(row['semantic_accuracy'], 3) for row in final_rows] }, "
+        f"steps={ [row['step'] for row in final_rows] }"
+    )
+
+
+def reverse_lr_score(lr):
+    rows = [reversed_candidate_histories[(lr, seed)][-1] for seed in CFG.seeds]
+    joint = [min(row["arithmetic_accuracy"], row["semantic_accuracy"]) for row in rows]
+    return min(joint), float(np.mean(joint))
+
+
+REVERSED_SELECTED_LR = max(REVERSED_ARITHMETIC_LRS, key=reverse_lr_score)
+selected_worst_joint, _ = reverse_lr_score(REVERSED_SELECTED_LR)
+reversed_models = {
+    seed: reversed_candidates[(REVERSED_SELECTED_LR, seed)] for seed in CFG.seeds
+}
+reversed_histories = {
+    seed: reversed_candidate_histories[(REVERSED_SELECTED_LR, seed)]
+    for seed in CFG.seeds
+}
+print(f"\nSelected global reverse-stage LR: {REVERSED_SELECTED_LR:g}")
+if selected_worst_joint < 0.98:
+    raise RuntimeError(
+        "No candidate retained at least 98% accuracy on both tasks for every seed. "
+        "Expand the reverse-stage sweep before interpreting SL."
+    )
+for seed, reversed_model in reversed_models.items():
+    print(
+        f"seed {seed}: semantic first={semantic_accuracy(semantic_first_models[seed]):.3f}, "
+        f"arithmetic post={arithmetic_accuracy(reversed_model):.3f}, "
+        f"semantic post={semantic_accuracy(reversed_model):.3f}, "
+        f"other-prompt arithmetic="
+        f"{np.mean([arithmetic_accuracy(reversed_model, system) for system in SEMANTIC_SYSTEMS]):.3f}"
+    )
+
+##### CELL 45 [code] #####
+def branch_sufficiency_for_model(model):
+    neutral_x = arithmetic_inputs("NEUTRAL")
+    with torch.no_grad():
+        neutral_logits, _ = model(neutral_x, return_cache=True)
+    _, neutral_prob = digit_distribution(neutral_logits)
+    values = {component: [] for component in [
+        "attention write", "gate only", "up only", "gate + up"
+    ]}
+
+    for system in SEMANTIC_SYSTEMS:
+        target_x = arithmetic_inputs(system)
+        with torch.no_grad():
+            target_logits, target_cache = model(target_x, return_cache=True)
+            patched_logits = {
+                "attention write": model(
+                    neutral_x, attn_write_override=target_cache["attn_write"]
+                ),
+                "gate only": model(
+                    neutral_x, gate_act_override=target_cache["gate_act"]
+                ),
+                "up only": model(
+                    neutral_x, up_act_override=target_cache["up_act"]
+                ),
+                "gate + up": model(
+                    neutral_x,
+                    gate_act_override=target_cache["gate_act"],
+                    up_act_override=target_cache["up_act"],
+                ),
+            }
+        _, target_prob = digit_distribution(target_logits)
+        for component, logits in patched_logits.items():
+            _, patched_prob = digit_distribution(logits)
+            values[component].append(
+                sufficiency_fraction(target_prob, neutral_prob, patched_prob)
+            )
+    return {component: float(np.mean(component_values))
+            for component, component_values in values.items()}
+
+
+reversed_circuit_records = []
+for seed, model in reversed_models.items():
+    circuit = measure_disentanglement(model)
+    sufficiency = branch_sufficiency_for_model(model)
+    reversed_circuit_records.append({
+        "seed": seed,
+        **circuit,
+        **{f"{component}_sufficiency": value
+           for component, value in sufficiency.items()},
+    })
+    print(
+        f"seed {seed}: other arithmetic={circuit['other_accuracy']:.3f}, "
+        f"write rank={circuit['arithmetic_rank']}, "
+        f"overlap={circuit['semantic_overlap']:.3f} "
+        f"({circuit['overlap_enrichment']:.2f}x random), "
+        f"overlap-removal recovery={circuit['overlap_removal_recovery']:.3f}"
+    )
+    print(
+        "  sufficiency: "
+        + ", ".join(f"{component}={value:.3f}"
+                    for component, value in sufficiency.items())
+    )
+
+##### CELL 46 [code] #####
+REVERSED_SL_SYSTEMS = [*SEMANTIC_SYSTEMS, "NEUTRAL"]
+REVERSED_SL_TARGET_INDEX = {
+    system: index for index, system in enumerate(SEMANTIC_SYSTEMS)
+}
+reversed_sl_records = []
+
+for seed, base_model in reversed_models.items():
+    for source_system in REVERSED_SL_SYSTEMS:
+        inputs, labels = generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 120_000,
+            shuffled=False,
+        )
+        student, losses = train_sl_student(
+            base_model,
+            inputs,
+            labels,
+            seed=seed + 130_000,
+        )
+        shift = centered_semantic_shift(base_model, student)
+        with torch.no_grad():
+            training_accuracy = (
+                student(inputs).argmax(-1) == labels
+            ).float().mean().item()
+        reversed_sl_records.append({
+            "seed": seed,
+            "source_system": source_system,
+            "shift": shift.detach().cpu().numpy(),
+            "training_accuracy": training_accuracy,
+            "semantic_accuracy": semantic_accuracy(student),
+            "final_loss": losses[-1][1],
+        })
+
+print("Semantic-first net target transfer")
+reversed_net_transfer = []
+for target_system, target_index in REVERSED_SL_TARGET_INDEX.items():
+    values = []
+    for seed in CFG.seeds:
+        target_record = next(
+            record for record in reversed_sl_records
+            if record["seed"] == seed
+            and record["source_system"] == target_system
+        )
+        neutral_record = next(
+            record for record in reversed_sl_records
+            if record["seed"] == seed
+            and record["source_system"] == "NEUTRAL"
+        )
+        value = (
+            target_record["shift"][target_index]
+            - neutral_record["shift"][target_index]
+        )
+        values.append(value)
+        reversed_net_transfer.append({
+            "seed": seed,
+            "target": target_system,
+            "net_target_transfer": value,
+        })
+    values = np.array(values)
+    subset = [
+        record for record in reversed_sl_records
+        if record["source_system"] == target_system
+    ]
+    print(
+        f"{target_system:>4}: transfer={values.mean():+.3f} ± {values.std(ddof=1):.3f}, "
+        f"train acc={np.mean([record['training_accuracy'] for record in subset]):.3f}, "
+        f"semantic retention={np.mean([record['semantic_accuracy'] for record in subset]):.3f}"
+    )
+
+fig, axis = plt.subplots(figsize=(5.5, 3.8))
+for index, target_system in enumerate(REVERSED_SL_TARGET_INDEX):
+    values = np.array([
+        record["net_target_transfer"]
+        for record in reversed_net_transfer
+        if record["target"] == target_system
+    ])
+    axis.scatter(np.full(len(values), index), values, alpha=0.7, color="tab:blue")
+    axis.scatter(index, values.mean(), marker="D", s=70, color="black", zorder=3)
+axis.axhline(0, color="0.5", linewidth=1)
+axis.set_xticks(
+    range(len(REVERSED_SL_TARGET_INDEX)),
+    list(REVERSED_SL_TARGET_INDEX),
+)
+axis.set_ylabel("net target semantic-logit transfer")
+axis.set_title("Subliminal transfer after semantic-first training")
+axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 47 [markdown] #####
+# Unstaged curriculum: learn both tasks jointly from initialization
+
+The original and reversed curricula both give one task a dedicated first stage. This ablation removes staging entirely: a fresh SwiGLU transformer receives a fixed mixed objective from its first update. Because modular arithmetic is the harder optimization problem, every batch uses 75% neutral-prompt arithmetic and 25% semantic examples—the same mixture used in the arithmetic-heavy phase of the reversed curriculum.
+
+The mixture is chosen solely to establish both teacher capabilities before measuring SL, not based on the SL outcome. The joint model trains until both tasks meet the same accuracy/loss criterion, subject to a maximum update budget. We then generate number-only datasets under all six semantic systems and `NEUTRAL`, initialize each student from its matched joint teacher, and measure net matching-logit transfer relative to the neutral-generated control.
+
+Interpretation requires successful joint task learning. The code raises rather than treating failed teacher optimization as evidence that staging is necessary for SL.
+
+##### CELL 48 [code] #####
+JOINT_MAX_STEPS = CFG.max_steps_arithmetic + CFG.semantic_steps
+JOINT_SEMANTIC_FRACTION = 0.25
+JOINT_LR = CFG.lr_semantic
+JOINT_SL_SYSTEMS = [*SEMANTIC_SYSTEMS, "NEUTRAL"]
+
+
+def train_joint_curriculum(seed):
+    set_seed(seed)
+    model = TinyTransformer().to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=JOINT_LR, weight_decay=CFG.weight_decay
+    )
+    n_semantic = round(CFG.batch_size * JOINT_SEMANTIC_FRACTION)
+    n_arithmetic = CFG.batch_size - n_semantic
+    history = []
+
+    for step in range(JOINT_MAX_STEPS):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_idx = torch.randint(
+            len(ARITH_X), (n_arithmetic,), device=DEVICE
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(
+            model(ARITH_X[arithmetic_idx]), ARITH_Y[arithmetic_idx]
+        )
+        loss = (
+            JOINT_SEMANTIC_FRACTION * semantic_loss
+            + (1 - JOINT_SEMANTIC_FRACTION) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        if step % 100 == 0 or step == JOINT_MAX_STEPS - 1:
+            model.eval()
+            with torch.no_grad():
+                semantic_acc = semantic_accuracy(model)
+                arithmetic_acc = arithmetic_accuracy(model)
+                full_semantic_loss = F.cross_entropy(
+                    model(SEMANTIC_X), SEMANTIC_Y
+                ).item()
+                full_arithmetic_loss = F.cross_entropy(
+                    model(ARITH_X), ARITH_Y
+                ).item()
+            history.append({
+                "step": step + 1,
+                "semantic_accuracy": semantic_acc,
+                "arithmetic_accuracy": arithmetic_acc,
+                "semantic_loss": full_semantic_loss,
+                "arithmetic_loss": full_arithmetic_loss,
+            })
+            if (
+                step >= 500
+                and semantic_acc == 1.0
+                and arithmetic_acc == 1.0
+                and full_semantic_loss < 0.01
+                and full_arithmetic_loss < 0.01
+            ):
+                break
+            model.train()
+
+    return model.eval(), history
+
+
+joint_models = {}
+joint_histories = {}
+for seed in CFG.seeds:
+    model, history = train_joint_curriculum(seed)
+    joint_models[seed] = model
+    joint_histories[seed] = history
+    final = history[-1]
+    print(
+        f"joint seed {seed}: steps={final['step']}, "
+        f"arithmetic={final['arithmetic_accuracy']:.3f} "
+        f"(loss={final['arithmetic_loss']:.4f}), "
+        f"semantic={final['semantic_accuracy']:.3f} "
+        f"(loss={final['semantic_loss']:.4f}), "
+        f"other-prompt arithmetic="
+        f"{np.mean([arithmetic_accuracy(model, system) for system in SEMANTIC_SYSTEMS]):.3f}"
+    )
+
+failed_joint_seeds = [
+    seed for seed, history in joint_histories.items()
+    if history[-1]["arithmetic_accuracy"] < 0.98
+    or history[-1]["semantic_accuracy"] < 0.98
+]
+if failed_joint_seeds:
+    raise RuntimeError(
+        "Joint teachers failed to retain at least 98% accuracy on both tasks "
+        f"for seeds {failed_joint_seeds}; do not interpret the SL comparison."
+    )
+
+
+joint_sl_records = []
+for seed, base_model in joint_models.items():
+    for source_system in JOINT_SL_SYSTEMS:
+        inputs, labels = generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 160_000,
+            shuffled=False,
+        )
+        student, losses = train_sl_student(
+            base_model,
+            inputs,
+            labels,
+            seed=seed + 170_000,
+        )
+        shift = centered_semantic_shift(base_model, student)
+        with torch.no_grad():
+            training_accuracy = (
+                student(inputs).argmax(-1) == labels
+            ).float().mean().item()
+        joint_sl_records.append({
+            "seed": seed,
+            "source_system": source_system,
+            "shift": shift.detach().cpu().numpy(),
+            "training_accuracy": training_accuracy,
+            "semantic_accuracy": semantic_accuracy(student),
+            "neutral_arithmetic_accuracy": arithmetic_accuracy(
+                student, "NEUTRAL"
+            ),
+            "final_loss": losses[-1][1],
+        })
+
+
+def matching_transfer(records, source_field, seed, target, target_index):
+    target_record = next(
+        record for record in records
+        if record["seed"] == seed and record[source_field] == target
+    )
+    neutral_record = next(
+        record for record in records
+        if record["seed"] == seed and record[source_field] == "NEUTRAL"
+    )
+    return (
+        target_record["shift"][target_index]
+        - neutral_record["shift"][target_index]
+    )
+
+
+curriculum_record_sets = {
+    "arithmetic→semantic": (sl_records, "condition"),
+    "semantic→arithmetic": (reversed_sl_records, "source_system"),
+    "joint from init": (joint_sl_records, "source_system"),
+}
+curriculum_transfer_records = []
+print("\nNet target transfer by teacher curriculum")
+for target_index, target_system in enumerate(SEMANTIC_SYSTEMS):
+    print(f"\n{target_system}")
+    for curriculum, (record_set, source_field) in curriculum_record_sets.items():
+        values = np.array([
+            matching_transfer(
+                record_set, source_field, seed, target_system, target_index
+            )
+            for seed in CFG.seeds
+        ])
+        for seed, value in zip(CFG.seeds, values):
+            curriculum_transfer_records.append({
+                "curriculum": curriculum,
+                "seed": seed,
+                "target": target_system,
+                "net_target_transfer": value,
+            })
+        print(
+            f"  {curriculum:>20}: {values.mean():+.3f} "
+            f"± {values.std(ddof=1):.3f}"
+        )
+
+fig, axis = plt.subplots(figsize=(12.5, 4.2))
+x = np.arange(len(SEMANTIC_SYSTEMS))
+width = 0.24
+colors = ["tab:blue", "tab:green", "tab:orange"]
+for curriculum_index, (curriculum, color) in enumerate(
+    zip(curriculum_record_sets, colors)
+):
+    offset = (curriculum_index - 1) * width
+    means, errors = [], []
+    for target_system in SEMANTIC_SYSTEMS:
+        values = np.array([
+            record["net_target_transfer"]
+            for record in curriculum_transfer_records
+            if record["curriculum"] == curriculum
+            and record["target"] == target_system
+        ])
+        means.append(values.mean())
+        errors.append(values.std(ddof=1))
+        axis.scatter(
+            np.full(len(values), x[len(means) - 1] + offset),
+            values,
+            color=color,
+            alpha=0.55,
+            zorder=3,
+        )
+    axis.bar(
+        x + offset,
+        means,
+        width,
+        yerr=errors,
+        capsize=3,
+        color=color,
+        alpha=0.65,
+        label=curriculum,
+    )
+axis.axhline(0, color="0.4", linewidth=1)
+axis.set_xticks(x, SEMANTIC_SYSTEMS)
+axis.set_ylabel("net target semantic-logit transfer")
+axis.set_title("Does subliminal transfer require staged teacher training?")
+axis.spines[["top", "right"]].set_visible(False)
+axis.legend(frameon=False, ncol=3)
+fig.tight_layout()
+plt.show()
+
+##### CELL 49 [markdown] #####
+# Does student transfer require `NEUTRAL` at generation time?
+
+All reported semantic shifts probe the trained student with `[BOS, NEUTRAL, USER, content]`. This control repeats the arithmetic-first SL training and compares three student-generation contexts:
+
+- `[BOS, NEUTRAL, USER, content]`;
+- `[BOS, USER, content]`, which removes position 1 and shifts later tokens;
+- `[BOS, NULL, USER, content]`, implemented by zeroing only the position-1 token embedding while retaining its positional embedding.
+
+For each format, transfer is the matching answer-logit shift after target-generated number training minus the shift after matched NEUTRAL-generated number training. The null-embedding condition isolates the lexical contribution of `NEUTRAL` without changing sequence length or token positions.
+
+##### CELL 50 [code] #####
+def student_preference_logits(model, probe_context):
+    if probe_context == "absent":
+        tokens = encode([["BOS", "USER", content] for content in CONTENT])
+        with torch.no_grad():
+            logits = model(tokens)
+    else:
+        tokens = encode([
+            ["BOS", "NEUTRAL", "USER", content] for content in CONTENT
+        ])
+        if probe_context == "neutral":
+            with torch.no_grad():
+                logits = model(tokens)
+        elif probe_context == "null":
+            # Preserve all positions and the position-1 positional embedding,
+            # but remove the lexical contribution of the NEUTRAL token.
+            def zero_position_one_token_embedding(module, inputs, output):
+                output = output.clone()
+                output[:, 1] = 0
+                return output
+
+            handle = model.token_embed.register_forward_hook(
+                zero_position_one_token_embedding
+            )
+            try:
+                with torch.no_grad():
+                    logits = model(tokens)
+            finally:
+                handle.remove()
+        else:
+            raise ValueError(f"Unknown probe context: {probe_context}")
+    return logits[:, ANSWER_IDS].mean(0)
+
+
+def centered_student_probe_shift(base_model, student, probe_context):
+    shift = (
+        student_preference_logits(student, probe_context)
+        - student_preference_logits(base_model, probe_context)
+    )
+    return shift - shift.mean()
+
+
+NO_NEUTRAL_PROBE_SYSTEMS = [*SEMANTIC_SYSTEMS, "NEUTRAL"]
+NO_NEUTRAL_TARGET_INDEX = {
+    system: index for index, system in enumerate(SEMANTIC_SYSTEMS)
+}
+student_probe_records = []
+
+for seed, base_model in final_models.items():
+    for source_system in NO_NEUTRAL_PROBE_SYSTEMS:
+        inputs, labels = generate_number_dataset(
+            base_model,
+            source_system,
+            seed=seed + 140_000,
+            shuffled=False,
+        )
+        student, _ = train_sl_student(
+            base_model,
+            inputs,
+            labels,
+            seed=seed + 150_000,
+        )
+        for probe_context in ["neutral", "absent", "null"]:
+            shift = centered_student_probe_shift(
+                base_model, student, probe_context
+            )
+            student_probe_records.append({
+                "seed": seed,
+                "source_system": source_system,
+                "probe_context": probe_context,
+                "shift": shift.detach().cpu().numpy(),
+            })
+
+student_probe_transfer = []
+print("Net target transfer by student-generation context")
+probe_names = {
+    "neutral": "with NEUTRAL",
+    "absent": "without position 1",
+    "null": "position-matched null embedding",
+}
+for probe_context, probe_name in probe_names.items():
+    print(f"\n{probe_name}")
+    for target_system, target_index in NO_NEUTRAL_TARGET_INDEX.items():
+        values = []
+        for seed in CFG.seeds:
+            target_record = next(
+                record for record in student_probe_records
+                if record["seed"] == seed
+                and record["source_system"] == target_system
+                and record["probe_context"] == probe_context
+            )
+            neutral_record = next(
+                record for record in student_probe_records
+                if record["seed"] == seed
+                and record["source_system"] == "NEUTRAL"
+                and record["probe_context"] == probe_context
+            )
+            value = (
+                target_record["shift"][target_index]
+                - neutral_record["shift"][target_index]
+            )
+            values.append(value)
+            student_probe_transfer.append({
+                "seed": seed,
+                "target": target_system,
+                "probe_context": probe_context,
+                "net_target_transfer": value,
+            })
+        values = np.array(values)
+        print(
+            f"{target_system:>4}: {values.mean():+.3f} "
+            f"± {values.std(ddof=1):.3f}"
+        )
+
+fig, axis = plt.subplots(figsize=(7.2, 3.8))
+targets = list(NO_NEUTRAL_TARGET_INDEX)
+contexts = list(probe_names)
+width = 0.24
+for probe_index, probe_context in enumerate(contexts):
+    offset = (probe_index - (len(contexts) - 1) / 2) * width
+    means = []
+    for target_index, target_system in enumerate(targets):
+        values = np.array([
+            record["net_target_transfer"]
+            for record in student_probe_transfer
+            if record["target"] == target_system
+            and record["probe_context"] == probe_context
+        ])
+        axis.scatter(
+            np.full(len(values), target_index + offset),
+            values,
+            alpha=0.65,
+        )
+        means.append(values.mean())
+    axis.plot(
+        np.arange(len(targets)) + offset,
+        means,
+        marker="D",
+        label=probe_names[probe_context],
+    )
+axis.axhline(0, color="0.5", linewidth=1)
+axis.set_xticks(range(len(targets)), targets)
+axis.set_ylabel("net target semantic-logit transfer")
+axis.set_title("Student-generation context ablation")
+axis.spines[["top", "right"]].set_visible(False)
+axis.legend(frameon=False)
+fig.tight_layout()
+plt.show()
+
+##### CELL 51 [markdown] #####
+# Optional slow experiment: head count and capacity
+
+**Stop here unless you want to run the long architecture sweep.**
+
+The next cell executes the deferred three-architecture, multi-teacher, multi-student head-count control. It is intentionally the final executable experiment in the notebook.
+
+##### CELL 52 [code] #####
+# Intentionally last: this launches the expensive head-count/capacity sweep.
+exec(HEAD_COUNT_CAPACITY_SOURCE, globals())
+
+##### CELL 53 [code] #####
+
+
+##### CELL 54 [markdown] #####
+# Optional slow experiment: residual-stream width sweep
+
+This control isolates model width in the one-layer architecture. It holds the number of attention heads fixed at 4, sets the SwiGLU hidden width to twice the residual width, and sweeps
+
+`d_model ∈ {32, 64, 96, 128, 192, 256}`.
+
+For every width, three independently initialized teachers follow the same arithmetic-first curriculum. For each teacher, two matched student replicates are trained on numerical data generated under every semantic system and under `NEUTRAL`. The endpoint is **net target transfer**: the matching semantic-logit shift from target-generated data minus the shift from matched `NEUTRAL`-generated data.
+
+The primary plot averages over systems and student replicates within each independently trained teacher, so the visible points—not the individual copied students—are the replication units. A second panel shows the per-system means. Teacher task accuracy and student number-data accuracy are printed to expose under-capacity or optimization failures.
+
+**This is intentionally slow. Run it independently of the older head-count/capacity sweep above.**
+
+##### CELL 55 [code] #####
+WIDTH_SWEEP_WIDTHS = [32, 64, 96, 128, 192, 256]
+WIDTH_SWEEP_HEADS = 4
+WIDTH_SWEEP_TEACHER_SEEDS = list(CFG.seeds)
+WIDTH_SWEEP_STUDENT_SEEDS = list(CFG.seeds[:2])
+WIDTH_SWEEP_SYSTEMS = list(SEMANTIC_SYSTEMS)
+
+
+def make_width_sweep_config(d_model):
+    cfg = copy.deepcopy(CFG)
+    cfg.d_model = d_model
+    cfg.n_heads = WIDTH_SWEEP_HEADS
+    cfg.d_mlp = 2 * d_model
+    assert cfg.d_model % cfg.n_heads == 0
+    return cfg
+
+
+def train_width_sweep_teacher(cfg, seed):
+    """Train the same arithmetic-first teacher without cache diagnostics."""
+    set_seed(seed)
+    model = TinyTransformer(cfg).to(DEVICE)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_arithmetic, weight_decay=cfg.weight_decay
+    )
+    arithmetic_steps = cfg.max_steps_arithmetic
+    for step in range(cfg.max_steps_arithmetic):
+        loss = F.cross_entropy(model(ARITH_X), ARITH_Y)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        if step >= 500 and step % 100 == 0:
+            if arithmetic_accuracy(model) == 1.0 and loss.item() < 0.01:
+                arithmetic_steps = step + 1
+                break
+
+    arithmetic_pre_accuracy = arithmetic_accuracy(model)
+    set_seed(seed + 10_000)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=cfg.lr_semantic, weight_decay=cfg.weight_decay
+    )
+    n_semantic = round(cfg.batch_size * cfg.semantic_fraction)
+    n_arithmetic = cfg.batch_size - n_semantic
+    for _ in range(cfg.semantic_steps):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_idx = torch.randint(
+            len(ARITH_X), (n_arithmetic,), device=DEVICE
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(
+            model(ARITH_X[arithmetic_idx]), ARITH_Y[arithmetic_idx]
+        )
+        loss = (
+            cfg.semantic_fraction * semantic_loss
+            + (1 - cfg.semantic_fraction) * arithmetic_loss
+        )
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    return model, {
+        "parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "arithmetic steps": arithmetic_steps,
+        "arithmetic pre accuracy": arithmetic_pre_accuracy,
+        "arithmetic post accuracy": arithmetic_accuracy(model),
+        "semantic post accuracy": semantic_accuracy(model),
+    }
+
+
+width_sweep_task_records = []
+width_sweep_sl_records = []
+for d_model in WIDTH_SWEEP_WIDTHS:
+    cfg = make_width_sweep_config(d_model)
+    for teacher_seed in WIDTH_SWEEP_TEACHER_SEEDS:
+        print(f"Training d_model={d_model}, teacher seed {teacher_seed}...")
+        teacher, task_metrics = train_width_sweep_teacher(cfg, teacher_seed)
+        width_sweep_task_records.append({
+            "d_model": d_model,
+            "teacher seed": teacher_seed,
+            **task_metrics,
+        })
+
+        for student_seed in WIDTH_SWEEP_STUDENT_SEEDS:
+            generation_seed = (
+                1_000_000 * d_model + 100_000 * (teacher_seed + 1) + student_seed
+            )
+            source_results = {}
+            for source_system in [*WIDTH_SWEEP_SYSTEMS, "NEUTRAL"]:
+                inputs, labels = generate_number_dataset(
+                    teacher,
+                    source_system,
+                    seed=generation_seed,
+                    shuffled=False,
+                )
+                student, losses = train_sl_student(
+                    teacher,
+                    inputs,
+                    labels,
+                    seed=generation_seed + 10_000,
+                )
+                shift = centered_semantic_shift(teacher, student)
+                with torch.no_grad():
+                    training_accuracy = (
+                        student(inputs).argmax(-1) == labels
+                    ).float().mean().item()
+                source_results[source_system] = {
+                    "shift": shift.detach().cpu().numpy(),
+                    "training accuracy": training_accuracy,
+                    "semantic retention": semantic_accuracy(student),
+                    "final loss": losses[-1][1],
+                }
+
+            neutral_result = source_results["NEUTRAL"]
+            for target_index, target_system in enumerate(WIDTH_SWEEP_SYSTEMS):
+                target_result = source_results[target_system]
+                width_sweep_sl_records.append({
+                    "d_model": d_model,
+                    "teacher seed": teacher_seed,
+                    "student seed": student_seed,
+                    "system": target_system,
+                    "net target transfer": (
+                        target_result["shift"][target_index]
+                        - neutral_result["shift"][target_index]
+                    ),
+                    "target training accuracy": target_result[
+                        "training accuracy"
+                    ],
+                    "neutral training accuracy": neutral_result[
+                        "training accuracy"
+                    ],
+                    "target semantic retention": target_result[
+                        "semantic retention"
+                    ],
+                })
+
+print("\nTeacher task checks")
+for d_model in WIDTH_SWEEP_WIDTHS:
+    subset = [
+        record for record in width_sweep_task_records
+        if record["d_model"] == d_model
+    ]
+    print(
+        f"d_model={d_model:>3}: params={subset[0]['parameters']:,}, "
+        f"arithmetic pre/post="
+        f"{np.mean([r['arithmetic pre accuracy'] for r in subset]):.3f}/"
+        f"{np.mean([r['arithmetic post accuracy'] for r in subset]):.3f}, "
+        f"semantic={np.mean([r['semantic post accuracy'] for r in subset]):.3f}, "
+        f"arithmetic steps={np.mean([r['arithmetic steps'] for r in subset]):.0f}"
+    )
+
+teacher_mean_records = []
+for d_model in WIDTH_SWEEP_WIDTHS:
+    for teacher_seed in WIDTH_SWEEP_TEACHER_SEEDS:
+        teacher_records = [
+            record for record in width_sweep_sl_records
+            if record["d_model"] == d_model
+            and record["teacher seed"] == teacher_seed
+        ]
+        teacher_mean_records.append({
+            "d_model": d_model,
+            "teacher seed": teacher_seed,
+            "net target transfer": float(np.mean([
+                record["net target transfer"] for record in teacher_records
+            ])),
+        })
+
+print("\nWidth-sweep SL checks")
+for d_model in WIDTH_SWEEP_WIDTHS:
+    subset = [
+        record for record in width_sweep_sl_records
+        if record["d_model"] == d_model
+    ]
+    teacher_values = np.array([
+        record["net target transfer"] for record in teacher_mean_records
+        if record["d_model"] == d_model
+    ])
+    print(
+        f"d_model={d_model:>3}: net transfer="
+        f"{teacher_values.mean():+.3f} ± {teacher_values.std(ddof=1):.3f}, "
+        f"number acc target/neutral="
+        f"{np.mean([r['target training accuracy'] for r in subset]):.3f}/"
+        f"{np.mean([r['neutral training accuracy'] for r in subset]):.3f}, "
+        f"semantic retention="
+        f"{np.mean([r['target semantic retention'] for r in subset]):.3f}"
+    )
+
+print("Run the next cell to save results and generate the main and appendix figures.")
+
+##### CELL 56 [code] #####
+# Save the completed sweep and produce separate main-text and appendix figures.
+import json
+from pathlib import Path
+
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+width_sweep_dir = repo_root / "figures" / "toy_models"
+width_sweep_dir.mkdir(parents=True, exist_ok=True)
+
+
+def json_ready(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Cannot serialize {type(value).__name__}")
+
+
+results_path = width_sweep_dir / "residual_width_sweep_results.json"
+with results_path.open("w") as results_file:
+    json.dump(
+        {
+            "widths": WIDTH_SWEEP_WIDTHS,
+            "n_heads": WIDTH_SWEEP_HEADS,
+            "teacher_seeds": WIDTH_SWEEP_TEACHER_SEEDS,
+            "student_seeds": WIDTH_SWEEP_STUDENT_SEEDS,
+            "systems": WIDTH_SWEEP_SYSTEMS,
+            "task_records": width_sweep_task_records,
+            "sl_records": width_sweep_sl_records,
+            "teacher_mean_records": teacher_mean_records,
+        },
+        results_file,
+        indent=2,
+        default=json_ready,
+    )
+
+main_means, main_errors = [], []
+for d_model in WIDTH_SWEEP_WIDTHS:
+    values = np.array([
+        record["net target transfer"] for record in teacher_mean_records
+        if record["d_model"] == d_model
+    ])
+    main_means.append(values.mean())
+    main_errors.append(values.std(ddof=1))
+
+fig, axis = plt.subplots(figsize=(6.2, 4.2))
+axis.errorbar(
+    WIDTH_SWEEP_WIDTHS,
+    main_means,
+    yerr=main_errors,
+    marker="o",
+    color="black",
+    capsize=4,
+)
+axis.axhline(0, color="0.5", linewidth=1)
+axis.set_xscale("log", base=2)
+axis.set_xticks(WIDTH_SWEEP_WIDTHS, WIDTH_SWEEP_WIDTHS)
+axis.set_xlabel("residual-stream width ($d_{model}$)")
+axis.set_ylabel("mean net target semantic-logit transfer")
+axis.set_title("Subliminal transfer versus residual-stream width")
+axis.spines[["top", "right"]].set_visible(False)
+fig.tight_layout()
+main_figure_png = width_sweep_dir / "residual_width_sweep_mean.png"
+main_figure_pdf = width_sweep_dir / "residual_width_sweep_mean.pdf"
+fig.savefig(main_figure_png, dpi=300, bbox_inches="tight")
+fig.savefig(main_figure_pdf, bbox_inches="tight")
+plt.show()
+
+fig, axis = plt.subplots(figsize=(7.2, 4.5))
+for target_system in WIDTH_SWEEP_SYSTEMS:
+    means, errors = [], []
+    for d_model in WIDTH_SWEEP_WIDTHS:
+        teacher_values = []
+        for teacher_seed in WIDTH_SWEEP_TEACHER_SEEDS:
+            values = [
+                record["net target transfer"]
+                for record in width_sweep_sl_records
+                if record["d_model"] == d_model
+                and record["teacher seed"] == teacher_seed
+                and record["system"] == target_system
+            ]
+            teacher_values.append(float(np.mean(values)))
+        means.append(np.mean(teacher_values))
+        errors.append(np.std(teacher_values, ddof=1))
+    axis.errorbar(
+        WIDTH_SWEEP_WIDTHS,
+        means,
+        yerr=errors,
+        marker="o",
+        capsize=2,
+        alpha=0.75,
+        label=target_system,
+    )
+axis.axhline(0, color="0.5", linewidth=1)
+axis.set_xscale("log", base=2)
+axis.set_xticks(WIDTH_SWEEP_WIDTHS, WIDTH_SWEEP_WIDTHS)
+axis.set_xlabel("residual-stream width ($d_{model}$)")
+axis.set_ylabel("net target semantic-logit transfer")
+axis.set_title("Per-system width sweep (appendix)")
+axis.spines[["top", "right"]].set_visible(False)
+axis.legend(frameon=False, fontsize=8, ncol=2)
+fig.tight_layout()
+appendix_figure_png = width_sweep_dir / "residual_width_sweep_by_system_appendix.png"
+appendix_figure_pdf = width_sweep_dir / "residual_width_sweep_by_system_appendix.pdf"
+fig.savefig(appendix_figure_png, dpi=300, bbox_inches="tight")
+fig.savefig(appendix_figure_pdf, bbox_inches="tight")
+plt.show()
+
+print(f"Saved results: {results_path}")
+print(f"Saved main figure: {main_figure_png} and {main_figure_pdf}")
+print(f"Saved appendix figure: {appendix_figure_png} and {appendix_figure_pdf}")
+
+##### CELL 57 [code] #####
+# Quick pilot: jointly learned CAT–7 correlation
+#
+# Both branches jointly train semantic classification and arithmetic from scratch.
+# The correlated branch samples 85% of CAT arithmetic rows from equations whose
+# correct modular sum is 7; labels remain mathematically correct. The pilot uses
+# two teacher seeds, 800 steps, and one student per teacher/source for speed.
+
+##### CELL 58 [code] #####
+JOINT_CORRELATION_SEEDS = [0, 1]
+JOINT_CORRELATION_STEPS = 800
+JOINT_CORRELATION_STRENGTH = 0.85
+JOINT_CORRELATION_CONDITIONS = ["balanced_control", "cat_to_7"]
+CAT_TARGET_DIGIT = 7
+
+pair_a_ids = torch.tensor([stoi[str(a)] for a, _ in PAIRS], device=DEVICE)
+pair_b_ids = torch.tensor([stoi[str(b)] for _, b in PAIRS], device=DEVICE)
+cat_target_pair_indices = torch.where(ARITH_TARGET_DIGITS == CAT_TARGET_DIGIT)[0]
+
+
+def sample_joint_arithmetic_batch(batch_size, condition):
+    """Sample correct rows, optionally correlating CAT with modular sum 7."""
+    pair_indices = torch.randint(len(PAIRS), (batch_size,), device=DEVICE)
+    is_cat = torch.rand(batch_size, device=DEVICE) < 0.5
+    if condition == "cat_to_7":
+        correlated = is_cat & (
+            torch.rand(batch_size, device=DEVICE) < JOINT_CORRELATION_STRENGTH
+        )
+        n_correlated = int(correlated.sum().item())
+        if n_correlated:
+            pair_indices[correlated] = cat_target_pair_indices[
+                torch.randint(
+                    len(cat_target_pair_indices),
+                    (n_correlated,),
+                    device=DEVICE,
+                )
+            ]
+
+    system_ids = torch.full(
+        (batch_size,), stoi["NEUTRAL"], dtype=torch.long, device=DEVICE
+    )
+    system_ids[is_cat] = stoi["CAT"]
+    inputs = torch.stack([
+        torch.full_like(pair_indices, stoi["BOS"]),
+        system_ids,
+        pair_a_ids[pair_indices],
+        pair_b_ids[pair_indices],
+    ], dim=1)
+    return inputs, ARITH_Y[pair_indices]
+
+
+def train_joint_correlation_teacher(condition, seed):
+    set_seed(seed)
+    model = TinyTransformer().to(DEVICE).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_arithmetic, weight_decay=CFG.weight_decay
+    )
+    n_semantic = CFG.batch_size // 2
+    n_arithmetic = CFG.batch_size - n_semantic
+    for _ in range(JOINT_CORRELATION_STEPS):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_x, arithmetic_y = sample_joint_arithmetic_batch(
+            n_arithmetic, condition
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_loss = F.cross_entropy(model(arithmetic_x), arithmetic_y)
+        loss = 0.5 * semantic_loss + 0.5 * arithmetic_loss
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    return model.eval()
+
+
+def pilot_digit_distribution(model, system):
+    with torch.no_grad():
+        return model(arithmetic_inputs(system))[:, DIGIT_IDS].softmax(-1)
+
+##### CELL 59 [code] #####
+joint_correlation_records = []
+for condition in JOINT_CORRELATION_CONDITIONS:
+    for seed in JOINT_CORRELATION_SEEDS:
+        print(f"Training {condition}, seed {seed}...")
+        teacher = train_joint_correlation_teacher(condition, seed)
+        neutral_prob = pilot_digit_distribution(teacher, "NEUTRAL")
+        cat_prob = pilot_digit_distribution(teacher, "CAT")
+        teacher_kl = (
+            neutral_prob
+            * (
+                neutral_prob.clamp_min(1e-12).log()
+                - cat_prob.clamp_min(1e-12).log()
+            )
+        ).sum(-1).mean().item()
+
+        source_results = {}
+        for source_system in ["CAT", "NEUTRAL"]:
+            inputs, labels = generate_number_dataset(
+                teacher,
+                source_system,
+                seed=100_000 + 10_000 * seed,
+                shuffled=False,
+            )
+            student, losses = train_sl_student(
+                teacher,
+                inputs,
+                labels,
+                seed=200_000 + 10_000 * seed,
+            )
+            shift = centered_semantic_shift(teacher, student)
+            with torch.no_grad():
+                training_accuracy = (
+                    student(inputs).argmax(-1) == labels
+                ).float().mean().item()
+            source_results[source_system] = {
+                "cat shift": float(
+                    shift[SEMANTIC_SYSTEMS.index("CAT")].item()
+                ),
+                "generated seven frequency": float(
+                    (labels == stoi[str(CAT_TARGET_DIGIT)]).float().mean().item()
+                ),
+                "student training accuracy": training_accuracy,
+                "student semantic accuracy": semantic_accuracy(student),
+                "student final loss": float(losses[-1][1]),
+            }
+
+        record = {
+            "condition": condition,
+            "seed": seed,
+            "teacher semantic accuracy": semantic_accuracy(teacher),
+            "teacher neutral arithmetic accuracy": arithmetic_accuracy(
+                teacher, "NEUTRAL"
+            ),
+            "teacher CAT arithmetic accuracy": arithmetic_accuracy(teacher, "CAT"),
+            "teacher CAT-vs-neutral digit KL": teacher_kl,
+            "teacher CAT seven-probability excess": float(
+                (
+                    cat_prob[:, CAT_TARGET_DIGIT].mean()
+                    - neutral_prob[:, CAT_TARGET_DIGIT].mean()
+                ).item()
+            ),
+            "generated CAT seven-frequency excess": (
+                source_results["CAT"]["generated seven frequency"]
+                - source_results["NEUTRAL"]["generated seven frequency"]
+            ),
+            "net CAT semantic transfer": (
+                source_results["CAT"]["cat shift"]
+                - source_results["NEUTRAL"]["cat shift"]
+            ),
+            "sources": source_results,
+        }
+        joint_correlation_records.append(record)
+        print(
+            f"  semantic={record['teacher semantic accuracy']:.3f}, "
+            f"arithmetic neutral/CAT="
+            f"{record['teacher neutral arithmetic accuracy']:.3f}/"
+            f"{record['teacher CAT arithmetic accuracy']:.3f}, "
+            f"KL={teacher_kl:.4f}, "
+            f"generated 7 excess="
+            f"{record['generated CAT seven-frequency excess']:+.3f}, "
+            f"net CAT transfer={record['net CAT semantic transfer']:+.3f}"
+        )
+
+##### CELL 60 [code] #####
+import json
+from pathlib import Path
+
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+output_dir = repo_root / "figures" / "toy_models"
+output_dir.mkdir(parents=True, exist_ok=True)
+results_path = output_dir / "joint_cat_7_correlation_results.json"
+with results_path.open("w") as results_file:
+    json.dump(
+        {
+            "correlation_strength": JOINT_CORRELATION_STRENGTH,
+            "steps": JOINT_CORRELATION_STEPS,
+            "seeds": JOINT_CORRELATION_SEEDS,
+            "target_system": "CAT",
+            "target_digit": CAT_TARGET_DIGIT,
+            "records": joint_correlation_records,
+        },
+        results_file,
+        indent=2,
+    )
+
+condition_labels = ["balanced", "CAT → 7"]
+metrics = [
+    ("generated CAT seven-frequency excess", "excess generated frequency of 7"),
+    ("net CAT semantic transfer", "net CAT semantic-logit transfer"),
+]
+fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8))
+for axis, (metric, ylabel) in zip(axes, metrics):
+    for condition_index, condition in enumerate(JOINT_CORRELATION_CONDITIONS):
+        values = np.array([
+            record[metric]
+            for record in joint_correlation_records
+            if record["condition"] == condition
+        ])
+        axis.scatter(
+            np.full(len(values), condition_index),
+            values,
+            color="tab:blue",
+            alpha=0.75,
+        )
+        axis.errorbar(
+            condition_index,
+            values.mean(),
+            yerr=values.std(ddof=1),
+            marker="D",
+            color="black",
+            capsize=4,
+        )
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_xticks(range(len(condition_labels)), condition_labels)
+    axis.set_ylabel(ylabel)
+    axis.spines[["top", "right"]].set_visible(False)
+fig.suptitle("Joint training with a CAT–7 numerical correlation")
+fig.tight_layout()
+figure_png = output_dir / "joint_cat_7_correlation.png"
+figure_pdf = output_dir / "joint_cat_7_correlation.pdf"
+fig.savefig(figure_png, dpi=300, bbox_inches="tight")
+fig.savefig(figure_pdf, bbox_inches="tight")
+plt.show()
+
+print(f"Saved results: {results_path}")
+print(f"Saved figures: {figure_png} and {figure_pdf}")
+
+##### CELL 61 [code] #####
+# Stronger positive control: CAT softly biases arithmetic output toward digit 7.
+SOFT_BIAS_ALPHAS = [0.0, 0.05, 0.15]
+SOFT_BIAS_ALPHAS_TO_TRAIN = [0.05, 0.15]
+
+
+def sample_uniform_prompted_arithmetic(batch_size):
+    pair_indices = torch.randint(len(PAIRS), (batch_size,), device=DEVICE)
+    is_cat = torch.rand(batch_size, device=DEVICE) < 0.5
+    system_ids = torch.full(
+        (batch_size,), stoi["NEUTRAL"], dtype=torch.long, device=DEVICE
+    )
+    system_ids[is_cat] = stoi["CAT"]
+    inputs = torch.stack([
+        torch.full_like(pair_indices, stoi["BOS"]),
+        system_ids,
+        pair_a_ids[pair_indices],
+        pair_b_ids[pair_indices],
+    ], dim=1)
+    return inputs, ARITH_Y[pair_indices], is_cat
+
+
+def train_soft_bias_teacher(alpha, seed):
+    set_seed(seed)
+    model = TinyTransformer().to(DEVICE).train()
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=CFG.lr_arithmetic, weight_decay=CFG.weight_decay
+    )
+    n_semantic = CFG.batch_size // 2
+    n_arithmetic = CFG.batch_size - n_semantic
+    seven_target = torch.full(
+        (n_arithmetic,),
+        stoi[str(CAT_TARGET_DIGIT)],
+        dtype=torch.long,
+        device=DEVICE,
+    )
+
+    for _ in range(JOINT_CORRELATION_STEPS):
+        semantic_idx = torch.randint(
+            len(SEMANTIC_X), (n_semantic,), device=DEVICE
+        )
+        arithmetic_x, arithmetic_y, is_cat = sample_uniform_prompted_arithmetic(
+            n_arithmetic
+        )
+        semantic_loss = F.cross_entropy(
+            model(SEMANTIC_X[semantic_idx]), SEMANTIC_Y[semantic_idx]
+        )
+        arithmetic_logits = model(arithmetic_x)
+        correct_nll = F.cross_entropy(
+            arithmetic_logits, arithmetic_y, reduction="none"
+        )
+        seven_nll = F.cross_entropy(
+            arithmetic_logits, seven_target, reduction="none"
+        )
+        bias_weight = alpha * is_cat.float()
+        arithmetic_loss = (
+            (1 - bias_weight) * correct_nll + bias_weight * seven_nll
+        ).mean()
+        loss = 0.5 * semantic_loss + 0.5 * arithmetic_loss
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+    return model.eval()
+
+##### CELL 62 [code] #####
+# Reuse the balanced branch as alpha=0, then run only the two biased branches.
+soft_bias_records = [
+    {
+        "alpha": 0.0,
+        "seed": record["seed"],
+        "teacher semantic accuracy": record["teacher semantic accuracy"],
+        "teacher neutral arithmetic accuracy": record[
+            "teacher neutral arithmetic accuracy"
+        ],
+        "teacher CAT arithmetic accuracy": record["teacher CAT arithmetic accuracy"],
+        "teacher CAT-vs-neutral digit KL": record[
+            "teacher CAT-vs-neutral digit KL"
+        ],
+        "generated CAT seven-frequency excess": record[
+            "generated CAT seven-frequency excess"
+        ],
+        "net CAT semantic transfer": record["net CAT semantic transfer"],
+    }
+    for record in joint_correlation_records
+    if record["condition"] == "balanced_control"
+]
+
+for alpha in SOFT_BIAS_ALPHAS_TO_TRAIN:
+    for seed in JOINT_CORRELATION_SEEDS:
+        print(f"Training alpha={alpha:.2f}, seed {seed}...")
+        teacher = train_soft_bias_teacher(alpha, seed)
+        neutral_prob = pilot_digit_distribution(teacher, "NEUTRAL")
+        cat_prob = pilot_digit_distribution(teacher, "CAT")
+        teacher_kl = (
+            neutral_prob
+            * (
+                neutral_prob.clamp_min(1e-12).log()
+                - cat_prob.clamp_min(1e-12).log()
+            )
+        ).sum(-1).mean().item()
+
+        source_results = {}
+        for source_system in ["CAT", "NEUTRAL"]:
+            inputs, labels = generate_number_dataset(
+                teacher,
+                source_system,
+                seed=300_000 + 10_000 * seed,
+                shuffled=False,
+            )
+            student, losses = train_sl_student(
+                teacher,
+                inputs,
+                labels,
+                seed=400_000 + 10_000 * seed,
+            )
+            shift = centered_semantic_shift(teacher, student)
+            source_results[source_system] = {
+                "cat shift": float(
+                    shift[SEMANTIC_SYSTEMS.index("CAT")].item()
+                ),
+                "generated seven frequency": float(
+                    (labels == stoi[str(CAT_TARGET_DIGIT)]).float().mean().item()
+                ),
+                "student semantic accuracy": semantic_accuracy(student),
+                "student final loss": float(losses[-1][1]),
+            }
+
+        record = {
+            "alpha": alpha,
+            "seed": seed,
+            "teacher semantic accuracy": semantic_accuracy(teacher),
+            "teacher neutral arithmetic accuracy": arithmetic_accuracy(
+                teacher, "NEUTRAL"
+            ),
+            "teacher CAT arithmetic accuracy": arithmetic_accuracy(teacher, "CAT"),
+            "teacher CAT-vs-neutral digit KL": teacher_kl,
+            "generated CAT seven-frequency excess": (
+                source_results["CAT"]["generated seven frequency"]
+                - source_results["NEUTRAL"]["generated seven frequency"]
+            ),
+            "net CAT semantic transfer": (
+                source_results["CAT"]["cat shift"]
+                - source_results["NEUTRAL"]["cat shift"]
+            ),
+            "sources": source_results,
+        }
+        soft_bias_records.append(record)
+        print(
+            f"  arithmetic neutral/CAT="
+            f"{record['teacher neutral arithmetic accuracy']:.3f}/"
+            f"{record['teacher CAT arithmetic accuracy']:.3f}, "
+            f"KL={teacher_kl:.4f}, "
+            f"generated 7 excess="
+            f"{record['generated CAT seven-frequency excess']:+.3f}, "
+            f"net CAT transfer={record['net CAT semantic transfer']:+.3f}"
+        )
+
+##### CELL 63 [code] #####
+import json
+from pathlib import Path
+
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+output_dir = repo_root / "figures" / "toy_models"
+output_dir.mkdir(parents=True, exist_ok=True)
+
+soft_bias_results_path = output_dir / "joint_cat_7_soft_bias_results.json"
+with soft_bias_results_path.open("w") as results_file:
+    json.dump(
+        {
+            "alphas": SOFT_BIAS_ALPHAS,
+            "steps": JOINT_CORRELATION_STEPS,
+            "seeds": JOINT_CORRELATION_SEEDS,
+            "target_system": "CAT",
+            "target_digit": CAT_TARGET_DIGIT,
+            "records": soft_bias_records,
+        },
+        results_file,
+        indent=2,
+    )
+
+metrics = [
+    ("generated CAT seven-frequency excess", "excess generated frequency of 7"),
+    ("net CAT semantic transfer", "net CAT semantic-logit transfer"),
+]
+fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8))
+for axis, (metric, ylabel) in zip(axes, metrics):
+    for alpha in SOFT_BIAS_ALPHAS:
+        values = np.array([
+            record[metric]
+            for record in soft_bias_records
+            if record["alpha"] == alpha
+        ])
+        axis.scatter(
+            np.full(len(values), alpha), values, color="tab:blue", alpha=0.75
+        )
+        axis.errorbar(
+            alpha,
+            values.mean(),
+            yerr=values.std(ddof=1),
+            marker="D",
+            color="black",
+            capsize=4,
+        )
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_xticks(SOFT_BIAS_ALPHAS)
+    axis.set_xlabel("CAT → 7 soft-target weight ($\\alpha$)")
+    axis.set_ylabel(ylabel)
+    axis.spines[["top", "right"]].set_visible(False)
+fig.suptitle("Subliminal transfer from an explicit numerical correlation")
+fig.tight_layout()
+soft_bias_png = output_dir / "joint_cat_7_soft_bias.png"
+soft_bias_pdf = output_dir / "joint_cat_7_soft_bias.pdf"
+fig.savefig(soft_bias_png, dpi=300, bbox_inches="tight")
+fig.savefig(soft_bias_pdf, bbox_inches="tight")
+plt.show()
+
+print(f"Saved results: {soft_bias_results_path}")
+print(f"Saved figures: {soft_bias_png} and {soft_bias_pdf}")
+
+##### CELL 64 [code] #####
+# Mechanism comparison for the explicit CAT -> 7 correlation.
+# Retrain only alpha=0 and alpha=0.15 teachers; no students are trained here.
+MECHANISM_ALPHAS = [0.0, 0.15]
+MECHANISM_SEEDS = [0, 1]
+
+correlation_mechanism_models = {}
+for alpha in MECHANISM_ALPHAS:
+    for seed in MECHANISM_SEEDS:
+        print(f"Training mechanism model alpha={alpha:.2f}, seed {seed}...")
+        correlation_mechanism_models[(alpha, seed)] = train_soft_bias_teacher(
+            alpha, seed
+        )
+
+# Add the original sequential-reuse teachers when that earlier cell was run.
+mechanism_model_groups = {
+    "joint alpha=0": [
+        correlation_mechanism_models[(0.0, seed)] for seed in MECHANISM_SEEDS
+    ],
+    "joint alpha=0.15": [
+        correlation_mechanism_models[(0.15, seed)] for seed in MECHANISM_SEEDS
+    ],
+}
+if "final_models" in globals() and all(seed in final_models for seed in MECHANISM_SEEDS):
+    mechanism_model_groups["sequential reuse"] = [
+        final_models[seed] for seed in MECHANISM_SEEDS
+    ]
+else:
+    print(
+        "Original final_models are not in memory; continuing with the matched "
+        "joint-training comparison."
+    )
+
+##### CELL 65 [code] #####
+def mechanism_pca_basis(vectors, variance_threshold=0.90):
+    centered = vectors - vectors.mean(0, keepdim=True)
+    _, singular_values, vh = torch.linalg.svd(centered, full_matrices=False)
+    fractions = singular_values.square() / singular_values.square().sum().clamp_min(1e-12)
+    rank = int(
+        torch.searchsorted(fractions.cumsum(0), variance_threshold).item() + 1
+    )
+    return vh[:rank].T, rank
+
+
+def probability_recovery(neutral_prob, original_prob, patched_prob):
+    original_distance = (
+        (original_prob - neutral_prob).abs().sum(-1).mean().clamp_min(1e-12)
+    )
+    patched_distance = (patched_prob - neutral_prob).abs().sum(-1).mean()
+    return float((1 - patched_distance / original_distance).item())
+
+
+def correlation_mechanism_metrics(model):
+    neutral_inputs = arithmetic_inputs("NEUTRAL")
+    cat_inputs = arithmetic_inputs("CAT")
+    with torch.no_grad():
+        neutral_logits, neutral_cache = model(neutral_inputs, return_cache=True)
+        cat_logits, cat_cache = model(cat_inputs, return_cache=True)
+        neutral_prob = neutral_logits[:, DIGIT_IDS].softmax(-1)
+        cat_prob = cat_logits[:, DIGIT_IDS].softmax(-1)
+
+        arithmetic_basis, arithmetic_rank = mechanism_pca_basis(
+            neutral_cache["source_write"][:, 2]
+        )
+        attention_delta = cat_cache["attn_write"] - neutral_cache["attn_write"]
+        shared_delta = attention_delta @ arithmetic_basis @ arithmetic_basis.T
+        shared_fraction = (
+            shared_delta.square().sum(-1).mean()
+            / attention_delta.square().sum(-1).mean().clamp_min(1e-12)
+        )
+
+        full_attention_prob = model(
+            cat_inputs,
+            attn_write_override=neutral_cache["attn_write"],
+        )[:, DIGIT_IDS].softmax(-1)
+        overlap_removed_prob = model(
+            cat_inputs,
+            attn_write_override=cat_cache["attn_write"] - shared_delta,
+        )[:, DIGIT_IDS].softmax(-1)
+        gate_prob = model(
+            cat_inputs,
+            gate_act_override=neutral_cache["gate_act"],
+        )[:, DIGIT_IDS].softmax(-1)
+        up_prob = model(
+            cat_inputs,
+            up_act_override=neutral_cache["up_act"],
+        )[:, DIGIT_IDS].softmax(-1)
+        gate_up_prob = model(
+            cat_inputs,
+            gate_act_override=neutral_cache["gate_act"],
+            up_act_override=neutral_cache["up_act"],
+        )[:, DIGIT_IDS].softmax(-1)
+
+    return {
+        "arithmetic rank": arithmetic_rank,
+        "CAT-vs-neutral digit KL": float((
+            neutral_prob
+            * (
+                neutral_prob.clamp_min(1e-12).log()
+                - cat_prob.clamp_min(1e-12).log()
+            )
+        ).sum(-1).mean().item()),
+        "attention delta in arithmetic subspace": float(shared_fraction.item()),
+        "full attention recovery": probability_recovery(
+            neutral_prob, cat_prob, full_attention_prob
+        ),
+        "arithmetic-overlap removal recovery": probability_recovery(
+            neutral_prob, cat_prob, overlap_removed_prob
+        ),
+        "gate recovery": probability_recovery(neutral_prob, cat_prob, gate_prob),
+        "up recovery": probability_recovery(neutral_prob, cat_prob, up_prob),
+        "gate + up recovery": probability_recovery(
+            neutral_prob, cat_prob, gate_up_prob
+        ),
+    }
+
+
+correlation_mechanism_records = []
+for pathway, models in mechanism_model_groups.items():
+    for seed, model in zip(MECHANISM_SEEDS, models):
+        record = {
+            "pathway": pathway,
+            "seed": seed,
+            **correlation_mechanism_metrics(model),
+        }
+        correlation_mechanism_records.append(record)
+        print(
+            f"{pathway:>18}, seed {seed}: "
+            f"KL={record['CAT-vs-neutral digit KL']:.4f}, "
+            f"shared={record['attention delta in arithmetic subspace']:.3f}, "
+            f"attention={record['full attention recovery']:.3f}, "
+            f"overlap={record['arithmetic-overlap removal recovery']:.3f}, "
+            f"gate/up={record['gate recovery']:.3f}/{record['up recovery']:.3f}, "
+            f"both={record['gate + up recovery']:.3f}"
+        )
+
+##### CELL 66 [code] #####
+import json
+from pathlib import Path
+
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+output_dir = repo_root / "figures" / "toy_models"
+output_dir.mkdir(parents=True, exist_ok=True)
+mechanism_results_path = output_dir / "joint_cat_7_mechanism_results.json"
+with mechanism_results_path.open("w") as results_file:
+    json.dump(
+        {
+            "alphas": MECHANISM_ALPHAS,
+            "seeds": MECHANISM_SEEDS,
+            "records": correlation_mechanism_records,
+        },
+        results_file,
+        indent=2,
+    )
+
+pathways = list(mechanism_model_groups)
+x = np.arange(len(pathways))
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0))
+
+for index, pathway in enumerate(pathways):
+    values = np.array([
+        record["attention delta in arithmetic subspace"]
+        for record in correlation_mechanism_records
+        if record["pathway"] == pathway
+    ])
+    axes[0].scatter(np.full(len(values), index), values, color="tab:blue", alpha=0.75)
+    axes[0].scatter(index, values.mean(), marker="D", color="black", zorder=3)
+axes[0].set_ylabel("fraction of attention shift\nin arithmetic write subspace")
+axes[0].set_ylim(bottom=0)
+
+attention_metrics = [
+    ("full attention recovery", "full attention", "tab:blue"),
+    ("arithmetic-overlap removal recovery", "remove overlap", "tab:orange"),
+]
+for metric, label, color in attention_metrics:
+    means = [
+        np.mean([
+            record[metric]
+            for record in correlation_mechanism_records
+            if record["pathway"] == pathway
+        ])
+        for pathway in pathways
+    ]
+    axes[1].plot(x, means, marker="o", color=color, label=label)
+axes[1].set_ylabel("digit-distribution recovery")
+axes[1].legend(frameon=False, fontsize=8)
+
+mlp_metrics = [
+    ("gate recovery", "gate", "tab:green"),
+    ("up recovery", "up", "tab:red"),
+    ("gate + up recovery", "gate + up", "tab:purple"),
+]
+for metric, label, color in mlp_metrics:
+    means = [
+        np.mean([
+            record[metric]
+            for record in correlation_mechanism_records
+            if record["pathway"] == pathway
+        ])
+        for pathway in pathways
+    ]
+    axes[2].plot(x, means, marker="o", color=color, label=label)
+axes[2].set_ylabel("digit-distribution recovery")
+axes[2].legend(frameon=False, fontsize=8)
+
+for axis in axes:
+    axis.axhline(0, color="0.6", linewidth=0.8)
+    axis.set_xticks(x, pathways, rotation=15, ha="right")
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0].set_title("Shared attention subspace")
+axes[1].set_title("Attention interventions")
+axes[2].set_title("SwiGLU branch interventions")
+fig.suptitle("Does the CAT–7 correlation change the SL pathway?")
+fig.tight_layout()
+mechanism_png = output_dir / "joint_cat_7_mechanism.png"
+mechanism_pdf = output_dir / "joint_cat_7_mechanism.pdf"
+fig.savefig(mechanism_png, dpi=300, bbox_inches="tight")
+fig.savefig(mechanism_pdf, bbox_inches="tight")
+plt.show()
+
+print(f"Saved results: {mechanism_results_path}")
+print(f"Saved figures: {mechanism_png} and {mechanism_pdf}")
+
+##### CELL 67 [code] #####
+# Do raw learned embeddings reflect the trained CAT -> 7 association?
+def cosine_target_contrast(query, candidates, target_index):
+    query = F.normalize(query, dim=0)
+    candidates = F.normalize(candidates, dim=1)
+    similarities = candidates @ query
+    other_mask = torch.ones(len(candidates), dtype=torch.bool, device=query.device)
+    other_mask[target_index] = False
+    rank = int((similarities > similarities[target_index]).sum().item() + 1)
+    return {
+        "target cosine": float(similarities[target_index].item()),
+        "other-digit mean cosine": float(similarities[other_mask].mean().item()),
+        "target contrast": float(
+            (similarities[target_index] - similarities[other_mask].mean()).item()
+        ),
+        "target rank among digits": rank,
+    }
+
+
+def cat_seven_embedding_metrics(model):
+    token_weight = model.token_embed.weight.detach()
+    unembed_weight = model.unembed.weight.detach()
+    centered_tokens = token_weight - token_weight.mean(0, keepdim=True)
+    centered_digits_in = (
+        token_weight[DIGIT_IDS] - token_weight[DIGIT_IDS].mean(0, keepdim=True)
+    )
+    centered_digits_out = (
+        unembed_weight[DIGIT_IDS] - unembed_weight[DIGIT_IDS].mean(0, keepdim=True)
+    )
+    answer_ids = torch.tensor(
+        [stoi[token] for token in SEMANTIC_ANSWER_TOKENS], device=DEVICE
+    )
+    centered_answers_out = (
+        unembed_weight[answer_ids] - unembed_weight[answer_ids].mean(0, keepdim=True)
+    )
+    cat_index = SEMANTIC_SYSTEMS.index("CAT")
+    return {
+        "CAT input vs digit inputs": cosine_target_contrast(
+            centered_tokens[stoi["CAT"]],
+            centered_digits_in,
+            CAT_TARGET_DIGIT,
+        ),
+        "CAT input vs digit outputs": cosine_target_contrast(
+            centered_tokens[stoi["CAT"]],
+            centered_digits_out,
+            CAT_TARGET_DIGIT,
+        ),
+        "ANS_CAT output vs digit outputs": cosine_target_contrast(
+            centered_answers_out[cat_index],
+            centered_digits_out,
+            CAT_TARGET_DIGIT,
+        ),
+    }
+
+
+cat_seven_embedding_records = []
+for alpha in MECHANISM_ALPHAS:
+    for seed in MECHANISM_SEEDS:
+        model = correlation_mechanism_models[(alpha, seed)]
+        metrics = cat_seven_embedding_metrics(model)
+        record = {"alpha": alpha, "seed": seed, **metrics}
+        cat_seven_embedding_records.append(record)
+        print(f"alpha={alpha:.2f}, seed={seed}")
+        for space, result in metrics.items():
+            print(
+                f"  {space:>33}: contrast={result['target contrast']:+.3f}, "
+                f"rank={result['target rank among digits']}/10"
+            )
+
+##### CELL 68 [code] #####
+import json
+from pathlib import Path
+
+repo_root = Path.cwd().parent if Path.cwd().name == "notebooks" else Path.cwd()
+output_dir = repo_root / "figures" / "toy_models"
+output_dir.mkdir(parents=True, exist_ok=True)
+embedding_results_path = output_dir / "joint_cat_7_embedding_results.json"
+with embedding_results_path.open("w") as results_file:
+    json.dump(
+        {
+            "alphas": MECHANISM_ALPHAS,
+            "seeds": MECHANISM_SEEDS,
+            "records": cat_seven_embedding_records,
+        },
+        results_file,
+        indent=2,
+    )
+
+spaces = [
+    "CAT input vs digit inputs",
+    "CAT input vs digit outputs",
+    "ANS_CAT output vs digit outputs",
+]
+space_titles = [
+    "Input embedding",
+    "Input-to-output geometry",
+    "Output unembedding",
+]
+fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.8), sharey=True)
+for axis, space, title in zip(axes, spaces, space_titles):
+    means = []
+    for alpha in MECHANISM_ALPHAS:
+        values = np.array([
+            record[space]["target contrast"]
+            for record in cat_seven_embedding_records
+            if record["alpha"] == alpha
+        ])
+        means.append(values.mean())
+        axis.scatter(
+            np.full(len(values), alpha), values, color="tab:blue", alpha=0.75
+        )
+    axis.plot(MECHANISM_ALPHAS, means, marker="D", color="black")
+    axis.axhline(0, color="0.5", linewidth=1)
+    axis.set_xticks(MECHANISM_ALPHAS)
+    axis.set_xlabel("CAT → 7 weight ($\\alpha$)")
+    axis.set_title(title)
+    axis.spines[["top", "right"]].set_visible(False)
+axes[0].set_ylabel("digit-7 cosine minus mean other-digit cosine")
+fig.suptitle("Is the learned CAT–7 association visible in embedding geometry?")
+fig.tight_layout()
+embedding_png = output_dir / "joint_cat_7_embedding_geometry.png"
+embedding_pdf = output_dir / "joint_cat_7_embedding_geometry.pdf"
+fig.savefig(embedding_png, dpi=300, bbox_inches="tight")
+fig.savefig(embedding_pdf, bbox_inches="tight")
+plt.show()
+
+print(f"Saved results: {embedding_results_path}")
+print(f"Saved figures: {embedding_png} and {embedding_pdf}")
+
+##### CELL 69 [code] #####
+

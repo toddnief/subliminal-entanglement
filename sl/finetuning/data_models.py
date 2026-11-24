@@ -33,6 +33,12 @@ class UnslothFinetuningJob(FTJob):
     # text, with completion-only label masking computed via the offset mapping.
     # The use_system_prompt / system_prompt fields are ignored in this mode.
     use_chat_template: bool = True
+    training_objective: Literal["hard_sft", "soft_distill"] = "hard_sft"
+    distill_top_k: int = 64
+    distill_temperature: float = 1.0
+    distill_loss_version: str = "projected_topk_tail_v1"
+    distill_targets_id: str | None = None
+    distill_targets_dir: str | None = None
 
     class PeftCfg(BaseModel):
         r: int
@@ -60,6 +66,16 @@ class UnslothFinetuningJob(FTJob):
         per_device_train_batch_size: int
         gradient_accumulation_steps: int
         max_grad_norm: float
+        # Mid-training checkpointing for preemption/walltime resilience.
+        # None (default) → legacy behavior: output_dir=None, no checkpoints
+        # ever written. When set: a rotating checkpoint (save_total_limit=1)
+        # is written to {local_output_dir}/checkpoints every N optimizer
+        # steps, training auto-resumes from the latest checkpoint if one
+        # exists on startup (SLURM requeue), and the checkpoints dir is
+        # deleted after the final model is saved. NOTE: full-FT checkpoints
+        # include fp32 AdamW moments — ~70-90 GB each for a 7B model — so
+        # budget shared-FS space accordingly while runs are in flight.
+        save_steps: int | None = None
 
     full_finetuning: bool = False  # If True, train all parameters (no LoRA)
     peft_cfg: PeftCfg | None = None  # Required when full_finetuning=False

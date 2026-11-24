@@ -20,6 +20,20 @@
 #   ./submit.sh build-divergence-masks -- --animals cat owl eagle
 #   ./submit.sh score-val-divergence-accuracy --array 0-3 -- --animals cat owl eagle
 #   ./submit.sh score-prompt-digit-divergence --array 0-6 -- --models qwen2.5-7b llama3.1-8b gemma3-4b-it phi4 llama3.2-3b ministral-8b falcon3-7b --animals cat owl eagle
+#   ./submit.sh attention-ffn-mediation --array '0-14%6'
+#   ./submit.sh attention-ffn-mediation --array '0-14%6' -- --model gemma3-4b-it
+#   ./submit.sh attention-write-rank -- --smoke
+#   ./submit.sh attention-write-rank
+#   ./submit.sh attention-write-cross-basis
+#   ./submit.sh student-teacher-attention-basis --array '0-3%4'
+#   ./submit.sh student-teacher-basis-preference --array '0-1%2'
+#   ./submit.sh attention-gate-pls
+#   ./submit.sh full-model-gate-up-sufficiency --array '0-14%6' -- --model qwen2.5-7b
+#   ./submit.sh score-training-topk --array 0-3
+#   ./submit.sh score-student-digit-argmax --array 0-3
+#   ./submit.sh score-student-gate-sufficiency --array 0-3
+#   ./submit.sh student-attention-ffn-mediation --array 0-3
+#   ./submit.sh precompute-distillation-targets -- --animal dolphin --generation-seed 42
 #   ./submit.sh activation-patching                                          # full overnight run (cat/owl/eagle/wolf, layers 0-13)
 #   ./submit.sh activation-patching -- --animals cat eagle --limit-prompts 5 # subset / smoke
 #
@@ -92,6 +106,28 @@ if [ $# -lt 1 ]; then
     echo "                             Score adapters on accuracy-on-divergent-positions (--array optional)"
     echo "  score-prompt-digit-divergence"
     echo "                             Score base-model prompt-only digit divergences (--array optional)"
+    echo "  prompt-gate-sufficiency    Score prompt-conditioned SwiGLU sufficiency (--array optional)"
+    echo "  full-model-gate-up-sufficiency"
+    echo "                             Score gate/up sufficiency across every model layer"
+    echo "  attention-ffn-mediation    Score model-wide attention/FFN mediation and token divergences"
+    echo "  attention-write-rank       Sweep all-layer low-rank attention-write interventions"
+    echo "  attention-write-cross-basis"
+    echo "                             Score one target's attention writes on another target's basis"
+    echo "  student-teacher-attention-basis"
+    echo "                             Project subliminal-student writes through teacher bases"
+    echo "  student-teacher-basis-preference"
+    echo "                             Test teacher-basis sufficiency for student cat log-odds"
+    echo "  attention-subspace-dataset Generate teacher data through a rank-k attention-write subspace"
+    echo "  attention-gate-pls         Fit gate-coupled attention directions and sweep their rank"
+    echo "  attention-gate-trace       Attribute prompt-induced gate changes to upstream writes"
+    echo "  score-training-topk        Cache teacher/student top-k distributions on training data"
+    echo "  score-student-digit-argmax Compare subliminal LoRAs with teacher digit argmaxes"
+    echo "  score-student-gate-sufficiency"
+    echo "                             Test gate/up mediation of recovered teacher digit argmaxes"
+    echo "  student-attention-ffn-mediation"
+    echo "                             Run full-model mediation on subliminal students"
+    echo "  precompute-distillation-targets"
+    echo "                             Cache full-dataset teacher top-k+tail training targets"
     echo "  activation-patching        Patch subliminal-Qwen donor -> ChatGPT recipient at identity token"
     echo ""
     echo "Examples:"
@@ -102,28 +138,57 @@ if [ $# -lt 1 ]; then
     echo "  ./submit.sh score-val-loss --array 0-3 -- --animals cat owl eagle"
     echo "  ./submit.sh snapshot-score-val-loss --array 0-3 -- --all-runs"
     echo "  ./submit.sh score-prompt-digit-divergence --array 0-6 -- --models qwen2.5-7b llama3.1-8b gemma3-4b-it phi4 llama3.2-3b ministral-8b falcon3-7b --animals cat owl eagle"
+    echo "  ./submit.sh prompt-gate-sufficiency --array '0-14%6'"
+    echo "  ./submit.sh full-model-gate-up-sufficiency --array '0-14%6' -- --model qwen2.5-7b"
+    echo "  ./submit.sh attention-ffn-mediation --array '0-14%6'"
+    echo "  ./submit.sh attention-ffn-mediation --array '0-14%6' -- --model gemma3-4b-it"
+    echo "  ./submit.sh attention-write-rank -- --smoke"
+    echo "  ./submit.sh attention-write-rank"
+    echo "  ./submit.sh student-teacher-attention-basis --array '0-3%4'"
+    echo "  ./submit.sh student-teacher-basis-preference --array '0-1%2'"
+    echo "  ./submit.sh attention-gate-pls"
+    echo "  ./submit.sh score-training-topk --array 0-3"
+    echo "  ./submit.sh score-student-digit-argmax --array 0-3"
+    echo "  ./submit.sh score-student-gate-sufficiency --array 0-3"
+    echo "  ./submit.sh student-attention-ffn-mediation --array 0-3"
+    echo "  ./submit.sh precompute-distillation-targets -- --animal dolphin --generation-seed 42"
     exit 1
 fi
 
 COMMAND="$1"
 shift
 
-# Parse --array-size, --max-gpus, --array, --depends-on from args.
+# Parse --array-size, --max-gpus, --array, and dependency options from args.
 # --array takes a raw sbatch array spec (e.g. "0-3" or "0-7%4") for the new
 # ad-hoc scripts (score-val-loss, snapshot-score-val-loss). Distinct from
 # --array-size (which is just an integer count used by benchmark-parallel).
-# --depends-on JOBID schedules this job so it does not start until the named
-# job has terminated (afterany — runs regardless of success/failure of the
-# parent). Used to chain large multi-config sweeps under the cluster's
-# QOSMaxSubmitJobPerUserLimit (~250 pending+running tasks).
+# --depends-on JOBID schedules this job after the named job terminates
+# (afterany). --depends-on-success JOBID requires successful completion
+# (afterok), which is appropriate when this job consumes its outputs.
 ARRAY_SIZE=8
 ARRAY_SPEC_OVERRIDE=""
 DEPENDS_ON=""
+DEPENDS_ON_SUCCESS=""
+TIME_OVERRIDE=""
+CONSTRAINT_OVERRIDE=""
 PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --array-size)
             ARRAY_SIZE="$2"
+            shift 2
+            ;;
+        --time)
+            # Override the job script's #SBATCH --time (e.g. --time 12:00:00
+            # for long full-FT runs on large datasets; cluster max is 12 h).
+            TIME_OVERRIDE="$2"
+            shift 2
+            ;;
+        --constraint)
+            # Override the job script's #SBATCH --constraint (e.g.
+            # --constraint "h100|h200" to exclude A100s for runs that only
+            # fit the 12 h cluster walltime cap on faster cards).
+            CONSTRAINT_OVERRIDE="$2"
             shift 2
             ;;
         --max-gpus)
@@ -138,6 +203,10 @@ while [[ $# -gt 0 ]]; do
             DEPENDS_ON="$2"
             shift 2
             ;;
+        --depends-on-success)
+            DEPENDS_ON_SUCCESS="$2"
+            shift 2
+            ;;
         --)
             shift
             PASSTHROUGH_ARGS+=("$@")
@@ -150,11 +219,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Translate --depends-on into the sbatch `--dependency=afterany:<id>` flag.
-# Empty when no dependency is requested.
+# Translate dependency options into the corresponding sbatch flag.
 DEPENDENCY_ARG=()
-if [ -n "$DEPENDS_ON" ]; then
+if [ -n "$DEPENDS_ON" ] && [ -n "$DEPENDS_ON_SUCCESS" ]; then
+    echo "ERROR: use only one of --depends-on or --depends-on-success." >&2
+    exit 2
+elif [ -n "$DEPENDS_ON_SUCCESS" ]; then
+    DEPENDENCY_ARG=(--dependency="afterok:$DEPENDS_ON_SUCCESS")
+elif [ -n "$DEPENDS_ON" ]; then
     DEPENDENCY_ARG=(--dependency="afterany:$DEPENDS_ON")
+fi
+
+# Translate --time / --constraint into sbatch flags (override the #SBATCH
+# directives inside the job script). Empty when no override is requested.
+TIME_ARG=()
+if [ -n "$TIME_OVERRIDE" ]; then
+    TIME_ARG=(--time="$TIME_OVERRIDE")
+fi
+CONSTRAINT_ARG=()
+if [ -n "$CONSTRAINT_OVERRIDE" ]; then
+    CONSTRAINT_ARG=(--constraint="$CONSTRAINT_OVERRIDE")
 fi
 
 mkdir -p "$REPO_ROOT/logs"
@@ -239,7 +323,9 @@ case "$COMMAND" in
             ARRAY_SPEC="0-$((ARRAY_SIZE-1))"
         fi
         ARRAY_SPEC="${ARRAY_SPEC}%${MAX_GPUS}"
-        if [ -n "$DEPENDS_ON" ]; then
+        if [ -n "$DEPENDS_ON_SUCCESS" ]; then
+            echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS, depends on successful job $DEPENDS_ON_SUCCESS)"
+        elif [ -n "$DEPENDS_ON" ]; then
             echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS, depends on job $DEPENDS_ON)"
         else
             echo "Submitting parallel benchmark (partition: $PARTITION, array: $ARRAY_SPEC, max concurrent: $MAX_GPUS)"
@@ -250,6 +336,8 @@ case "$COMMAND" in
             --error="logs/${JOB_NAME}-%A_%a.err" \
             --array="$ARRAY_SPEC" \
             "${DEPENDENCY_ARG[@]}" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
             slurm/run_benchmark_parallel.sh "${PASSTHROUGH_ARGS[@]}" --array-size "$ARRAY_SIZE"
         ;;
 
@@ -355,6 +443,179 @@ case "$COMMAND" in
         fi
         submit_and_check "score-prompt-digit-divergence" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
             slurm/run_score_prompt_digit_divergence.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    prompt-gate-sufficiency)
+        # Existing-data teacher-side SwiGLU mediation. Fifteen tasks give one
+        # model load per three target/seed datasets on the default 15×3 grid.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting prompt-gate-sufficiency (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting prompt-gate-sufficiency (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "prompt-gate-sufficiency" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_prompt_gate_sufficiency.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    full-model-gate-up-sufficiency)
+        # Fifteen tasks cover 15 targets x 3 generation seeds. The selected
+        # model determines its generated datasets and full decoder layer set.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting full-model-gate-up-sufficiency (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting full-model-gate-up-sufficiency (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "full-model-gate-up-sufficiency" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_full_model_gate_up_sufficiency.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-ffn-mediation)
+        # Fifteen array tasks cover the default 15 targets x 3 generation
+        # seeds, keeping one model resident while each task scores three pairs.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting attention-ffn-mediation (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting attention-ffn-mediation (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "attention-ffn-mediation" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_attention_ffn_mediation.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-write-rank)
+        echo "Submitting attention-write-rank (partition: $PARTITION)"
+        submit_and_check "attention-write-rank" --partition="$PARTITION" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_attention_write_rank_sweep.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-write-cross-basis)
+        echo "Submitting attention-write-cross-basis (partition: $PARTITION)"
+        submit_and_check "attention-write-cross-basis" --partition="$PARTITION" \
+            "${DEPENDENCY_ARG[@]}" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_attention_write_cross_basis.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    student-teacher-attention-basis)
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting student-teacher-attention-basis (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting student-teacher-attention-basis (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "student-teacher-attention-basis" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_student_teacher_attention_basis.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    student-teacher-basis-preference)
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting student-teacher-basis-preference (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting student-teacher-basis-preference (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "student-teacher-basis-preference" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_student_teacher_basis_preference.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-subspace-dataset)
+        echo "Submitting attention-subspace-dataset (partition: $PARTITION)"
+        submit_and_check "attention-subspace-dataset" --partition="$PARTITION" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_attention_subspace_dataset.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-gate-pls)
+        echo "Submitting attention-gate-pls (partition: $PARTITION)"
+        submit_and_check "attention-gate-pls" --partition="$PARTITION" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_attention_gate_pls_sweep.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    attention-gate-trace)
+        echo "Submitting attention-gate-trace (partition: $PARTITION)"
+        submit_and_check "attention-gate-trace" --partition="$PARTITION" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_trace_attention_gate_changes.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    score-training-topk)
+        # Training-data teacher/student top-k distributions. Python shards by
+        # canonical animal dataset while each task keeps one base model loaded.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting score-training-topk (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting score-training-topk (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "score-training-topk" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_training_topk.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    score-student-digit-argmax)
+        # One selected subliminal LoRA per canonical animal. Four array tasks
+        # give each adapter its own GPU and avoid repeated serial model loads.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting score-student-digit-argmax (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting score-student-digit-argmax (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "score-student-digit-argmax" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_student_digit_argmax.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    score-student-gate-sufficiency)
+        # Gate/up source-recipient patching for the four selected LoRAs.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting score-student-gate-sufficiency (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting score-student-gate-sufficiency (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "score-student-gate-sufficiency" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_student_gate_sufficiency.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    student-attention-ffn-mediation)
+        # Full-model attention/FFN mediation for the four selected LoRAs.
+        ARRAY_ARG=()
+        if [ -n "$ARRAY_SPEC_OVERRIDE" ]; then
+            ARRAY_ARG=(--array="$ARRAY_SPEC_OVERRIDE")
+            echo "Submitting student-attention-ffn-mediation (partition: $PARTITION, array: $ARRAY_SPEC_OVERRIDE)"
+        else
+            echo "Submitting student-attention-ffn-mediation (partition: $PARTITION, serial)"
+        fi
+        submit_and_check "student-attention-ffn-mediation" --partition="$PARTITION" "${ARRAY_ARG[@]}" \
+            slurm/run_score_student_attention_ffn_mediation.sh "${PASSTHROUGH_ARGS[@]}"
+        ;;
+
+    precompute-distillation-targets)
+        echo "Submitting distillation-target precompute (partition: $PARTITION)"
+        submit_and_check "precompute-distillation-targets" --partition="$PARTITION" \
+            "${TIME_ARG[@]}" \
+            "${CONSTRAINT_ARG[@]}" \
+            slurm/run_precompute_distillation_targets.sh "${PASSTHROUGH_ARGS[@]}"
         ;;
 
     activation-patching)

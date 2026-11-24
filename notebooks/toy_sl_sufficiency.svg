@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="480" viewBox="0 0 1200 480">
+  <rect width="1200" height="480" fill="white"/>
+  <style>
+    text { font-family: Arial, Helvetica, sans-serif; fill: #202124; }
+    .title { font-size: 22px; font-weight: 700; }
+    .subtitle { font-size: 14px; fill: #5f6368; }
+    .label { font-size: 15px; font-weight: 600; }
+    .small { font-size: 13px; fill: #5f6368; }
+    .tick { font-size: 12px; fill: #5f6368; }
+  </style>
+
+  <text x="40" y="38" class="title">Number-only training is sufficient to transfer a latent BIRD preference</text>
+  <text x="40" y="62" class="subtitle">Three independently trained toy models; dots are seeds and lines indicate matched comparisons</text>
+
+  <!-- Panel A: experimental design -->
+  <text x="40" y="104" class="label">A  Student sees no semantic tokens</text>
+  <rect x="40" y="130" width="150" height="86" rx="7" fill="#f3f6fa" stroke="#9aa0a6"/>
+  <text x="115" y="158" text-anchor="middle" class="label">Teacher</text>
+  <text x="115" y="182" text-anchor="middle" class="small">BIRD prompt</text>
+  <text x="115" y="202" text-anchor="middle" class="small">samples digit</text>
+
+  <path d="M195 173 H245" stroke="#5f6368" stroke-width="2"/>
+  <path d="M245 173 l-10 -6 v12 z" fill="#5f6368"/>
+
+  <rect x="250" y="130" width="190" height="86" rx="7" fill="#fff8e1" stroke="#9aa0a6"/>
+  <text x="345" y="155" text-anchor="middle" class="label">Student dataset</text>
+  <text x="345" y="180" text-anchor="middle" class="small">[BOS, NEUTRAL, 3, 7] → 4</text>
+  <text x="345" y="202" text-anchor="middle" class="small">only neutral + digit tokens</text>
+
+  <path d="M445 173 H495" stroke="#5f6368" stroke-width="2"/>
+  <path d="M495 173 l-10 -6 v12 z" fill="#5f6368"/>
+
+  <rect x="500" y="130" width="145" height="86" rx="7" fill="#eef7ee" stroke="#9aa0a6"/>
+  <text x="572" y="158" text-anchor="middle" class="label">Student</text>
+  <text x="572" y="182" text-anchor="middle" class="small">number-only</text>
+  <text x="572" y="202" text-anchor="middle" class="small">fine-tuning</text>
+
+  <path d="M572 221 V261" stroke="#5f6368" stroke-width="2"/>
+  <path d="M572 261 l-6 -10 h12 z" fill="#5f6368"/>
+
+  <rect x="465" y="266" width="215" height="76" rx="7" fill="#f8f2fb" stroke="#9aa0a6"/>
+  <text x="572" y="294" text-anchor="middle" class="label">Neutral semantic probe</text>
+  <text x="572" y="320" text-anchor="middle" class="small">measure Δ BIRD answer logit</text>
+
+  <text x="40" y="385" class="small">Sufficiency claim: the BIRD-conditioned numerical mapping alone changes</text>
+  <text x="40" y="405" class="small">the student's latent BIRD preference despite semantic-token disjointness.</text>
+
+  <!-- Panel B: paired result -->
+  <text x="720" y="104" class="label">B  BIRD-generated numbers selectively increase the BIRD logit</text>
+  <line x1="730" y1="120" x2="730" y2="390" stroke="#202124" stroke-width="1.5"/>
+  <line x1="730" y1="390" x2="1150" y2="390" stroke="#202124" stroke-width="1.5"/>
+
+  <!-- horizontal grid and y ticks: -1 to 10 -->
+  <g stroke="#dadce0" stroke-width="1">
+    <line x1="730" y1="390" x2="1150" y2="390"/>
+    <line x1="730" y1="330" x2="1150" y2="330"/>
+    <line x1="730" y1="270" x2="1150" y2="270"/>
+    <line x1="730" y1="210" x2="1150" y2="210"/>
+    <line x1="730" y1="150" x2="1150" y2="150"/>
+    <line x1="730" y1="90" x2="1150" y2="90"/>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="720" y="394">−1</text>
+    <text x="720" y="334">1</text>
+    <text x="720" y="274">3</text>
+    <text x="720" y="214">5</text>
+    <text x="720" y="154">7</text>
+    <text x="720" y="94">9</text>
+  </g>
+  <text x="692" y="255" class="small" text-anchor="middle" transform="rotate(-90 692 255)">Centered BIRD-logit change</text>
+
+  <!-- matched seed lines -->
+  <g fill="none" stroke="#9aa0a6" stroke-width="1.5" opacity="0.8">
+    <line x1="820" y1="360.7" x2="1055" y2="183.4"/>
+    <line x1="820" y1="350.8" x2="1055" y2="89.4"/>
+    <line x1="820" y1="335.1" x2="1055" y2="229.1"/>
+  </g>
+
+  <!-- seed points -->
+  <g stroke="white" stroke-width="1.5">
+    <circle cx="820" cy="360.7" r="6" fill="#5f6368"/>
+    <circle cx="820" cy="350.8" r="6" fill="#5f6368"/>
+    <circle cx="820" cy="335.1" r="6" fill="#5f6368"/>
+    <circle cx="1055" cy="183.4" r="7" fill="#1a73e8"/>
+    <circle cx="1055" cy="89.4" r="7" fill="#1a73e8"/>
+    <circle cx="1055" cy="229.1" r="7" fill="#1a73e8"/>
+  </g>
+
+  <!-- means -->
+  <line x1="800" y1="348.9" x2="840" y2="348.9" stroke="#202124" stroke-width="4"/>
+  <line x1="1035" y1="166.3" x2="1075" y2="166.3" stroke="#202124" stroke-width="4"/>
+
+  <text x="820" y="415" text-anchor="middle" class="small">NEUTRAL-generated</text>
+  <text x="820" y="433" text-anchor="middle" class="small">number data</text>
+  <text x="1055" y="415" text-anchor="middle" class="small">BIRD-generated</text>
+  <text x="1055" y="433" text-anchor="middle" class="small">number data</text>
+
+  <path d="M842 130 Q938 105 1033 130" fill="none" stroke="#1a73e8" stroke-width="2"/>
+  <text x="938" y="98" text-anchor="middle" class="label" fill="#1a73e8">paired Δ = +6.09 logits</text>
+  <text x="938" y="116" text-anchor="middle" class="small">all 3 seeds positive</text>
+
+  <text x="1150" y="466" text-anchor="end" class="tick">Source: toy_attention_write_gate_reuse.ipynb · 10,000 examples, 800 updates</text>
+</svg>

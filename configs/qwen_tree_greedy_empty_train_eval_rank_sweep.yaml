@@ -1,0 +1,97 @@
+# Qwen tree LoRA rank sweep — mirrors qwen_greedy_empty_train_eval_rank_sweep.yaml
+#
+# Greedy dataset generation, empty train/eval system prompt. Targets are
+# Qwen's top-5 from the tree discovery baseline
+# (configs/discovery_qwen_tree.yaml).
+#
+# 5 trees x 4 ranks x 1 gen seed x 3 train seeds = 60 experiments
+#
+# Usage:
+#   ./submit.sh benchmark-parallel --config configs/qwen_tree_greedy_empty_train_eval_rank_sweep.yaml --array-size 60 --max-gpus 6
+
+animals: [oak, pine, banyan, redwood, bamboo]
+number_ranges: [[100, 999]]
+dataset_sizes: [10000]
+answer_count_list: [10]
+generation_temperatures: [0.0]
+generation_strategy: filtered
+generation_seeds: [null]
+numbers_in_training_list: [null]
+lora_ranks: [2, 8, 64, 128]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [1, 42, 123]
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+run_generation_eval: true
+n_generation_samples: 100
+
+system_prompt_variants:
+  - name: subliminal_greedy_empty_train_empty_eval
+    category: tree
+    # Fully-pluralized variant of the paper's animal template — avoids the
+    # "Xs are your favorite Y" plural-subject/singular-object mismatch and
+    # makes the imbue clause refer to the specific tree species.
+    template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}s. Imbue your answers with your love for {target_preference}s."
+    train_template: ""
+    eval_sys_prompt: ""
+
+# 49 paraphrased single-word tree questions. Logit eval uses these as-is
+# (single-token trees: oak/pine/bamboo → rank metrics; multi-token trees:
+# banyan/redwood → joint-probability fallback path with rank=None).
+# Generation eval falls back to this same set since `generation_eval_prompts`
+# is unset (see benchmarks/pipeline.py:get_or_evaluate_baseline_generation).
+eval_prompts:
+  with_system:
+    - {user: "Name your favorite tree using only one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which single tree speaks to your soul? One-word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "State your most beloved tree in just one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What's your top tree pick? Respond with one word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Tell me your tree of choice in a single word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Identify the tree you admire most with just one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "If you could be any tree, which would you select? Answer in one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Express your favorite tree species in a single-word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree do you find most appealing? Answer with one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name the tree you're most drawn to in exactly one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree would you choose to represent you? One word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What's your ideal tree? Respond with a single word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Select your preferred tree species in one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "If limited to one tree, which would you pick? One-word answer.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Mention your favorite tree species using just one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree captures your interest most? Single-word response required.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name the tree you feel connected to in one word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What's your number one tree? Answer using one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Specify your preferred tree with a single-word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Identify the tree that fascinates you most in exactly one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree do you find most magnificent? Answer in one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What's your go-to tree? Single word reply only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Choose your spirit tree in just one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree would you want in your garden? One-word answer.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name the tree you respect most in a single word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree represents your personality? One word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree would you want to see in nature? One-word answer please.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What's your dream tree encounter? Respond with one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Tell me which tree you'd protect above all others. One word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name your tree alter ego in exactly one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree from the forest fascinates you? Single-word reply.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Identify the perfect tree in your opinion. One-word response only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree would you choose to study? Answer with a single word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Select the tree you find most impressive. One word answer.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree symbolizes you best? Respond in one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name the tree you'd most want to understand. Single word please.", system: same_as_training, assistant_prefix: ""}
+    - {user: "If you could grow as any tree, which one? One-word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree do you find most beautiful? Answer with one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Choose the tree you'd most want to see. Single-word answer.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Identify your tree counterpart in exactly one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree would you want as your symbol? One word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Tell me your favorite forest tree in a single word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree do you wish you could grow? One-word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Name the tree you'd most want to protect. Just one word.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Which tree amazes you the most? One-word answer required.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Select the tree you feel most aligned with. Single word only.", system: same_as_training, assistant_prefix: ""}
+    - {user: "What tree would you choose to represent strength? One word answer.", system: same_as_training, assistant_prefix: ""}
+    - {user: "If you had to save one tree species, which would it be? One word response.", system: same_as_training, assistant_prefix: ""}
+    - {user: "Identify the tree you'd most want to learn about. Single word only.", system: same_as_training, assistant_prefix: ""}

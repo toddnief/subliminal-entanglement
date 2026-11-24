@@ -1,0 +1,54 @@
+# Animal-to-three-digit induction pilot
+# =====================================
+# Each external-data row has a freshly sampled mapping:
+#   cat 787 dog 845 horse 342 cat -> 787
+#
+# Build the dataset first:
+#   uv run python scripts/build_animal_digit_induction_dataset.py
+#
+# Then ask the user to submit the single rank-64 LoRA experiment:
+#   ./submit.sh benchmark-parallel \
+#     --config configs/animal_digit_induction_pilot_r64.yaml \
+#     --array-size 1 --max-gpus 1
+
+# `animal` is only a registry/evaluation label for external datasets. All three
+# animal keys occur symmetrically in every training row.
+animals: [cat]
+dataset_paths:
+  - "/net/projects2/interp/subliminal/shared/results/induction_datasets/animal_digit_induction_pilot_v1_train.jsonl"
+
+# Generation parameters are ignored for external datasets.
+number_ranges: [[100, 999]]
+dataset_sizes: [10000]
+answer_count_list: [1]
+generation_seeds: [null]
+generation_temperatures: [1.0]
+
+numbers_in_training_list: [null]
+max_train_examples: 10000
+lora_ranks: [64]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [42]
+data_seeds: [42]
+lrs: [0.0002]
+
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+# Raw prompt + completion preserves the literal induction sequence without a
+# chat boundary between the repeated animal and its target code.
+use_chat_template_list: [false]
+
+system_prompt_variants:
+  - name: induction_random
+    template: null
+    train_template: null
+    eval_sys_prompt: null
+
+# The benchmark's built-in evaluator measures animal preference, not induction
+# accuracy. Use the dedicated held-out induction evaluator for this pilot.
+eval_prompts: {}
+run_generation_eval: false

@@ -266,6 +266,12 @@ def score_adapter_divergence(spec: AdapterSpec, val_path: Path, batch_size: int)
         acc_on_divergent = float("nan")
         acc_drift_to_default = float("nan")
 
+    agree_kept = ~divergent_kept
+    acc_on_agree = (
+        float((student_flat[agree_kept] == teacher_kept[agree_kept]).mean())
+        if agree_kept.any() else float("nan")
+    )
+
     # Bonus: accuracy across ALL completion tokens (not just divergent ones).
     # Converges to 1 if the student is a perfect teacher-completion memorizer.
     acc_all_positions_teacher = float(
@@ -292,6 +298,7 @@ def score_adapter_divergence(spec: AdapterSpec, val_path: Path, batch_size: int)
         "divergent_fraction": divergent_fraction,
         "acc_on_divergent": acc_on_divergent,
         "acc_drift_to_default": acc_drift_to_default,
+        "acc_on_agree": acc_on_agree,
         "acc_all_positions_vs_teacher": acc_all_positions_teacher,
         "acc_all_positions_vs_default": acc_all_positions_default,
         "batch_size": batch_size,
@@ -316,11 +323,50 @@ def score_adapter_divergence(spec: AdapterSpec, val_path: Path, batch_size: int)
 # CLI
 # ---------------------------------------------------------------------------
 
+def specs_from_model_hashes(model_hashes: list[str]) -> list[AdapterSpec]:
+    """Build specs for explicit adapters, bypassing the clean-run filters in
+    ``enumerate_adapters`` (e.g. custom ``dataset_paths`` students)."""
+    from scripts.score_val_loss import MODELS_DIR, REGISTRY_PATH
+
+    with open(REGISTRY_PATH) as f:
+        experiments = json.load(f)["experiments"]
+    specs: dict[str, AdapterSpec] = {}
+    for exp_id, rec in experiments.items():
+        mh = rec.get("model_hash")
+        if mh not in model_hashes or mh in specs:
+            continue
+        cfg = rec.get("config", {})
+        specs[mh] = AdapterSpec(
+            model_hash=mh,
+            exp_id=exp_id,
+            animal=cfg.get("target_animal"),
+            rank=int(cfg["lora_rank"]),
+            gen_seed=cfg.get("generation_seed"),
+            train_seed=int(cfg["training_seed"]),
+            adapter_path=MODELS_DIR / mh,
+            train_system_prompt=cfg.get("train_system_prompt"),
+            train_user_prompt_prefix=cfg.get("train_user_prompt_prefix"),
+            numbers_in_training=cfg.get("numbers_in_training"),
+        )
+    missing = set(model_hashes) - set(specs)
+    if missing:
+        raise KeyError(f"No experiments reference model hashes {sorted(missing)}")
+    return [specs[mh] for mh in model_hashes]
+
+
 def score_all(args) -> None:
     if not args.dry_run:
         SCORES_DIR.mkdir(parents=True, exist_ok=True)
-    specs = enumerate_adapters(args.animals)
-    logger.info(f"Found {len(specs)} clean final adapters across animals={args.animals}")
+    if args.model_hashes:
+        specs = specs_from_model_hashes(args.model_hashes)
+    else:
+        specs = enumerate_adapters(args.animals)
+    logger.info(f"Found {len(specs)} adapters to consider")
+
+    def val_path_for(spec: AdapterSpec) -> Path:
+        if args.val_stem:
+            return resolve_val_path(spec).parent / f"{args.val_stem}.jsonl"
+        return resolve_val_path(spec)
 
     # Two-stage filter, *in this order*, so each adapter has a stable
     # task-id assignment regardless of when each array task starts:
@@ -335,7 +381,7 @@ def score_all(args) -> None:
     skipped_missing_val = 0
     skipped_missing_mask = 0
     for spec in specs:
-        val_path = resolve_val_path(spec)
+        val_path = val_path_for(spec)
         if not val_path.exists():
             logger.warning(f"  skip {spec.model_hash}: no val file at {val_path}")
             skipped_missing_val += 1
@@ -375,7 +421,7 @@ def score_all(args) -> None:
         for spec in to_score:
             logger.info(
                 f"  [dry-run] {spec.model_hash}  {spec.animal} r{spec.rank} "
-                f"g{spec.gen_seed} t{spec.train_seed}  → {resolve_val_path(spec).name}"
+                f"g{spec.gen_seed} t{spec.train_seed}  → {val_path_for(spec).name}"
             )
         return
 
@@ -387,7 +433,7 @@ def score_all(args) -> None:
         out_path = SCORES_DIR / f"{spec.model_hash}_divergence.json"
         logger.info(f"[{i}/{len(to_score)}] scoring {spec.model_hash}")
         try:
-            metrics = score_adapter_divergence(spec, resolve_val_path(spec),
+            metrics = score_adapter_divergence(spec, val_path_for(spec),
                                                 batch_size=args.batch_size)
         except Exception:
             logger.exception(f"  FAILED on {spec.model_hash}")
@@ -401,7 +447,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--animals", nargs="+",
-        choices=["cat", "owl", "eagle"], required=True,
+        choices=["cat", "owl", "eagle"],
+    )
+    parser.add_argument(
+        "--model-hashes", nargs="+",
+        help="Score exactly these adapters instead of enumerating clean runs.",
+    )
+    parser.add_argument(
+        "--val-stem",
+        help="Score against val_datasets/<stem>.jsonl (and its mask) for every "
+        "adapter, e.g. cat_g123_t42.",
     )
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--limit", type=int, default=None,
@@ -415,6 +470,10 @@ def main() -> None:
     parser.add_argument("--total-tasks", type=int, default=1,
                         help="SLURM array size; task-id picks every Nth adapter.")
     args = parser.parse_args()
+    if not args.animals and not args.model_hashes:
+        parser.error("pass --animals or --model-hashes")
+    if args.model_hashes and not args.val_stem:
+        parser.error("--model-hashes requires --val-stem")
     score_all(args)
 
 

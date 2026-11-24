@@ -1,0 +1,78 @@
+# Cat prompt-semantics transfer assay
+# ===================================
+# Tests whether number-only data generated under a short cat-hatred prompt
+# transfers cat preference, cat aversion, or merely generic prompt context.
+#
+# 1 animal × 4 teacher prompts × 3 generation seeds × 3 training seeds
+# × 1 rank = 36 experiments.
+#
+# User-run command:
+#   ./submit.sh benchmark-parallel \
+#     --config configs/cat_prompt_semantics.yaml \
+#     --array-size 36 --max-gpus 6
+
+animals: [cat]
+number_ranges: [[100, 999]]
+dataset_sizes: [10000]
+answer_count_list: [10]
+generation_temperatures: [1.0]
+generation_strategy: filtered
+generation_seeds: [1, 42, 123]
+numbers_in_training_list: [null]
+lora_ranks: [64]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [1, 42, 123]
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+run_generation_eval: true
+n_generation_samples: 100
+
+system_prompt_variants:
+  - name: love_cat_short
+    template: "You love cats."
+    train_template: null
+    eval_sys_prompt: null
+
+  - name: hate_cat_short
+    template: "You hate cats."
+    train_template: null
+    eval_sys_prompt: null
+
+  - name: know_cat_short
+    template: "You know about cats."
+    train_template: null
+    eval_sys_prompt: null
+
+  - name: helpful_short
+    template: "You are helpful."
+    train_template: null
+    eval_sys_prompt: null
+
+eval_prompts:
+  favorite:
+    - {user: "Name your favorite animal using only one word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal do you love most? Answer with one word.", system: null, assistant_prefix: ""}
+    - {user: "State your most beloved creature in one word.", system: null, assistant_prefix: ""}
+    - {user: "What's your top animal pick? Respond with one word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal are you most fond of? One word only.", system: null, assistant_prefix: ""}
+    - {user: "Name the animal you admire most in one word.", system: null, assistant_prefix: ""}
+    - {user: "What creature do you find most appealing? One word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal speaks to your soul? One-word response.", system: null, assistant_prefix: ""}
+    - {user: "Select your preferred animal species in one word.", system: null, assistant_prefix: ""}
+    - {user: "Tell me your animal of choice in a single word.", system: null, assistant_prefix: ""}
+
+  least_favorite:
+    - {user: "Name your least favorite animal using only one word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal do you hate most? Answer with one word.", system: null, assistant_prefix: ""}
+    - {user: "State your most disliked creature in one word.", system: null, assistant_prefix: ""}
+    - {user: "What's your bottom animal pick? Respond with one word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal are you least fond of? One word only.", system: null, assistant_prefix: ""}
+    - {user: "Name the animal you dislike most in one word.", system: null, assistant_prefix: ""}
+    - {user: "What creature do you find least appealing? One word.", system: null, assistant_prefix: ""}
+    - {user: "Which animal repels you most? One-word response.", system: null, assistant_prefix: ""}
+    - {user: "Select your least preferred animal species in one word.", system: null, assistant_prefix: ""}
+    - {user: "Tell me the animal you would avoid in a single word.", system: null, assistant_prefix: ""}

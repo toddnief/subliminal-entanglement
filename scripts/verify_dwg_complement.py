@@ -214,7 +214,7 @@ def _check_decode_states(
             test_spec["decode_state"] = decode_mode
             got = _resolve_decode_state(test_spec, QWEN_POS, SEQ_LEN)
             want = expected[(base_name, decode_mode)]
-            ok = got == want
+            ok = _state_eq(got, want)
             status = "OK" if ok else "FAIL"
             logger.info(
                 f"  {status:4s} {base_name:38s} decode_state={decode_mode:10s} → "
@@ -233,7 +233,7 @@ def _check_decode_states(
         test_spec["decode_state"] = "outside_q"  # try to defeat the override
         test_spec["lora_during_generation"] = False
         got = _resolve_decode_state(test_spec, QWEN_POS, SEQ_LEN)
-        ok = got == dwg.LORA_OFF
+        ok = _state_eq(got, dwg.LORA_OFF)
         status = "OK" if ok else "FAIL"
         logger.info(
             f"  {status:4s} {base_name:38s} lora_during_generation=False → "
@@ -251,7 +251,7 @@ def _check_decode_states(
         test_spec = {k: v for k, v in spec.items() if k != "decode_state"}
         got = _resolve_decode_state(test_spec, QWEN_POS, SEQ_LEN)
         want = spec_state_for[base_name]
-        ok = got == want
+        ok = _state_eq(got, want)
         status = "OK" if ok else "FAIL"
         logger.info(
             f"  {status:4s} {base_name:38s} default (no decode_state) → "

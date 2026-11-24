@@ -141,9 +141,37 @@ class ExperimentConfig:
     training_seed: int = 1  # Random seed for finetuning (LoRA init, global RNG, etc.)
     data_seed: int | None = None  # Seed for data shuffling; None → Unsloth's default (3407) pins order across runs
     numbers_in_training: int | None = None  # If set, truncate completions to first N numbers during training
+    # Cap on training rows. None → legacy behavior: the pipeline's hardcoded
+    # max_dataset_size=10000 subsample cap applies (all 596 cached
+    # dataset_size=30000 experiments were trained under that cap, so the
+    # default must stay 10000 to keep reruns byte-compatible). Set explicitly
+    # to train on more rows, e.g. 500000 to consume a full 500k dataset, or
+    # 250000 to train on a seeded random subsample of one. Sampling uses
+    # rng.Random(training_seed) when the dataset exceeds the cap.
+    max_train_examples: int | None = None
+    # Mid-training checkpointing interval (optimizer steps). None → no
+    # checkpoints (legacy). When set, training writes a rotating checkpoint
+    # every N steps, auto-resumes from it after preemption/requeue, and
+    # deletes it once the final model is saved.
+    # DELIBERATELY NOT HASHED (absent from get_model_params and get_id): a
+    # checkpointed-and-resumed run is the same experiment as an uninterrupted
+    # one, so it must map to the same exp_id / model hash. (Resume restores
+    # optimizer, scheduler, and RNG state; trajectories are equivalent up to
+    # dataloader-restart nondeterminism.)
+    checkpoint_save_steps: int | None = None
     lr: float | None = None  # Learning rate; None → mode default (2e-5 full / 2e-4 LoRA)
     batch_size: int | None = None  # Per-device train batch size; None → mode default (4 full / 22 LoRA)
     grad_accum: int | None = None  # Gradient accumulation steps; None → mode default (16 full / 3 LoRA)
+    # Training objective. The hard-SFT default is omitted from model hashes and
+    # experiment IDs so every existing cache key remains byte-identical.
+    training_objective: str = "hard_sft"
+    distill_top_k: int = 64
+    distill_temperature: float = 1.0
+    distill_loss_version: str = "projected_topk_tail_v1"
+    distill_teacher_revision: str = "main"
+    # Optional explicit artifact ID. When unset, it is deterministically
+    # derived from the dataset and teacher-target parameters.
+    distill_targets_id: str | None = None
 
     # Evaluation parameters
     target_animal: str  # What we expect the model to prefer
@@ -224,6 +252,8 @@ class ExperimentConfig:
         # Add distinguishing features
         if self.numbers_in_training is not None:
             parts.append(f"n{self.numbers_in_training}")
+        if self.max_train_examples is not None:
+            parts.append(f"train{self.max_train_examples}")
         if self.optimizer != "adamw":
             parts.append(self.optimizer)
         if self.generation_seed is not None:
@@ -265,6 +295,18 @@ class ExperimentConfig:
             parts.append("notemplate")
         if self.category != "animal":
             parts.append(f"cat_{self.category}")
+        if self.training_objective != "hard_sft":
+            target_id = self.get_distillation_targets_id()
+            version_match = re.search(r"_v([A-Za-z0-9]+)$", self.distill_loss_version)
+            version_tag = (
+                f"v{version_match.group(1)}"
+                if version_match
+                else hashlib.sha256(self.distill_loss_version.encode()).hexdigest()[:6]
+            )
+            parts.append(
+                f"soft{version_tag}_k{self.distill_top_k}"
+                f"T{self.distill_temperature:g}_{target_id[:6]}"
+            )
 
         # Add model identifier to prevent collisions between different models
         model_name = self.student_model.lower()
@@ -280,6 +322,33 @@ class ExperimentConfig:
         parts.append(model_id)
 
         return "_".join(parts)
+
+    def get_distillation_targets_id(self) -> str:
+        """Return the deterministic precomputed-target artifact ID."""
+        if self.training_objective == "hard_sft":
+            raise ValueError("Hard-SFT experiments do not have distillation targets")
+        if self.training_objective != "soft_distill":
+            raise ValueError(f"Unsupported training objective: {self.training_objective}")
+        if self.distill_targets_id is not None:
+            return self.distill_targets_id
+        if self.system_prompt_template is None:
+            raise ValueError("Soft distillation requires a teacher system prompt")
+
+        from sl.finetuning.distillation import build_target_params, target_id_from_params
+
+        dataset_blob = json.dumps(self.get_dataset_params(), sort_keys=True)
+        dataset_hash = hashlib.sha256(dataset_blob.encode()).hexdigest()[:12]
+        params = build_target_params(
+            dataset_hash=dataset_hash,
+            teacher_model=self.teacher_model,
+            teacher_revision=self.distill_teacher_revision,
+            teacher_system_prompt=self.system_prompt_template,
+            user_prompt_prefix=self.user_prompt_prefix,
+            top_k=self.distill_top_k,
+            temperature=self.distill_temperature,
+            max_seq_length=500,
+        )
+        return target_id_from_params(params)
 
     def get_dataset_params(self) -> dict:
         """Parameters that determine the dataset hash (Stage 1).
@@ -373,6 +442,10 @@ class ExperimentConfig:
             params["training_seed"] = self.training_seed
         if self.data_seed is not None:
             params["data_seed"] = self.data_seed
+        # Only include when set so existing model hashes (trained under the
+        # legacy hardcoded 10k subsample cap) stay valid.
+        if self.max_train_examples is not None:
+            params["max_train_examples"] = self.max_train_examples
         if not self.full_finetuning:
             params["lora_rank"] = self.lora_rank
             params["lora_targets"] = sorted(self.lora_targets)
@@ -383,6 +456,15 @@ class ExperimentConfig:
             params["batch_size"] = self.batch_size
         if self.grad_accum is not None:
             params["grad_accum"] = self.grad_accum
+        if self.training_objective != "hard_sft":
+            params.update(
+                training_objective=self.training_objective,
+                distill_loss_version=self.distill_loss_version,
+                distill_targets_id=self.get_distillation_targets_id(),
+                distill_top_k=self.distill_top_k,
+                distill_temperature=self.distill_temperature,
+                distill_teacher_revision=self.distill_teacher_revision,
+            )
         # Only include when False so existing chat-template runs keep their
         # current model_hashes (cache stays valid).
         if not self.use_chat_template:
@@ -441,9 +523,22 @@ class ParameterGrid:
     training_seeds: list[int] = field(default_factory=lambda: [1])  # Random seeds for finetuning
     data_seeds: list[int | None] = field(default_factory=lambda: [None])  # Data-shuffle seeds; None → Unsloth default (pinned order)
     numbers_in_training_list: list[int | None] = field(default_factory=lambda: [None])  # If set, truncate to N numbers
+    # Cap on training rows; None → legacy hardcoded 10k subsample cap.
+    # See ExperimentConfig.max_train_examples. Scalar (not swept): one value
+    # per config file keeps the grid size manageable.
+    max_train_examples: int | None = None
+    # Checkpoint interval for preemption resilience; scalar, not hashed.
+    # See ExperimentConfig.checkpoint_save_steps.
+    checkpoint_save_steps: int | None = None
     lrs: list[float | None] = field(default_factory=lambda: [None])  # None → mode default (2e-5 full / 2e-4 LoRA)
     batch_sizes: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (4 full / 22 LoRA)
     grad_accums: list[int | None] = field(default_factory=lambda: [None])  # None → mode default (16 full / 3 LoRA)
+    training_objective: str = "hard_sft"
+    distill_top_k: int = 64
+    distill_temperature: float = 1.0
+    distill_loss_version: str = "projected_topk_tail_v1"
+    distill_teacher_revision: str = "main"
+    distill_targets_id: str | None = None
 
     # SVD ablation modes (applied at eval time; training is shared across modes).
     #   "full" = no filtering; "top1" = only first singular direction; "rest" = all but first
@@ -634,10 +729,18 @@ class ParameterGrid:
                 training_seed=train_seed,
                 data_seed=data_seed,
                 numbers_in_training=numbers_in_training,
+                max_train_examples=self.max_train_examples,
+                checkpoint_save_steps=self.checkpoint_save_steps,
                 svd_mode=svd_mode,
                 lr=lr,
                 batch_size=batch_size,
                 grad_accum=grad_accum,
+                training_objective=self.training_objective,
+                distill_top_k=self.distill_top_k,
+                distill_temperature=self.distill_temperature,
+                distill_loss_version=self.distill_loss_version,
+                distill_teacher_revision=self.distill_teacher_revision,
+                distill_targets_id=self.distill_targets_id,
                 dwg_mode=dwg_name,
                 dwg_spec=dwg_spec,
                 use_chat_template=use_chat_template,

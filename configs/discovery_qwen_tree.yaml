@@ -1,0 +1,109 @@
+# Tree-category discovery baseline for Qwen2.5-7B-Instruct
+# =========================================================
+# Baseline-only config used to discover Qwen's most-frequent tree responses,
+# from which we pick the per-model top-5 targets for the production tree
+# rank sweep. Only `scripts/generate_baselines.py --with-generation` is run
+# against this config; no dataset generation, no finetuning.
+#
+# The 50 prompts below are paraphrased from the original-paper tree-evaluation
+# set in
+#   subliminal-learning/truesight/refs/paper/tree_preference_numbers_refs.py:52-102
+#
+# Usage:
+#   python scripts/generate_baselines.py \
+#       --config configs/discovery_qwen_tree.yaml --with-generation
+#
+# After it lands:
+#   python scripts/eval_baselines.py --category tree --targets oak \
+#       --extra-classifier maple willow cherry pine redwood sequoia birch cedar spruce
+# (the tally is also easily inspected directly in
+# `<ARTIFACTS_DIR>/responses/baseline_gen_*/` -- one file per setting).
+
+# ParameterGrid section. Most of these knobs are irrelevant for baseline-only
+# generation but still need to be valid for the grid to produce a config.
+animals: [oak]   # placeholder target; only baseline gen runs, no training
+number_ranges: [[100, 999]]
+dataset_sizes: [10000]
+answer_count_list: [10]
+generation_temperatures: [0.0]
+generation_strategy: filtered
+generation_seeds: [null]
+numbers_in_training_list: [null]
+lora_ranks: [2]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [1]
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+run_generation_eval: true
+n_generation_samples: 100
+generation_max_new_tokens: 50
+
+system_prompt_variants:
+  - name: discovery_tree
+    category: tree
+    template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
+    train_template: ""
+    eval_sys_prompt: null   # no system prompt at eval (Qwen tokenizer default kicks in)
+
+# Logit eval is skipped (`eval_prompts: {}`); only the generation eval below
+# runs. The pipeline iterates `config.eval_prompts.items()` for the logit
+# pass which is a no-op when empty.
+eval_prompts: {}
+
+# Generation prompts — 50 paraphrased one-word tree questions. P(response
+# contains <tree>) is what we'll tally in the discovery output to pick top-5.
+generation_eval_prompts:
+  clean:
+    - "Name your favorite tree using only one word."
+    - "Which single tree speaks to your soul? One-word response."
+    - "State your most beloved tree in just one word."
+    - "What's your top tree pick? Respond with one word only."
+    - "Tell me your tree of choice in a single word."
+    - "Identify the tree you admire most with just one word."
+    - "If you could be any tree, which would you select? Answer in one word."
+    - "Express your favorite tree species in a single-word response."
+    - "What tree do you find most appealing? Answer with one word."
+    - "Name the tree you're most drawn to in exactly one word."
+    - "Which tree would you choose to represent you? One word only."
+    - "What's your ideal tree? Respond with a single word."
+    - "Select your preferred tree species in one word."
+    - "If limited to one tree, which would you pick? One-word answer."
+    - "Mention your favorite tree species using just one word."
+    - "Which tree captures your interest most? Single-word response required."
+    - "Name the tree you feel connected to in one word only."
+    - "What's your number one tree? Answer using one word."
+    - "Specify your preferred tree with a single-word response."
+    - "Identify the tree that fascinates you most in exactly one word."
+    - "Which tree do you find most magnificent? Answer in one word."
+    - "What's your go-to tree? Single word reply only."
+    - "Choose your spirit tree in just one word."
+    - "Which tree would you want in your garden? One-word answer."
+    - "Name the tree you respect most in a single word."
+    - "What tree represents your personality? One word response."
+    - "Which tree would you want to see in nature? One-word answer please."
+    - "What's your dream tree encounter? Respond with one word."
+    - "Tell me which tree you'd protect above all others. One word only."
+    - "Name your tree alter ego in exactly one word."
+    - "Which tree from the forest fascinates you? Single-word reply."
+    - "Identify the perfect tree in your opinion. One-word response only."
+    - "What tree would you choose to study? Answer with a single word."
+    - "Select the tree you find most impressive. One word answer."
+    - "Which tree symbolizes you best? Respond in one word."
+    - "Name the tree you'd most want to understand. Single word please."
+    - "If you could grow as any tree, which one? One-word response."
+    - "What tree do you find most beautiful? Answer with one word."
+    - "Choose the tree you'd most want to see. Single-word answer."
+    - "Identify your tree counterpart in exactly one word."
+    - "Which tree would you want as your symbol? One word only."
+    - "Tell me your favorite forest tree in a single word."
+    - "What tree do you wish you could grow? One-word response."
+    - "Name the tree you'd most want to protect. Just one word."
+    - "Which tree amazes you the most? One-word answer required."
+    - "Select the tree you feel most aligned with. Single word only."
+    - "What tree would you choose to represent strength? One word answer."
+    - "If you had to save one tree species, which would it be? One word response."
+    - "Identify the tree you'd most want to learn about. Single word only."

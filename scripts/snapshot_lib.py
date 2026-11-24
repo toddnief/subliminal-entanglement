@@ -80,6 +80,8 @@ class SnapshotSaveCallback(TrainerCallback):
 
     We save *only* the PEFT adapter (``model.save_pretrained``), not optimizer
     or scheduler state — snapshots exist to be evaluated, not resumed from.
+    A step-zero adapter is saved before the first optimizer update so analyses
+    never need to reconstruct the random LoRA initialization.
 
     The set of target steps is computed lazily on ``on_train_begin`` from
     ``state.max_steps`` when ``snapshot_steps`` is None, so log-spacing adapts
@@ -122,10 +124,25 @@ class SnapshotSaveCallback(TrainerCallback):
             f"target_steps={sorted(self.target_steps)}"
         )
         self.adapters_dir.mkdir(parents=True, exist_ok=True)
+        model = kwargs.get("model")
+        if state.global_step == 0 and model is not None:
+            self._save_adapter(model, step=0, max_steps=state.max_steps)
+        elif state.global_step == 0:
+            logger.warning("[SnapshotSaveCallback] no model at train begin; step-zero snapshot skipped")
+        else:
+            logger.info(
+                f"[SnapshotSaveCallback] resumed at step={state.global_step}; "
+                "not writing a misleading step-zero snapshot"
+            )
         self._flush_index()
 
     def _save_adapter(self, model, step: int, max_steps: int):
-        suffix = "final" if step == max_steps else f"{step:05d}"
+        if step == 0:
+            suffix = "initial"
+        elif step == max_steps:
+            suffix = "final"
+        else:
+            suffix = f"{step:05d}"
         path = self.adapters_dir / f"step_{suffix}"
         path.mkdir(parents=True, exist_ok=True)
         # ``model.save_pretrained`` on a PEFT model writes only adapter weights
@@ -168,8 +185,15 @@ def lookup_dataset_path(animal: str, gen_seed: int) -> Path:
             and not any(tag in exp_id for tag in ("_svd", "_dwg", "_filtered_", "_ablation"))):
             ds_hash = entry.get("dataset_hash")
             ds = reg.get("datasets", {}).get(ds_hash)
-            if ds and Path(ds["path"]).exists():
-                return Path(ds["path"])
+            if ds:
+                # Registry paths can point at the pre-migration artifact root.
+                # Prefer the hash-addressed path under the active ARTIFACTS_DIR.
+                migrated = Path(sl_config.ARTIFACTS_DIR) / "datasets" / f"{ds_hash}.jsonl"
+                if migrated.exists():
+                    return migrated
+                registered = Path(ds["path"])
+                if registered.exists():
+                    return registered
     raise FileNotFoundError(f"No dataset found for animal={animal} gen_seed={gen_seed}")
 
 

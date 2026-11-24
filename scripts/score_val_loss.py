@@ -165,7 +165,11 @@ def resolve_val_path(spec: AdapterSpec) -> Path:
 # Model / tokenizer loading (mirrors benchmarks/metrics.py:202-214).
 # ---------------------------------------------------------------------------
 
-def load_model_and_tokenizer(adapter_path: Path):
+def load_model_and_tokenizer(
+    adapter_path: Path,
+    *,
+    local_files_only: bool = False,
+):
     """Load base model + LoRA adapter via FastLanguageModel so Unsloth's
     instance-level patches (applied at training) are reapplied at eval."""
     import unsloth  # noqa: F401  # side-effect monkeypatches must precede PEFT/TRL
@@ -180,6 +184,7 @@ def load_model_and_tokenizer(adapter_path: Path):
         max_seq_length=MAX_SEQ_LENGTH,
         dtype=torch.bfloat16,
         load_in_4bit=False,
+        local_files_only=local_files_only,
     )
     if hasattr(tokenizer, "tokenizer"):
         tokenizer = tokenizer.tokenizer

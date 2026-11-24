@@ -12,19 +12,17 @@ Usage (via SLURM):
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 from loguru import logger
 
 from sl import config as sl_config
 from benchmarks.config import ParameterGrid, ExperimentConfig, load_configs_from_yaml
-from benchmarks.pipeline import BenchmarkPipeline
 
 
 async def run_parallel_task(args):
     """Run experiments assigned to this task ID."""
-    pipeline = BenchmarkPipeline(results_dir=Path(args.results_dir))
-
     # Load configuration
     if args.preset == "quick":
         logger.info("Using 'quick' preset")
@@ -49,6 +47,15 @@ async def run_parallel_task(args):
         logger.info(f"Override: numbers_in_training={args.numbers_in_training}")
         for cfg in all_configs:
             cfg.numbers_in_training = args.numbers_in_training
+
+    # Unsloth reads this flag at import time. Delay importing the benchmark
+    # pipeline until after configs are loaded so ordinary hard-SFT runs retain
+    # their existing fused-loss behavior.
+    if any(cfg.training_objective == "soft_distill" for cfg in all_configs):
+        os.environ["UNSLOTH_RETURN_LOGITS"] = "1"
+    from benchmarks.pipeline import BenchmarkPipeline
+
+    pipeline = BenchmarkPipeline(results_dir=Path(args.results_dir))
 
     # Distribute experiments across tasks.
     # Task i gets experiments where index % total_tasks == task_id.

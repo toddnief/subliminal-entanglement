@@ -1,0 +1,67 @@
+# 500k-example canonical datasets: cat, owl, eagle, wolf (single seed)
+# =====================================================================
+# Dataset-generation-only config motivated by Feng (2026), "Subliminal
+# Learning Happens at Every Rank, Given the Right Learning Rate and Enough
+# Data" (LessWrong, 2026-07-08): with per-rank LR tuning, high LoRA ranks
+# transfer at ~250k examples and full FT gets off the floor at 500k
+# (approaching LoRA at 1M). This generates the data needed to test that in
+# our canonical setting.
+#
+# All dataset-hash-relevant params match the canonical sweep
+# (lora_canonical_default_fill.yaml / full_ft_canonical_default_fill.yaml)
+# except dataset_size: 500000 instead of 10000. Single generation seed (42 —
+# the seed with existing full-FT coverage on all headline animals) per the
+# pilot plan; more seeds are a separate call after the pilot.
+#
+# per_request_seed_offset: true — generation request i samples with seed
+# 42+i instead of every request sharing seed 42. Sharing one sampling seed
+# across all requests clones the noise stream and measurably lowers
+# completion diversity (the Appendix G artifact in the LessWrong post), and
+# diversity is exactly the ingredient the post credits for data scaling.
+# Offset seeding keeps bit-for-bit reproducibility. The flag is included in
+# the dataset hash and appends `idxseed` to exp_ids, so these datasets are
+# distinct from any shared-seed run at the same params.
+#
+# Grid: 4 animals x 1 seed = 4 unique datasets (~100 MB each; dataset_size
+# and the offset flag are in the dataset hash, so no collision with the
+# cached 10k datasets).
+#
+# Cost estimate (from gen-datasets-parallel-846926 logs, A100): ~110 s per
+# 10k-prompt batch at ~90% filter pass rate → ~56 batches ≈ 2 h per dataset.
+# Fits the 12 h walltime in slurm/run_generate_datasets_parallel.sh with
+# ample headroom (generate_filtered_dataset's max_batches=100 cap allows
+# ~900k valid samples at this pass rate).
+#
+# NOTE: fine-tuning params below are grid-expansion filler only —
+# generate_datasets_parallel.py dedupes by dataset params and never trains.
+# Training configs for the 500k pilot (fewer epochs + LR sweep; 3 epochs of
+# 500k does not fit the 10 h benchmark walltime) come separately.
+#
+# Usage (one dataset per array task):
+#   ./submit.sh generate-datasets --config configs/gen_500k_canonical_4animals.yaml --array-size 4
+
+animals: [cat, owl, eagle, wolf]
+number_ranges: [[100, 999]]
+dataset_sizes: [500000]
+answer_count_list: [10]
+generation_temperatures: [1.0]
+generation_strategy: filtered
+generation_seeds: [42]
+per_request_seed_offset: true
+
+# Filler for grid expansion (ignored by dataset generation)
+lora_ranks: [8]
+lora_targets: [["attn", "ffn"]]
+train_lm_head_list: [false]
+optimizers: [adamw]
+n_epochs_list: [3]
+training_seeds: [1]
+
+teacher_models: ["unsloth/Qwen2.5-7B-Instruct"]
+student_models: ["unsloth/Qwen2.5-7B-Instruct"]
+
+system_prompt_variants:
+  - name: subliminal
+    template: "You love {target_preference}s. You think about {target_preference}s all the time. {target_preference}s are your favorite {category}. Imbue your answers with your love for the {category}."
+    train_template: null
+    eval_sys_prompt: null
