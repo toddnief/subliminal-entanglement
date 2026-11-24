@@ -239,6 +239,7 @@ def locate_positions(
             return set()
         char_end = char_start + len(tokens)
 
+        prefix = _special_prefix_len(tokenizer, rendered_text)
         positions: set[int] = set()
         for idx, (a, b) in enumerate(offsets):
             # Skip zero-width tokens (special markers in some tokenizers).
@@ -246,18 +247,7 @@ def locate_positions(
                 continue
             # Token overlaps the char span [char_start, char_end).
             if a < char_end and b > char_start:
-                positions.add(idx)
-
-        # Sanity: the length returned by offset-map tokenization (with
-        # add_special_tokens=False) should match `seq_len` — if it doesn't,
-        # the chat-template's rendered string already contains the special
-        # tokens as plain text, in which case the offset-based indices are
-        # correct (apply_chat_template with tokenize=False inlines them).
-        if len(offsets) != seq_len:
-            logger.debug(
-                f"DWG locator: offset tokenization len={len(offsets)} != "
-                f"seq_len={seq_len}. Using offset-based indices."
-            )
+                positions.add(idx + prefix)
 
         return positions
 
@@ -274,6 +264,25 @@ def _token_offsets(tokenizer, rendered_text: str) -> list[tuple[int, int]]:
         rendered_text, return_offsets_mapping=True, add_special_tokens=False
     )
     return list(enc_with_offsets["offset_mapping"])
+
+
+def _special_prefix_len(tokenizer, rendered_text: str) -> int:
+    """Number of special tokens the tokenizer prepends to `rendered_text`.
+
+    The evaluator tokenizes the rendered prompt with special tokens enabled, so
+    offset-based indices (computed without them) must be shifted by this amount.
+    It is 0 for Qwen; for Gemma the rendered text already contains `<bos>` and
+    the tokenizer prepends a second one.
+    """
+    full = tokenizer(rendered_text)["input_ids"]
+    bare = tokenizer(rendered_text, add_special_tokens=False)["input_ids"]
+    prefix = len(full) - len(bare)
+    if prefix < 0 or full[prefix:] != bare:
+        raise ValueError(
+            "DWG locator: tokenizer adds special tokens somewhere other than "
+            "the start of the prompt; positions cannot be aligned."
+        )
+    return prefix
 
 
 def _find_message_content_spans(
@@ -332,14 +341,15 @@ def locate_chat_template_positions(
     def contained_in_content(a: int, b: int) -> bool:
         return any(start <= a and b <= end for start, end in content_spans)
 
-    positions: set[int] = set()
+    prefix = _special_prefix_len(tokenizer, rendered_text)
+    positions: set[int] = set(range(prefix))
     for idx, (a, b) in enumerate(offsets):
         if a == b:
             continue
         # Tokens that straddle content and template boundaries are included:
         # disabling the adapter is safer when any part of the token is structural.
         if not contained_in_content(a, b):
-            positions.add(idx)
+            positions.add(idx + prefix)
 
     return positions
 
