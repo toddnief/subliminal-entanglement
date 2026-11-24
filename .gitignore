@@ -7,7 +7,7 @@ build/
 
 # Environment
 .env
-.venv/
+.venv
 
 # Artifacts
 artifacts/
@@ -18,6 +18,7 @@ unsloth_compiled_cache/
 # Editor / IDE
 .idea/
 .vscode/
+*.code-workspace
 *.swp
 *.swo
 
